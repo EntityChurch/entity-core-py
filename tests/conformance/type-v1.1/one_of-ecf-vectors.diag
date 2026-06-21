@@ -1,0 +1,85 @@
+# EXTENSION-TYPE v1.1 §5.5 — `one_of` ECF byte-equality vectors.
+# Companion to one_of-ecf-vectors.cbor (canonical form).
+# See one_of-ecf-vectors.md for the human-readable table.
+[
+  # v01 — string match
+  {
+    "id": "v01",
+    "description": "string match",
+    "value": "red",
+    "candidates": ["red", "green", "blue"],
+    "valid": true
+  },
+  # v02 — string miss
+  {
+    "id": "v02",
+    "description": "string miss",
+    "value": "yellow",
+    "candidates": ["red", "green", "blue"],
+    "valid": false
+  },
+  # v03 — int match
+  {
+    "id": "v03",
+    "description": "int match",
+    "value": 5,
+    "candidates": [1, 2, 5],
+    "valid": true
+  },
+  # v04 — int miss
+  {
+    "id": "v04",
+    "description": "int miss",
+    "value": 5,
+    "candidates": [1, 2, 3],
+    "valid": false
+  },
+  # v05 — int-vs-float divergence
+  {
+    "id": "v05",
+    "description": "int-vs-float divergence",
+    "value": 5.0,
+    "candidates": [1, 2, 5],
+    "valid": false
+  },
+  # v06 — nested map match
+  {
+    "id": "v06",
+    "description": "nested map match",
+    "value": {"kind": "color", "value": "red"},
+    "candidates": [{"kind": "color", "value": "blue"}, {"kind": "color", "value": "red"}, {"kind": "size", "value": "large"}],
+    "valid": true
+  },
+  # v07 — array of strings
+  {
+    "id": "v07",
+    "description": "array of strings",
+    "value": ["a", "b"],
+    "candidates": [["a"], ["a", "b"], ["c"]],
+    "valid": true
+  },
+  # v08 — bytes match
+  {
+    "id": "v08",
+    "description": "bytes match",
+    "value": h'68656c6c6f',
+    "candidates": [h'68656c6c6f', h'776f726c64'],
+    "valid": true
+  },
+  # v09 — bool match
+  {
+    "id": "v09",
+    "description": "bool match",
+    "value": true,
+    "candidates": [true],
+    "valid": true
+  },
+  # v10 — null match
+  {
+    "id": "v10",
+    "description": "null match",
+    "value": null,
+    "candidates": [null, 1, 2],
+    "valid": true
+  },
+]

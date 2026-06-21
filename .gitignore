@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+
+build/
+dist/
+
+# Per-machine podman resource-cap overrides (not committed)
+caps.local.mk

@@ -1,0 +1,42 @@
+[project]
+name   = "Entity Core (Python)"
+slug   = "entity-core-py"
+repo   = "entity-core-py"
+github = "https://github.com/EntityChurch/entity-core-py"
+intro  = """
+entity-core-py is a reference implementation of the Entity Core Protocol (v7),
+written in Python. It sits in the stack as one of three independent
+language reference impls (alongside the Go oracle and the Rust impl): it
+implements the wire protocol — content-addressed entities, ECF/CBOR encoding,
+Ed25519/Ed448 identity, capability delegation, and the handler/peer runtime —
+directly from the specification, and exists primarily to validate that the spec
+is clear and complete enough to build interoperable peers. It depends on the
+protocol specification (entity-core-architecture); nothing else in the batch
+depends on it (the three cores do not cross-depend). Confidence: solid and
+cross-impl-converged (2700+ tests, validate-peer green), at the v0.8 research-
+preview maturity level — not a 1.0 API commitment.
+"""
+
+[[doc]]
+path  = "README.md"
+title = "Overview"
+blurb = "What the project is, how to build/test it, and a tour of the CLI and protocol."
+group = "Overview"
+
+[[doc]]
+path  = "docs/CLI.md"
+title = "Command-line tools"
+blurb = "The make targets and the entity-core CLI — what each does, how to invoke it, key flags."
+group = "Tools"
+
+[[doc]]
+path  = "docs/VALIDATING.md"
+title = "Validating a peer against the spec"
+blurb = "The cross-implementation peer validator: what it checks and how to run it."
+group = "Tools"
+
+[[doc]]
+path  = "docs/HANDLER-ARCHITECTURE.md"
+title = "Handler architecture"
+blurb = "How handlers, the registry, and dispatch fit together in the Python peer."
+group = "Architecture"
