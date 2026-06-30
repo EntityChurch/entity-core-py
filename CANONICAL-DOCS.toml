@@ -40,3 +40,9 @@ path  = "docs/HANDLER-ARCHITECTURE.md"
 title = "Handler architecture"
 blurb = "How handlers, the registry, and dispatch fit together in the Python peer."
 group = "Architecture"
+
+[[doc]]
+path  = "docs/status/STATUS.md"
+title = "Status"
+blurb = "Current project status — where the project is, recent work, backlog, and what's next."
+group = "Overview"
