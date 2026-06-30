@@ -38,11 +38,9 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-No code or protocol changes since the `v0.8.0` "Genesis" research-preview cut — recent
-work has been docs / standards hygiene only (the Code of Conduct was softened to open
-with "be good to all"; this canonical status doc was added; a small standards-alignment
-cleanup was applied). The implementation is at the Genesis line and stable; the next
-substantive work is upstream-spec tracking and live cross-impl validation (below).
+Stable at the `v0.8.0` "Genesis" research-preview line; no code or protocol changes are
+in flight. Next substantive work is running the conformance + interop suites live against
+a current reference peer to confirm green at HEAD (below).
 
 ## Backlog
 
@@ -92,8 +90,6 @@ substantive work is upstream-spec tracking and live cross-impl validation (below
 - **Format agility / peer-id hardening** — Ed448 + SHA-384 support, content-hash-format
   negotiation, format-relative deletion markers and content paths, and identity loading
   that always re-derives the canonical peer id rather than trusting the file.
-- **Standards check** against `AGENTS-STANDARD.md`: `AGENTS.md` / `CLAUDE.md` verified
-  current (no drift).
 
 ## Next
 
