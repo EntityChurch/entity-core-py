@@ -251,6 +251,36 @@ async def test_pin_wrong_digest_width_returns_400():
 
 
 @pytest.mark.asyncio
+async def test_pin_98_char_hex_claiming_sha256_returns_400():
+    """NETWORK §6.5.3 hex-strictness `[MUST]`, the row the ruling names by
+    hand: *"a 98-char string claiming `00`"* → 400.
+
+    This is the mirror of `test_pin_wrong_digest_width_returns_400` and it is
+    the one a **hardcoded width** gets wrong in the *other* direction. A gate
+    written as `len(hex) in (66, 98)` — the natural "fix" for the 2026-08-10
+    hardcoded-66 defect — accepts this string, because 98 is on the list and
+    nothing cross-checks it against the format byte the string itself carries.
+    The rule is not "one of the known widths"; it is **the width this format
+    byte implies**, which is why the check has to read the byte.
+    """
+    peer = _make_peer()
+    namespace = "system/content/public"
+
+    def probe(host, port):
+        # `00` = ECFv1-SHA-256 (32-byte digest) followed by 48 digest bytes:
+        # a well-formed SHA-384-WIDTH hex claiming the SHA-256 format code.
+        claims_sha256 = "00" + ("aa" * 48)
+        assert len(claims_sha256) == 98
+        return _do_request(
+            method="GET", host=host, port=port,
+            path=f"/content/{claims_sha256}",
+        )
+
+    code, _, _ = await _run_against_isolated_poll(peer, namespace, probe)
+    assert code == 400
+
+
+@pytest.mark.asyncio
 async def test_pin_unsupported_format_byte_returns_400():
     """A genuinely unsupported format byte → 400 fail-closed.
 

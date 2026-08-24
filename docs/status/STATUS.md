@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-20 · public: v0.8.0 (master)_
+_Updated: 2026-08-21 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -38,6 +38,92 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
+**C-8's closure-result positions are landed, and `fold` went the other way at core-go
+(2026-08-21).** Arch ruled `map`/`filter`/`fold`'s closure-result positions (`172589e`), replacing
+v3.26's *"exactly three contained positions"* with the rule that generates it: **a position CONTAINS
+when the primitive places the value without reading it, and CONSUMES when it reads it to decide.**
+Landed at `0b2d946`: `map`'s output element contains (§1.5's NaN model is element-wise, so
+`map(f,[1,0,2])` is `[a,E,c]` and not one `E`); `fold`'s accumulator contains and `initial` joins the
+contained-args table, so **a closure that ignores its accumulator recovers**; `filter` stays consumed
+(already correct); and **D3** — `concat-args.collections` is one scalar hash, because §7.1's reactive
+walk descends only on *scalar* `system/hash` fields and the declared array shape leaves every
+`lookup/tree` inside every `concat` sub-collection unregistered.
+
+**The nothing-broke was the finding:** changing `map` and `fold` broke **zero** of 3998 tests. The
+suite *and* a 352-vector corpus cross-blessed byte-identical three ways had never put an error in a
+closure-result position.
+
+**Four divergences confirmed on the wire against go `9ad0110`** (`c3f9b87`), with the identical rows
+**12/12 green against a py peer in the same session**: `fold` short-circuits an accumulator the
+ruling makes contained (go reads arch's word *"propagates"* as *abort*; arch's D2 lists *"fold's
+final accumulator"* in the contained set of five); `fold`'s `initial` short-circuits; a **value-form**
+`budget_exhausted` is contained on go and propagated here, because go's eval-limit carve-out sits on
+its *minted* arm only — the §2.4 provenance asymmetry that same ruling closed, re-opened three codes
+wide; and **§8.2 canonical arg order**, `coll_error` vs `idx_error`, which became measurable the
+moment go fixed `resolveCollection` (`ded9ea0`) and discharged the retirement condition our `skip`
+carried in writing.
+
+**The corpus locked anyway, and stating both facts together is the point.** Route B at **358
+vectors** (wire corpus `b7e5b023…`, in-proc frozen `ffb6e354…`) cross-blesses **LOCKED, 358/358
+byte-identical go↔py** at exactly the commits where those four rows disagree — go's CV-8c seeds
+`fold`'s *position* and not its *discriminator* (one element, closure returns the error: both
+readings answer the same), so the vector cannot see the divergence. Arch's CV-8**d** is the shape,
+and it was not in the set.
+
+**The citable number is `1609 · 1594 P · 14 W · 1 F · 0 S @ core-go `9ad0110`` (2026-08-21)** —
+passes 0/0b/1b/2/3 exit 0, pass 1 exit 1; `make test` **exit 0, 4024 pass / 0 fail / 48 skip**.
+**The 1 F is ours and deliberate:** `type_system_compute_concat_args_match` fails because py landed
+D3 and go's served declaration is still the pre-ruling `array_of(system/hash)`. It is
+declaration-only — nothing on the wire moves — and it retires when go lands the same one-line edit.
+Two SAs filed: **SA-PY-25** (an evaluation limit has no representation of its own, so both seats'
+carve-outs discriminate on the wrong thing in opposite ways) and **SA-PY-26** (none of C-8's four
+deltas are in `EXTENSION-COMPUTE.md`; the file is v3.26 and §3.5 still ships the sentence the ruling
+contradicts).
+
+---
+
+**COMPUTE v3.24 → v3.26 is landed, and the routed baseline was three versions off (2026-08-21).**
+core-go routed `2026-08-21-a` — `-f` (v3.26's contained-`compute/error` boundary form) and `-g`
+(content-URL full wire form) — saying *"rust and py are not yet on v3.26."* True, and it hid the
+state: **py was on v3.23.** v3.24 and v3.25 were never routed here, so §3.5's three contained
+positions (`assoc`'s `value`, `concat`'s elements, `group-by`'s `members`) **did not exist to carve
+out**. Proved before acting (`git log --all -S assoc -- packages/` is empty), and built all three
+versions rather than the carve-out alone — a carve-out with no site is a green diff that unblocks
+nothing. **A wrong claim about our version fails silently and in the flattering direction**, unlike
+the shape/coverage claims this rule was earned on.
+
+`-g` needed no behaviour change at all: `build_content_url` and the serve route (`validate_hash`,
+F-PY-13) were already format-relative, and there was no hardcoded-66 gate to remove. What was owed
+was teeth, including the row §6.5.3 names by hand and we lacked — a **98-char hex claiming `00`**,
+which is exactly what the natural `len in (66, 98)` "fix" accepts.
+
+Two pre-existing holes surfaced that the ruling never mentions, both made routine by v3.24:
+`_materialize_bare` had **no array branch**, and **scope capture had the same hole one branch over**,
+so `let g = group-by(…) in map(g, fn)` killed the handler task on the CBOR encoder.
+
+**The citable number is `1609 · 1594 P · 15 W · 0 F · 0 S @ core-go `f14cc2c`` (2026-08-21)** —
+`validate-complete.sh python` **exit 0, all six passes**, from the committed tree; `make test`
+**3998 pass / 0 fail / 43 skip**. **The validator carries no v3.24+ compute checks**, so `-f` is
+*not* verified by it —
+saying so because "exit 0" would otherwise be read as covering it. What does verify it is the
+**compute-corpus cross-bless, route B**: wire corpus `048e67aefc5ecd58` (352 vectors) driven over the
+wire against a live py peer and cross-blessed against go's emission → **LOCKED, every vector
+byte-identical**, 6 advisory message-text differences only. **That is the C-5 go↔py leg, including
+CV-4a and CV-5**, which had never been three-way'd.
+
+**Three findings routed back** (`ROUTING-2026-08-21-…`): go answers `type_mismatch` where §7.2
+requires a short-circuit for an error-valued **collection** operand, at **three** call sites
+(`concat`, `assoc`, `group-by` — `resolveCollection` uses `Evaluate` where `evalOperand` is
+required), measured on the wire with three discriminating controls and **all six rows passing against
+a py peer**; a §8.2 canonical-arg-order divergence that is **predicted and currently unmeasurable**
+because the first defect masks it, carried as a `skip` with a written un-skip condition rather than
+an `xfail`; and a py-side gate that has **never passed** —
+`test_cross_impl_publish_fetch.py`'s `PINNED_ROOT_HASH` is the placeholder byte sequence
+`0xc0..0xdf`, green on ordinary runners only because it `skipif`s when the Go toolchain is absent.
+**A source reading gave the site; only the trace gave the extent** — two of the three call sites came
+from running it, and go's own 352-vector corpus cross-blesses LOCKED because none of these
+configurations is in it.
+
 **REGISTRY v1.19 is landed, and the conjunction we took was still an under-refusal (2026-08-20).**
 Arch ruled both of our routed registry items at **v1.19** (arch `9cffb14`/`b254845`), and
 `COHORT-OPEN-ITEMS` §0a makes them two of the five rows that close the **registry v1 release line**.
@@ -64,13 +150,53 @@ filing's no-local-fix call held for one day and was right, and its escalation ro
 gate class unchanged. Four mutations, all caught. Full detail:
 `ROUTING-2026-08-20-registry-v1-19-is-landed-…`.
 
-**No citable conformance number this session, and that is a measurement, not an omission.** Another
-session on this host held a concurrent `validate-complete.sh` run (fixed ports), so a run started
-against it would collide and neither result would be citable. Local: `3931 passed · 31 skipped ·
-1 F`, the one failure being `tests/interop/test_connect_to_rust_peer` dialing a fixed
-`127.0.0.1:9000` held by unrelated Selenium containers — the fixed-port anti-pattern's fourth
-occurrence, not this diff. The previous number (`@ core-go 5655494`) **predates go's `v15` row 7**
-and therefore says nothing about R-15 either way; a fresh armed run from `1d0f20c` is owed.
+**R-27 is ruled and row 8 is green on the wire (2026-08-20 b).** Arch ruled go's spec-issue
+`2026-08-20-a` the same day (`08841d8`): pin authority is authority over the **non-dispatchable**
+operation `pin-bindings`, Option 1. Our `_OP_PIN_BINDINGS` already matched — **and the derivation is
+not ours and is stronger**: arch reads it off **V7** (a grant scopes on path-scope and id-scope only,
+and the path axis is *explicitly non-portable*, so the operation name is the **sole portable**
+discriminator), where ours was *"a resource split discriminates nothing **here**."* **All four
+clauses were already true here**, which is a coverage finding rather than work avoided — the normal
+forcing function for a test is a behaviour change, so a ruling that demands none leaves the surface
+exactly as untested as it was before it became normative. Pinned at `fcdc168`, four rows,
+each mutation-verified: dispatchability, byte-identity-without-field-drop, ordering, and **ordering's
+*reason***. Clause 4 was arch's flagged open question at this seat: we had the right code for a
+weaker reason — the ruling's is an **information-disclosure control** (§4.3's refusal is deliberately
+verbose, so validating first hands a config-shaped disclosure to a caller with no authority to change
+anything), so the row asserts the **response body**, not the status. The byte-identity row exists
+because `entity-core-rust` found a live **fail-open in `entity-core-go`** (`f44ed4d`, a typed-struct
+decode dropping §4.2 forward-compat keys); arch records that py has no field-drop, and **we verified
+that claim about us rather than accepting it.** Full detail: `ROUTING-2026-08-20-…` §6.
+
+**The citable number is `1601 · 1586 P · 15 W · 0 F · 0 S @ core-go `d697b9a`` (2026-08-20 b)** —
+the full armed `validate-complete.sh python` from the **clean committed tree** at `25c3c96`, **exit
+0, all six passes**: pass 1b `747 · 632 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`,
+substitute `8/8`, **`registry` `18/18`** — now including **row 8 on the wire**, so the §4.3 pin-delta
+is cross-impl green under the ruled `pin-bindings` encoding rather than in-tree only.
+
+> **Open, and not written off: `concurrency.t2_1_sustained_load` is marginal here.** Four runs:
+> `30.7s → PASS` · `36.7s → PASS` · `44.0s → FAIL 4.1x` · `56.6s → FAIL 4.2x`, against a **4.0x**
+> ceiling, with near-identical failing windows (first-window ~39 ms, last ~161–164 ms) and pass 1b
+> green every time. **py sits at 4.0–4.2x and crosses about half the time.** Host-side versus a real
+> sustained-load degradation is **not established**, and the earlier report of *"host load"* rested on
+> one confirming re-run — corrected. t2_1 drives `tree.get` on a hot path, so no registry diff is on
+> it; that half is provable and the other half is not. Not on the release line; owed a look here, and
+> the ceiling's tightness is `entity-core-go`'s as oracle author.
+
+*(superseded — the run below predates R-27 and row 8)* **The citable number is
+`1601 · 1586 P · 15 W · 0 F · 0 S @ core-go `a7a9493`` (2026-08-20)** — the
+full armed `validate-complete.sh python`, **exit 0, all six passes**, measured from the committed
+tree at `b4c4881`: pass 1b (`--profile core`) `747 · 632 P · 12 W · 0 F · 103 S`, pass 2 `55/55`,
+pass 3 `32/32`, substitute `8/8`, and **`registry` `18/18`** — with
+**`registry.v15_dispatch_config_refused` PASS**, i.e. R-11 **row 7** on the wire, so R-15 is
+confirmed **cross-impl** and not merely in-tree. Last session's one FAIL is gone: the
+`set-resolver-config-request.config` type-ref divergence was go's, as we routed, and go fixed it at
+`857a348`. **The first attempt at this run exited 1 on `concurrency.t2_1_sustained_load`** — a
+latency-ratio threshold (4.1x against a 4.0x ceiling) that **passed in pass 1b of the same run** and
+passes on a quiet host; host load, not this diff, and recorded rather than quietly re-run. Local:
+`3931 passed · 31 skipped · 1 F`, the one failure being `tests/interop/test_connect_to_rust_peer`
+dialing a fixed `127.0.0.1:9000` held by unrelated Selenium containers — the fixed-port
+anti-pattern's fourth occurrence.
 
 **§4.3 is built, the load-time normalizer is gone, and the new operation absorbed a capability
 nobody meant it to (2026-08-19 c).** Arch ruled SA-PY-21 Q1/Q2 and SA-PY-22 as one model (REGISTRY

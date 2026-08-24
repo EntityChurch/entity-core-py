@@ -60,7 +60,7 @@ from entity_handlers.substitute.urls import (
     DEFAULT_TREE_LEAF_SUFFIX,
     build_content_url,
     build_tree_url,
-    digest_hex,
+    wire_hex,
 )
 
 __all__ = [
@@ -85,5 +85,5 @@ __all__ = [
     "DEFAULT_TREE_LEAF_SUFFIX",
     "build_content_url",
     "build_tree_url",
-    "digest_hex",
+    "wire_hex",
 ]

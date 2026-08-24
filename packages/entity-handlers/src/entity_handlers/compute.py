@@ -63,7 +63,55 @@ BUILTIN_MAP = "system/compute/builtins/map"
 BUILTIN_FILTER = "system/compute/builtins/filter"
 BUILTIN_FOLD = "system/compute/builtins/fold"
 BUILTIN_STORE = "system/compute/builtins/store"
-_COLLECTION_BUILTINS = frozenset({BUILTIN_MAP, BUILTIN_FILTER, BUILTIN_FOLD})
+# The v3.24 collection primitives. All four are MUST-given-COMPUTE (§10.1):
+# they produce boundary bytes, so a peer computing a different result is
+# divergent, not merely slower.
+BUILTIN_RANGE = "system/compute/builtins/range"
+BUILTIN_GROUP_BY = "system/compute/builtins/group-by"
+BUILTIN_CONCAT = "system/compute/builtins/concat"
+BUILTIN_ASSOC = "system/compute/builtins/assoc"
+
+_COLLECTION_BUILTINS = frozenset({
+    BUILTIN_MAP, BUILTIN_FILTER, BUILTIN_FOLD,
+    BUILTIN_RANGE, BUILTIN_GROUP_BY, BUILTIN_CONCAT, BUILTIN_ASSOC,
+})
+
+#: `group-by`'s result element (§3.5, v3.25). A pinned type **name**, not a
+#: type-extension registration: §2.3 N1 + §4.1 encode a constructed entity by
+#: the *runtime kind* of the evaluated value and never by the declared
+#: schema, so a peer with no type extension produces byte-identical groups.
+TYPE_COMPUTE_GROUP = "system/compute/group"
+
+#: §7.2 flow-through, arg axis (§3.5's table, v3.25). An arg listed here sits
+#: in a **data position** — its value is *placed into* the output rather than
+#: *consumed* — so a `compute/error` arriving there flows in as a value
+#: instead of short-circuiting the whole apply.
+#:
+#: `store`'s `value` is the SA-9 write payload (ruled 2026-08-16); `assoc`'s
+#: `value` is the same shape one primitive over. `fold`'s `initial` joined them
+#: at the C-8 ruling (2026-08-21): it is **bound into the closure**, not read by
+#: `fold`, so it is a contained position by the rule that ruling states —
+#: *places-without-reading contains; reads-to-decide consumes*. **Every other
+#: position of every other builtin is consumed and short-circuits** — that is
+#: the half of v3.26 the ruling calls "add the carve-out, not remove the guard",
+#: stated at the arg boundary instead of at materialization.
+_CONTAINED_ARGS: dict[str, tuple[str, ...]] = {
+    BUILTIN_STORE: ("value",),
+    BUILTIN_ASSOC: ("value",),
+    BUILTIN_FOLD: ("initial",),
+}
+
+#: The maximum array length `range` will produce (§3.5 v3.25: *"an `n`
+#: exceeding the maximum representable array length"* is `count_out_of_range`).
+#:
+#: **Python has no such bound and that is the hazard.** In go and rust an `n`
+#: above `MaxInt64` fails the decode into the index type and never reaches the
+#: comparison; `cbor2` hands back an arbitrary-precision `int`, so the same
+#: program would sail past a naive `n < 0` check and try to build the list.
+#: Same class as the CAP-6a temporal-bounds defect (`capability/temporal.py`):
+#: *where a peer language fails closed by decoding, we fail closed by
+#: checking.* Pinned at go's own boundary so the refusal set is identical.
+MAX_ARRAY_LENGTH = 2**63 - 1
 
 # Inline-equivalent builtins (§3.5): the handler form IS an alias for the inline
 # expression type. We synthesize the inline entity and evaluate it, so the
@@ -129,9 +177,34 @@ ERR_CASCADE_LIMIT = "cascade_limit"
 ERR_PERMISSION_DENIED = "permission_denied"
 ERR_INSTALLATION_GRANT_INVALID = "installation_grant_invalid"
 ERR_AMBIGUOUS_RESOURCE = "ambiguous_resource"
-ERR_INDEX_OUT_OF_RANGE = "index_out_of_range"  # compute/index (§9.1, N.1)
+ERR_INDEX_OUT_OF_RANGE = "index_out_of_range"  # compute/index + assoc (§9.1, N.1; v3.25)
 ERR_CAST_OUT_OF_RANGE = "cast_out_of_range"    # compute/numeric-cast (§9.1, N.4)
+ERR_COUNT_OUT_OF_RANGE = "count_out_of_range"  # range's n (§9.1, v3.25)
 ERR_SCOPE_UNREACHABLE = "scope_unreachable"    # kind:entity binding unresolvable (§9.1, v3.19b N8)
+
+#: The **evaluation-limit** codes (§5.1 budget, §5.4 cascade). These are the one
+#: thing that does not flow into a contained position `[C-8 lead call, go
+#: 2026-08-21; py concurs]`.
+#:
+#: A limit code is not a value the closure produced — it is the evaluator
+#: refusing to run the closure at all — so placing it into the output would
+#: assert an element the program never computed. Concretely: `Evaluate`
+#: decrements once per call, so containing `budget_exhausted` and continuing
+#: turns one stop-point into `[be, be, …]` at a **shifted** budget, and two
+#: conformant peers fork on the array's bytes.
+#:
+#: **We apply it to the code, never to the provenance.** go's implementation
+#: checks `isEvalLimitCode` only on its *minted* arm, so a value-form
+#: `compute/error{code: "budget_exhausted"}` is contained there and propagated
+#: here — the §2.4 provenance asymmetry the same ruling closed, re-opened three
+#: codes wide. py has one representation and cannot express that split even by
+#: accident; the check is :func:`is_eval_limit`, and it is kind-and-code based
+#: exactly as :func:`is_error` is kind based. Routed to go and arch.
+_EVAL_LIMIT_CODES: frozenset[str] = frozenset({
+    ERR_BUDGET_EXHAUSTED,
+    ERR_DEPTH_EXCEEDED,
+    ERR_CASCADE_LIMIT,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -245,22 +318,136 @@ def _materialize_bare(value: Any, ctx: EvalContext) -> Any:
     `system/hash` reference** (V7 §1.4 refless — exactly what a hand-built
     entity carries); a value-kind field stays inline. Non-entity values pass
     through unchanged.
+
+    **Arrays materialize element-wise** — an entity-valued *element* becomes a
+    bare `system/hash` exactly as an entity-valued *field* does. This branch
+    was absent until v3.24 gave the evaluator array-of-entity values to
+    produce (`group-by`'s result, `concat`'s output, a `map` closure returning
+    a construct): before it, such an array reached the encoder with live
+    `Entity` objects inside and died there, which is the `error_to_wire` shape
+    one container out.
+
+    **A CONTAINED `compute/error` materializes code-only** `[MUST, v3.26]`
+    (§2.3 N1 / §3.5). See :func:`_materialize_contained_error` for why the
+    array-element position is the right and only place to put it.
     """
+    if isinstance(value, list):
+        return [_materialize_element(el, ctx) for el in value]
     if not isinstance(value, Entity):
         return value
+    if value.type == "compute/error":
+        _reject_scalar_error_materialization(value)
     data = value.data
     if not isinstance(data, dict):
         # A non-record entity — e.g. a `primitive/any` wrapper whose `data` is a
-        # bare value (the unwrapped result of an entity-native dispatch). There
-        # are no entity-valued fields to materialize; it is already bare.
+        # bare value (the unwrapped result of an entity-native dispatch). A
+        # *list* payload still needs element-wise treatment (an entity inside it
+        # is as unencodable there as anywhere else); a scalar is already bare.
+        if isinstance(data, list):
+            return Entity(type=value.type, data=_materialize_bare(data, ctx))
         return value
     bare_data: dict[str, Any] = {}
     for k, v in data.items():
         if isinstance(v, Entity):
             bare_data[k] = ctx.content_store.put(_materialize_bare(v, ctx))
+        elif isinstance(v, list):
+            bare_data[k] = _materialize_bare(v, ctx)
         else:
             bare_data[k] = v
     return Entity(type=value.type, data=bare_data)
+
+
+def _materialize_element(el: Any, ctx: EvalContext) -> Any:
+    """Materialize one **array element** — the v3.26 contained position.
+
+    Split out from :func:`_materialize_bare`'s array branch so the carve-out
+    has a name a reader can grep, and so the *scalar* guard below cannot be
+    reached from here by accident.
+    """
+    if is_error(el):
+        return _materialize_contained_error(el, ctx)
+    m = _materialize_bare(el, ctx)
+    if isinstance(m, Entity):
+        return ctx.content_store.put(m)
+    return m
+
+
+def _materialize_contained_error(v: Any, ctx: EvalContext) -> bytes:
+    """A `compute/error` CONTAINED in a value materializes **code-only**, by
+    bare `system/hash` `[MUST, v3.26]` (§2.3 N1, §3.5).
+
+    v3.23's ruling B said an error is *never* placed into the data, so N1 never
+    applies to it. That premise was true when written and stopped being true at
+    v3.25: §3.5's collection primitives created **data positions** — `assoc`'s
+    `value`, `concat`'s elements, `group-by`'s `members` — where an error is
+    *contained in* a value rather than *consumed*. Ruling B is **scoped, not
+    reversed**; arch's words are *"add the carve-out, not remove the guard."*
+
+    **v3.26's "and ONLY those three" did not survive its first re-reading, and
+    the count is now the rule instead** `[C-8, 2026-08-21]`. The enumeration was
+    taken over the v3.25 table, which does not contain `map`/`filter`/`fold` —
+    they predate it and place closure results into outputs too. The contained
+    set is five (`map`'s output element and `fold`'s final accumulator join the
+    three), and arch **replaced** the sentence rather than incrementing it:
+
+        A position is CONTAINED when the primitive PLACES the value without
+        reading it, and CONSUMED when it READS the value to decide control
+        flow, ordering, membership, or a write location.
+
+    A count is wrong again at the next primitive; a rule is not. **Note the
+    normative text still says "exactly three"** — `EXTENSION-COMPUTE` is v3.26
+    on disk and the C-8 deltas target v3.27, so a reader implementing from the
+    spec alone gets the superseded answer. Routed (SA-PY-26).
+
+    **Code-only is load-bearing, not tidiness.** If the contained element
+    carried `message`, two conformant peers whose diagnostics differ would
+    produce **different bytes for the containing array** — the array's content
+    hash would fork cross-impl on a string no spec pins. That is the same
+    argument :func:`error_materialized` makes for the two *write* boundaries,
+    reaching a third boundary: an array element that gets hashed. So this
+    function is `error_materialized` + `put`, and the reason it exists
+    separately is the *position*, not the encoding.
+
+    **Why the position is the array element and not the primitive.** All three
+    §3.5 contained positions are a direct element of some materialized array
+    (`members` is an array field of each group), so one carve-out at the
+    element boundary covers all three uniformly. Placing it per-primitive
+    instead would be three carve-outs that can drift apart, and would leave the
+    fourth container — whatever v3.27 adds — silently uncovered.
+    """
+    return ctx.content_store.put(error_materialized(v))
+
+
+def _reject_scalar_error_materialization(value: Entity) -> None:
+    """The other half of v3.26: the guard ruling B put on the **scalar** path,
+    kept exactly as strict as it was.
+
+    An error reaching materialization as a scalar — a top-level result, a
+    `compute/construct` field, a scope binding — means a §4.1 `is_error`
+    short-circuit was missed upstream. The two places an error legitimately
+    materializes as a scalar (the §7.2 `result_path` write and the SA-9 `store`
+    payload) call :func:`error_materialized` directly and never arrive here.
+
+    **The tell that the v3.26 carve-out was scoped wrong is a NON-element error
+    materializing quietly** — so this raises rather than embedding. It is an
+    internal-invariant violation, not an error-as-value: a `compute/error`
+    silently re-embedded into a construct field is a wrong *answer* that
+    hashes, sends, and is believed, which is strictly worse than a loud one.
+
+    Note this makes the **ordering** at the three compute→non-compute crossings
+    load-bearing: each checks `is_error(result)` *before* materializing, so a
+    legitimate top-level error-as-value (the F10 status-200 return) leaves by
+    its own door. Before v3.26 that ordering was free; it is now the difference
+    between an F10 return and a raise, and the tests say so.
+    """
+    raise RuntimeError(
+        "internal: compute/error reached _materialize_bare() as a SCALAR — a "
+        "§4.1 is_error short-circuit was missed upstream (EXTENSION-COMPUTE "
+        "v3.23 ruling B, scoped v3.26). A CONTAINED error (an array element) "
+        "materializes code-only via _materialize_contained_error; a scalar "
+        f"error propagates from its consumption site. code="
+        f"{error_data(value).get('code', '')!r}"
+    )
 
 
 def is_error(v: Any) -> bool:
@@ -287,6 +474,27 @@ def is_error(v: Any) -> bool:
     see :func:`error_to_wire`.
     """
     return _entity_type(v) == "compute/error"
+
+
+def is_eval_limit(v: Any) -> bool:
+    """Is ``v`` an **evaluation-limit** error — the one thing a CONTAINED
+    position does not contain? `[C-8, 2026-08-21]`
+
+    See :data:`_EVAL_LIMIT_CODES` for why. The discriminator is the **code**,
+    read through :func:`error_data` so it answers identically for a minted dict
+    and a stored-literal `Entity` — deliberately, because a discriminator that
+    reads the *representation* is the §2.4 asymmetry the C-8 ruling exists to
+    close, and re-introducing it three codes wide is still re-introducing it.
+
+    **The residual, stated rather than hidden:** a caller can store a
+    `compute/error{code: "budget_exhausted"}` literal and have a closure return
+    it, and this predicate will propagate it out of a `map` that would
+    otherwise contain it. That costs the caller their own `map` and escalates
+    nothing, but it does mean "the evaluator gave up" is spellable as a value.
+    The durable fix is a limit signal that is not a `compute/error` at all —
+    arch's to decide, filed as SA-PY-25.
+    """
+    return is_error(v) and error_data(v).get("code") in _EVAL_LIMIT_CODES
 
 
 def error_data(v: Any) -> dict[str, Any]:
@@ -976,14 +1184,21 @@ def _eval_apply_handler(
     #   - an unresolvable `value` hash, which is a resolution failure rather
     #     than an error *value* the caller asked to store (matches go's
     #     `resolveOrError` propagating before `Evaluate`).
-    write_payload = ("value",) if path == BUILTIN_STORE else ()
+    #
+    # **v3.26 generalizes the exemption from one arg to a table.** §3.5's
+    # collection primitives created a second data position of exactly the SA-9
+    # shape — `assoc`'s `value` — so the rule stopped being about `store` and
+    # became about *consumed vs contained*. `_CONTAINED_ARGS` is that table;
+    # anything not in it is consumed and short-circuits, which is the "add the
+    # carve-out, not remove the guard" half stated at the arg boundary.
+    contained_args = _CONTAINED_ARGS.get(path, ())
 
     # Evaluate args in canonical order
     resolved_args: dict[str, Any] = {}
     for name, h in canonical_sorted(args):
         if not isinstance(h, bytes):
             return make_error(ERR_INVALID_EXPRESSION, f"Arg {name} is not a hash reference")
-        is_write_payload = name in write_payload
+        is_contained = name in contained_args
         # `resolve_or_error` folds two outcomes into one `is_error`: a
         # resolution FAILURE (a minted not_found) and a successfully resolved
         # `compute/error` LITERAL. For a consumed operand those are the same
@@ -994,10 +1209,10 @@ def _eval_apply_handler(
         target = ctx.resolve(h)
         if target is None:
             return make_error(ERR_NOT_FOUND, f"Cannot resolve hash for arg {name}")
-        if is_error(target) and not is_write_payload:
+        if is_error(target) and not is_contained:
             return target
         value = evaluate(target, scope, budget, ctx)
-        if is_error(value) and not is_write_payload:
+        if is_error(value) and not is_contained:
             return value
         resolved_args[name] = value
 
@@ -1292,7 +1507,20 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
         out: list[Any] = []
         for el in collection:
             r = _invoke_closure(fn, [el], budget, ctx)
-            if is_error(r):
+            # The closure RESULT is a CONTAINED position `[C-8, 2026-08-21]`:
+            # `map` never reads it, it *places* it — structurally `concat`'s
+            # element and `assoc`'s `value` one primitive over. §1.5's model is
+            # "the same model as NaN propagation in IEEE 754", which is
+            # ELEMENT-WISE: `map(f, [1,2,3])` where `f` fails only on element 2
+            # is `[a, E, c]`. Short-circuiting the whole array is exception
+            # semantics — the model §1.5 explicitly declined.
+            #
+            # It materializes code-only, at `_materialize_element`, with no
+            # carve-out of its own: the v3.26 boundary is per array element and
+            # therefore already covered this position before the position
+            # existed. That is what "the fourth container is silently
+            # uncovered" was written to avoid, and it held.
+            if is_eval_limit(r):
                 return r
             out.append(r)
         return out
@@ -1307,6 +1535,17 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
         kept: list[Any] = []
         for el in collection:
             r = _invoke_closure(fn, [el], budget, ctx)
+            # The predicate RESULT is a CONSUMED position `[C-8, 2026-08-21]` —
+            # `filter` READS it for truthiness (§4.5) to decide inclusion, which
+            # is §7.2's plain definition of consumption. Identical in kind to
+            # `group-by`'s derived key, and it fails the same way if contained:
+            # an error has no truth value, so coercing it silently DROPS the
+            # element — a well-formed wrong answer carrying no error, the exact
+            # outcome §3.5 refused when it declined to clamp `range(-1)` to `[]`.
+            #
+            # This arm was already correct; the check stays here so the
+            # asymmetry with `map` eight lines up is deliberate and legible,
+            # rather than looking like one of them was forgotten.
             if is_error(r):
                 return r
             if truthy(r):
@@ -1319,16 +1558,338 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
         acc = args.get("initial")
         if not isinstance(collection, list):
             return make_error(ERR_TYPE_MISMATCH, "fold collection must be an array")
+        # `initial` is a CONTAINED arg (`_CONTAINED_ARGS`), so an error arrives
+        # here as a value rather than short-circuiting at the arg loop — except
+        # a limit code, which is not a value at all.
+        if is_eval_limit(acc):
+            return acc
         for el in collection:
             acc = _invoke_closure(fn, [acc, el], budget, ctx)
-            if is_error(acc):
+            # The accumulator is a CONTAINED position `[C-8, 2026-08-21]`, and
+            # arch names it the one of the three with the widest blast radius if
+            # wrong — the only one where the alternative reading produces a
+            # different VALUE rather than a different cost.
+            #
+            # `fold` binds the accumulator into the next invocation and never
+            # reads it, so **a closure that ignores its accumulator recovers**.
+            # That is correct under the error-as-value model, where errors are
+            # ordinary values a program may inspect (§4.1 `is_error` exists
+            # precisely so a fold can branch on one). Short-circuiting here
+            # would make recovery unexpressible and would be exception
+            # semantics wearing a value model's clothes.
+            if is_eval_limit(acc):
                 return acc
         return acc
+
+    if path == BUILTIN_RANGE:
+        return _eval_builtin_range(args, budget)
+
+    if path == BUILTIN_GROUP_BY:
+        return _eval_builtin_group_by(args, budget, ctx)
+
+    if path == BUILTIN_CONCAT:
+        return _eval_builtin_concat(args)
+
+    if path == BUILTIN_ASSOC:
+        return _eval_builtin_assoc(args)
 
     if path == BUILTIN_STORE:
         return _eval_builtin_store(args, ctx)
 
     return make_error(ERR_NOT_FOUND, f"Unknown builtin: {path}")
+
+
+# ---------------------------------------------------------------------------
+# The v3.24 collection primitives — range / group-by / concat / assoc (§3.5)
+# ---------------------------------------------------------------------------
+#
+# Error-as-value flow-through is governed by §7.2, not by a rule of their own
+# `[v3.25]`. §3.5's table applies the existing consumed-operand `[MUST]` to all
+# seven positions so no implementer re-derives it:
+#
+#   range     n              consumed (sizes the array)      short-circuit
+#   group-by  derived key    consumed (compared to group)    short-circuit
+#   group-by  element        copied into `members`           CONTAIN
+#   assoc     index          consumed (positions the write)  short-circuit
+#   assoc     value          placed into the output          CONTAIN
+#   concat    each collection consumed (length read to copy) short-circuit
+#   concat    element        copied into the output          CONTAIN
+#
+# `[C-8, 2026-08-21]` extends the same table to the three closure primitives,
+# which predate it — by the rule *places-without-reading contains*:
+#
+#   map       closure result placed into the output          CONTAIN
+#   filter    predicate result read for truthiness (§4.5)    short-circuit
+#   fold      accumulator    bound into the next invocation  CONTAIN
+#
+# with the evaluation-LIMIT codes carved out of both CONTAIN rows — see
+# `_EVAL_LIMIT_CODES`.
+#
+# The *arg-level* half of that table lives in `_CONTAINED_ARGS` and is applied
+# by `_eval_apply_handler`'s canonical-order arg loop, which is why these
+# functions receive already-evaluated values and never resolve a hash. The
+# *element-level* half is here, and its materialization is `_materialize_bare`.
+
+
+def _as_array_index(v: Any) -> int | None:
+    """`v` as an array index, or None if it is not an integer value.
+
+    `bool` is an `int` subclass in Python and is **not** an index — the same
+    exclusion `compute/index` already makes. Magnitude is not judged here:
+    an out-of-domain magnitude is not a type error (§2.2's cross-impl ruling),
+    so the caller decides between `index_out_of_range` and
+    `count_out_of_range` on a value this function has already accepted.
+    """
+    if isinstance(v, bool) or not isinstance(v, int):
+        return None
+    return v
+
+
+def _eval_builtin_range(args: dict[str, Any], budget: Budget) -> Any:
+    """`range(n)` → `[0 … n-1]`, empty when `n` is `0` (§3.5, v3.24).
+
+    Single-argument form only — a start offset is expressed inside the lambda,
+    not as a second parameter. It exists because `map`/`filter`/`fold` pass an
+    element and not its index.
+
+    **A negative `n`, or an `n` exceeding the maximum representable array
+    length, is `count_out_of_range`** `[MUST, v3.25]` — *not* `type_mismatch`
+    (§2.2: an out-of-domain magnitude is not a type error) and *not* clamped to
+    `[]` (`n` is a loop bound, so a silent empty propagates through every
+    downstream `map`/`filter`/`fold` and yields a well-formed wrong answer
+    carrying no error).
+    """
+    n = _as_array_index(args.get("n"))
+    if n is None:
+        return make_error(
+            ERR_TYPE_MISMATCH,
+            f"range n must be an integer, got {type(args.get('n')).__name__}",
+        )
+    if n < 0 or n > MAX_ARRAY_LENGTH:
+        # The upper bound is where Python differs from every peer language and
+        # therefore where it must check rather than decode — see
+        # MAX_ARRAY_LENGTH.
+        return make_error(
+            ERR_COUNT_OUT_OF_RANGE,
+            f"range n must be non-negative and representable, got {n}",
+        )
+    # Charge the budget per produced element so `range(huge)` exhausts rather
+    # than OOMs — the same per-step cost `map`/`filter`/`fold` already pay.
+    # Checked BEFORE allocating: the point is to refuse the allocation, and a
+    # check that runs after it has already happened is a comment.
+    if n > budget.operations:
+        return make_error(
+            ERR_BUDGET_EXHAUSTED,
+            f"range({n}) exceeds remaining budget {budget.operations}",
+        )
+    budget.operations -= n
+    return list(range(n))
+
+
+def _eval_builtin_group_by(args: dict[str, Any], budget: Budget, ctx: EvalContext) -> Any:
+    """`group-by(collection, fn)` — group elements by a derived key, one pass
+    (§3.5, v3.24; result shape ruled v3.25).
+
+    **The result is an array of `system/compute/group{key, members}`** `[MUST,
+    v3.25]` — the key is carried, not dropped, because the shapes this
+    primitive exists to serve (a histogram, a bucketed aggregation, a router)
+    are exactly the ones whose output is unreadable without its labels.
+
+    Within each group, elements keep input index order; **groups are ordered by
+    first appearance of their key** — not by key sort order, which would need a
+    total order over arbitrary key types this extension does not define.
+
+    **Key equality is byte-identity over the canonical ECF encoding** of the
+    derived key — the protocol's own value identity, defined for every key type
+    `fn` may return.
+
+    A `compute/error` **key** short-circuits even though the key now has an
+    output position: grouping by an error would make its `message` string
+    structurally load-bearing, so two failures worded differently would become
+    two groups and one reworded message would change the result's shape. The
+    **element** is a contained position and flows into `members` untouched.
+    """
+    collection = args.get("collection")
+    fn = args.get("fn")
+    if not isinstance(collection, list):
+        return make_error(ERR_TYPE_MISMATCH, "group-by collection must be an array")
+
+    order: list[bytes] = []
+    members: dict[bytes, list[Any]] = {}
+    key_values: dict[bytes, Any] = {}
+    for el in collection:
+        key = _invoke_closure(fn, [el], budget, ctx)
+        if is_error(key):
+            # Consumed position — §7.2 short-circuit.
+            return key
+        key_bytes = _canonical_key_bytes(key, ctx)
+        if key_bytes is None:
+            return make_error(
+                ERR_TYPE_MISMATCH,
+                f"group-by key is not encodable ({type(key).__name__})",
+            )
+        if key_bytes not in members:
+            order.append(key_bytes)
+            members[key_bytes] = []
+            key_values[key_bytes] = key
+        members[key_bytes].append(el)
+
+    return [
+        Entity(
+            type=TYPE_COMPUTE_GROUP,
+            data={"key": key_values[k], "members": members[k]},
+        )
+        for k in order
+    ]
+
+
+def _canonical_key_bytes(key: Any, ctx: EvalContext) -> bytes | None:
+    """The ECF byte-identity of a `group-by` key, or None if unencodable.
+
+    The key is materialized first: an entity-valued key must compare by the
+    same bytes it would carry in the result, not by Python object identity.
+    """
+    try:
+        return ecf_encode(_materialize_bare(key, ctx))
+    except Exception:
+        return None
+
+
+def _eval_builtin_concat(args: dict[str, Any]) -> Any:
+    """`concat(...collections)` — join arrays **order-preserving, one level**
+    (§3.5, v3.24). It does **not** flatten recursively.
+
+    `concat()` with no collections is the empty array; `concat(a)` is `a`.
+    There is otherwise no way to join k arrays: `fold` cannot (the accumulator
+    step needs the append that does not exist), `map` yields k arrays, and
+    `construct` changes the entity shape, which boundary equivalence forbids.
+
+    Element types MUST match across all collections; a mismatch is a
+    `type_mismatch` **error-as-value**, not a fault.
+
+    **A `compute/error` element is type-transparent to that check** `[MUST,
+    v3.25]`: it neither matches nor mismatches, and flows through untouched.
+    Per §1.5 an error is *"the same model as NaN propagation in IEEE 754"* — a
+    poisoned value **of** the array's element type, not a value of a different
+    type — and §7.2 scopes `concat` to consuming its `collections`, never their
+    elements, so inspecting elements for errors is the one behaviour it must
+    not have.
+    """
+    collections = args.get("collections")
+    if not isinstance(collections, list):
+        return make_error(
+            ERR_TYPE_MISMATCH,
+            "concat collections must be an array of arrays, got "
+            f"{type(collections).__name__}",
+        )
+
+    out: list[Any] = []
+    tag: str | None = None
+    for sub in collections:
+        if is_error(sub):
+            # §3.5's table: each `collection` is a CONSUMED position — "its
+            # length is read to copy" — so an error there short-circuits rather
+            # than falling through to the array-shape check. Reading it as a
+            # shape violation would answer `type_mismatch` and discard the
+            # original code, which is exactly the substitution §7.2 forbids for
+            # a consumed operand.
+            return sub
+        if not isinstance(sub, list):
+            return make_error(
+                ERR_TYPE_MISMATCH,
+                f"concat: each collection must be an array, got {type(sub).__name__}",
+            )
+        for el in sub:
+            if is_error(el):
+                out.append(el)
+                continue
+            el_tag = _element_type_tag(el)
+            if tag is None:
+                tag = el_tag
+            elif el_tag != tag:
+                return make_error(
+                    ERR_TYPE_MISMATCH,
+                    f"concat: element type {el_tag!r} does not match {tag!r}",
+                )
+            out.append(el)
+    return out
+
+
+def _element_type_tag(v: Any) -> str:
+    """Classify a compute value for `concat`'s element-type-match check.
+
+    `int`/`uint` collapse to one `"integer"` tag — they are **annotations, not
+    distinct value types** (§2.2), so a `concat` of an int array and a uint
+    array is not a mismatch. `bool` is checked before `int` because it is an
+    `int` subclass here and is a distinct value type on the wire.
+    """
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "float"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, (bytes, bytearray)):
+        return "bytes"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, Entity):
+        return f"entity:{v.type}"
+    if isinstance(v, dict) and "type" in v:
+        return f"entity:{v['type']}"
+    if isinstance(v, dict):
+        return "record"
+    return type(v).__name__
+
+
+def _eval_builtin_assoc(args: dict[str, Any]) -> Any:
+    """`assoc(collection, index, value)` — a new array identical to
+    `collection` except at `index`, which carries `value` (§3.5, v3.24).
+
+    **An out-of-range `index` — negative, or ≥ the collection's length — is
+    `index_out_of_range`** `[MUST, v3.25]`: the same code and the same
+    condition as `compute/index` (§2.2). *(v3.24 said `type_mismatch` here;
+    that contradicted §2.2's ruling that an out-of-bounds magnitude is not a
+    type error, and one document must not answer one malformed program with two
+    codes depending on which array operation it reached.)*
+
+    `value` is a **contained** position: an error-as-value is placed into the
+    array and the whole `assoc` does **not** short-circuit. That exemption is
+    applied upstream by `_CONTAINED_ARGS`, so by the time it reaches here it is
+    simply a value.
+
+    **`assoc` MUST NOT be an implicit lowering target** `[MUST]` — `map` and
+    `fold` are never lowered onto it. This evaluator performs no such lowering,
+    so there is nothing here to suppress; the rule is recorded because an
+    "optimization" that rewrote a fold into a sequence of `assoc` updates would
+    silently remove the parallelism the fold form buys.
+    """
+    collection = args.get("collection")
+    if not isinstance(collection, list):
+        return make_error(ERR_TYPE_MISMATCH, "assoc collection must be an array")
+
+    idx = _as_array_index(args.get("index"))
+    if idx is None:
+        return make_error(
+            ERR_TYPE_MISMATCH,
+            f"assoc index must be an integer, got {type(args.get('index')).__name__}",
+        )
+    if idx < 0 or idx >= len(collection):
+        return make_error(
+            ERR_INDEX_OUT_OF_RANGE,
+            f"assoc index {idx} out of range for array of length {len(collection)}",
+        )
+
+    if "value" not in args:
+        return make_error(ERR_MISSING_ARGUMENT, "assoc requires a value arg")
+
+    out = list(collection)
+    out[idx] = args["value"]
+    return out
 
 
 def _eval_builtin_store(args: dict[str, Any], ctx: EvalContext) -> Any:
@@ -2085,6 +2646,22 @@ def _capture_scope(scope: Scope, ctx: EvalContext) -> bytes | None:
             ent_hash = ctx.content_store.put(_materialize_bare(value, ctx))
             ctx.mark_encountered(ent_hash)
             bindings[name] = {"kind": "entity", "entity_hash": ent_hash}
+        elif isinstance(value, list):
+            # An ARRAY-valued binding is the same crossing as the branch above,
+            # and it was unencodable until v3.24 gave the evaluator arrays of
+            # entities to produce. `let g = group-by(…) in map(g, fn)` captures
+            # `g` — a list of `system/compute/group` entities — and the encoder
+            # died on the live `Entity` inside the `kind:"value"` binding,
+            # killing the handler task and answering nothing.
+            #
+            # So the α rule the `Entity` branch already states applies
+            # element-wise: an entity ELEMENT is stored and referenced by its
+            # bare `system/hash`, exactly as an entity FIELD is. Read-back then
+            # follows §2.3's rule for a materialized bare value — `index`
+            # yields the hash, and the caller follows it with
+            # `compute/lookup/hash` — rather than auto-resolving by shape,
+            # which N3 forbids.
+            bindings[name] = {"kind": "value", "value": _materialize_bare(value, ctx)}
         else:
             bindings[name] = {"kind": "value", "value": value}
 
@@ -2733,7 +3310,13 @@ async def _handle_eval(
     )
 
     result = evaluate(expression, scope, budget, eval_ctx)
-    result = _materialize_bare(result, eval_ctx)  # v3.19c α: bare at the compute→non-compute crossing
+    # v3.19c α: bare at the compute→non-compute crossing. **Guarded on
+    # is_error [v3.26]:** a top-level error-as-value leaves by its own door
+    # below (F10 / the `result_path` write / the entity-native unwrap), and
+    # since v3.26 `_materialize_bare` *raises* on a scalar error rather than
+    # passing it through, so this order is load-bearing rather than cosmetic.
+    if not is_error(result):
+        result = _materialize_bare(result, eval_ctx)
 
     # F10 (PROPOSAL-COMPUTE-NAVIGATION-AND-ERROR-SURFACE): an evaluated
     # compute/error is a *value* (§1.5 — errors propagate like NaN). Evaluation
@@ -3238,7 +3821,13 @@ def _re_evaluate(
 
     scope = Scope()
     result = evaluate(expression, scope, budget, eval_ctx)
-    result = _materialize_bare(result, eval_ctx)  # v3.19c α: bare at the compute→non-compute crossing
+    # v3.19c α: bare at the compute→non-compute crossing. **Guarded on
+    # is_error [v3.26]:** a top-level error-as-value leaves by its own door
+    # below (F10 / the `result_path` write / the entity-native unwrap), and
+    # since v3.26 `_materialize_bare` *raises* on a scalar error rather than
+    # passing it through, so this order is load-bearing rather than cosmetic.
+    if not is_error(result):
+        result = _materialize_bare(result, eval_ctx)
 
     from entity_core.storage.emit import EmitContext
 
@@ -3573,6 +4162,43 @@ _COMPUTE_TYPE_DEFS: list[dict[str, Any]] = [
         "path": {"type_ref": "system/tree/path"},
         "value": {"type_ref": "system/hash"},
     }},
+    # The v3.24 collection primitives' args types — pinned in the spec on the
+    # same reasoning as map/filter/fold above (a transferable IR requires every
+    # peer to agree on their shape).
+    {"name": "system/compute/range-args", "description": "Args for compute range builtin", "fields": {
+        "n": {"type_ref": "system/hash"},  # non-negative integer expression
+    }},
+    {"name": "system/compute/group-by-args", "description": "Args for compute group-by builtin", "fields": {
+        "collection": {"type_ref": "system/hash"},
+        "fn": {"type_ref": "system/hash"},  # unary closure (element → key)
+    }},
+    # `collections` is ONE scalar hash resolving to an array of arrays — NOT an
+    # array of hashes `[C-8 D3, 2026-08-21]`. All three seats evaluated the
+    # scalar shape while declaring the array shape; arch ruled the evaluated
+    # shape normative, and **not** because three seats agreed (that is
+    # cohort-consistency, not evidence). The derivation is §7.1: the reactive
+    # `walk` descends on scalar `system/hash` FIELD VALUES and does not enter
+    # arrays, so under the declared shape every `lookup/tree` inside every
+    # sub-collection of every `concat` goes unregistered and a reactive concat
+    # silently never re-fires. It evaluates correctly once and is never woken.
+    {"name": "system/compute/concat-args", "description": "Args for compute concat builtin", "fields": {
+        "collections": {"type_ref": "system/hash"},
+    }},
+    {"name": "system/compute/assoc-args", "description": "Args for compute assoc builtin", "fields": {
+        "collection": {"type_ref": "system/hash"},
+        "index": {"type_ref": "system/hash"},
+        "value": {"type_ref": "system/hash"},  # the replacement element
+    }},
+    # group-by's RESULT element (§3.5, v3.25) — the one result type §3.5 pins;
+    # the other three return arrays of the input's own element type and need no
+    # declaration. Registering the *name* costs one agreed string and buys
+    # nothing at encode time: per §2.3 N1 / §4.1 a constructed entity is encoded
+    # by the RUNTIME KIND of the evaluated value and never by the declared
+    # schema, so a peer with no type extension produces byte-identical groups.
+    {"name": "system/compute/group", "description": "group-by result element", "fields": {
+        "key": {"type_ref": "primitive/any"},
+        "members": {"array_of": {"type_ref": "primitive/any"}},
+    }},
     # Per PROPOSAL-PATH-AS-RESOURCE-HYGIENE P-COMPUTE-3: subgraph path
     # comes from ctx.resource; uninstall-request wrapper eliminated.
 ]
@@ -3803,7 +4429,13 @@ class ComputeExtension(Extension):
         )
 
         result = evaluate(expression, scope, budget, eval_ctx)
-        result = _materialize_bare(result, eval_ctx)  # v3.19c α: bare at the compute→non-compute crossing
+        # v3.19c α: bare at the compute→non-compute crossing. **Guarded on
+        # is_error [v3.26]:** a top-level error-as-value leaves by its own
+        # door below (the entity-native unwrap), and since v3.26
+        # `_materialize_bare` *raises* on a scalar error rather than passing
+        # it through, so this order is load-bearing rather than cosmetic.
+        if not is_error(result):
+            result = _materialize_bare(result, eval_ctx)
         return _unwrap_entity_native_result(result)
 
     def manifest(self) -> Entity:
