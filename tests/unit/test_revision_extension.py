@@ -31,6 +31,9 @@ from entity_handlers.revision import (
     _is_ancestor,
     _check_relationship,
     _collect_missing_pull_hashes,
+    _find_merge_strategy,
+    _dispatch_merge_handler,
+    _merge_bindings,
 )
 
 
@@ -1903,8 +1906,304 @@ class TestKeepBoth:
 
 
 # =============================================================================
+# §5.3 — Custom merge handler delegation
+# =============================================================================
+
+
+class TestCustomMergeHandlerDelegation:
+    """§5.3: `strategy: "handler"` delegates content-level merge to the handler
+    named in the companion `handler` field, which returns a merged entity or a
+    conflict.
+
+    Built after core-go routed us the config-write half of this limb
+    (HANDOFF-2026-08-14-c §5). Rejecting a config at write time while never
+    honouring it at merge time would have been the worse half to build alone:
+    the operator gets a clean error for the unusable config and silence for
+    the usable one.
+
+    The dispositions below are the three §5.3 leaves the spec is silent on.
+    core-go published theirs as E4 for the cohort to match or object; we
+    match, and each one is a row here rather than a paragraph.
+    """
+
+    def _dispatcher(self, response, *, record=None, raises=False):
+        """A stand-in merge handler. Records the capability it was dispatched
+        under, which is the only way to observe the authority question."""
+        async def _dispatch(uri, operation, params, capability, *args, **kwargs):
+            if record is not None:
+                record.append({
+                    "uri": uri,
+                    "operation": operation,
+                    "params": params,
+                    "capability": capability,
+                })
+            if raises:
+                raise RuntimeError("handler exploded")
+            return response
+        return _dispatch
+
+    def _entities(self, ctx):
+        cs = ctx.emit_pathway.content_store
+        return (
+            cs.put(Entity(type="test/file", data={"content": "base"})),
+            cs.put(Entity(type="test/file", data={"content": "local"})),
+            cs.put(Entity(type="test/file", data={"content": "remote"})),
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolved_response_binds_merged_entity(self, handler_context):
+        cs = handler_context.emit_pathway.content_store
+        base, local, remote = self._entities(handler_context)
+        merged = cs.put(Entity(type="test/file", data={"content": "base+local+remote"}))
+        calls: list[dict] = []
+        handler_context._execute_dispatcher = self._dispatcher(
+            ExecuteResult(status=200, result={
+                "type": "system/revision/merge-response",
+                "data": {"resolved": True, "entity": merged},
+            }),
+            record=calls,
+        )
+
+        got = await _dispatch_merge_handler(
+            handler_context, "app/merge/text", base, local, remote,
+        )
+        assert got == merged
+
+        # The request shape is `{base, local, remote}` and NOT `path` — §5.3's
+        # normative type block and §5.2's pseudocode against the §5.3 EXECUTE
+        # example, two to one. core-go pinned the same; A-6 E1 asks arch to rule.
+        assert len(calls) == 1
+        assert calls[0]["uri"] == "app/merge/text"
+        assert calls[0]["operation"] == "merge"
+        assert calls[0]["params"]["type"] == "system/revision/merge-request"
+        assert calls[0]["params"]["data"] == {
+            "base": base, "local": local, "remote": remote,
+        }
+
+    @pytest.mark.asyncio
+    async def test_dispatched_under_caller_capability(self, handler_context):
+        """E4 disposition 1 — authority. The handler is application code named
+        by whoever wrote the merge config; under the revision handler's own
+        grant, a config author reaches paths the merging caller cannot."""
+        base, local, remote = self._entities(handler_context)
+        merged = handler_context.emit_pathway.content_store.put(
+            Entity(type="test/file", data={"content": "merged"}))
+        calls: list[dict] = []
+        caller_cap = {"grants": [{"resources": {"include": ["data/**"]}}]}
+        handler_context.caller_capability = caller_cap
+        handler_context.handler_grant = {"grants": [{"resources": {"include": ["*"]}}]}
+        handler_context._execute_dispatcher = self._dispatcher(
+            ExecuteResult(status=200, result={
+                "data": {"resolved": True, "entity": merged}}),
+            record=calls,
+        )
+
+        await _dispatch_merge_handler(
+            handler_context, "app/merge/text", base, local, remote,
+        )
+        assert calls[0]["capability"] is caller_cap, (
+            "merge handler ran under the revision handler's grant — a config "
+            "author would reach paths the merging caller cannot"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unresolved_and_failed_responses_fall_through(self, handler_context):
+        """`resolved: false` is the handler declining, not failing — and a
+        non-2xx is a handler that could not run. Both land on the conflict."""
+        base, local, remote = self._entities(handler_context)
+        for response in (
+            ExecuteResult(status=200, result={
+                "data": {"resolved": False, "reason": "semantic conflict"}}),
+            ExecuteResult(status=404, error="no such handler"),
+            ExecuteResult(status=500, error="handler blew up"),
+        ):
+            handler_context._execute_dispatcher = self._dispatcher(response)
+            assert await _dispatch_merge_handler(
+                handler_context, "app/merge/text", base, local, remote,
+            ) is None, response
+
+    @pytest.mark.asyncio
+    async def test_missing_handler_falls_through(self, handler_context):
+        """E4 disposition 2 — a handler that is absent or raises. A dispatch
+        that never returns a response resolves nothing."""
+        base, local, remote = self._entities(handler_context)
+        handler_context._execute_dispatcher = self._dispatcher(None, raises=True)
+        assert await _dispatch_merge_handler(
+            handler_context, "app/merge/text", base, local, remote,
+        ) is None
+
+        # No dispatcher wired at all — ctx.execute_with_capability raises.
+        handler_context._execute_dispatcher = None
+        assert await _dispatch_merge_handler(
+            handler_context, "app/merge/text", base, local, remote,
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_malformed_responses_fall_through(self, handler_context):
+        """E4 disposition 3 — the one that protects state rather than merely
+        recording it. `resolved: true` with nothing usable behind it must not
+        bind: a missing hash, a non-hash, or a hash this peer does not hold
+        would put an unreadable path into the merged trie."""
+        base, local, remote = self._entities(handler_context)
+        dangling = b"\x00" + b"\xab" * 32
+        assert handler_context.emit_pathway.content_store.get(dangling) is None
+        for result in (
+            {"data": {"resolved": True}},
+            {"data": {"resolved": True, "entity": "not-a-hash"}},
+            {"data": {"resolved": True, "entity": dangling}},
+            {"data": "not-a-dict"},
+            None,
+        ):
+            handler_context._execute_dispatcher = self._dispatcher(
+                ExecuteResult(status=200, result=result))
+            assert await _dispatch_merge_handler(
+                handler_context, "app/merge/text", base, local, remote,
+            ) is None, result
+
+    @pytest.mark.asyncio
+    async def test_cascade_reaches_the_handler_and_binds_the_result(
+        self, handler_context,
+    ):
+        """End-to-end through `_merge_bindings`: a per-type config carrying the
+        sentinel plus its companion path resolves a divergence the built-in
+        strategies would have conflicted on."""
+        cs = handler_context.emit_pathway.content_store
+        from entity_core.storage.emit import EmitContext
+        handler_context.emit_pathway.emit(
+            "system/revision/config/merge/type/test/file",
+            Entity(type="system/revision/merge-config", data={
+                "strategy": "handler", "handler": "app/merge/text"}),
+            EmitContext.protocol(author="operator"),
+        )
+        base, local, remote = self._entities(handler_context)
+        merged = cs.put(Entity(type="test/file", data={"content": "diff3 result"}))
+        handler_context._execute_dispatcher = self._dispatcher(
+            ExecuteResult(status=200, result={
+                "data": {"resolved": True, "entity": merged}}))
+
+        bindings, conflicts, _ = await _merge_bindings(
+            handler_context,
+            {"data/shared.txt": base},
+            {"data/shared.txt": local},
+            {"data/shared.txt": remote},
+            "three-way",
+        )
+        assert conflicts == {}, "handler resolved it; nothing should conflict"
+        assert bindings["data/shared.txt"] == merged
+
+    @pytest.mark.asyncio
+    async def test_cascade_control_without_handler_conflicts(self, handler_context):
+        """The control. The row above passes for a peer that resolves this
+        divergence by any means — including one that never dispatches. Same
+        divergence, no merge config: it MUST conflict, and local stays bound."""
+        base, local, remote = self._entities(handler_context)
+        bindings, conflicts, _ = await _merge_bindings(
+            handler_context,
+            {"data/shared.txt": base},
+            {"data/shared.txt": local},
+            {"data/shared.txt": remote},
+            "three-way",
+        )
+        assert "data/shared.txt" in conflicts
+        assert bindings["data/shared.txt"] == local
+
+    @pytest.mark.asyncio
+    async def test_sentinel_without_companion_path_conflicts(self, handler_context):
+        """A config that bypassed the write-time check (raw `tree:put` on the
+        handler-owned namespace — §2.3 calls that a deployment
+        misconfiguration) reaches merge time with nothing to dispatch to. It
+        degrades to a conflict; it must not dispatch to a path-shaped nothing.
+        """
+        from entity_core.storage.emit import EmitContext
+        handler_context.emit_pathway.emit(
+            "system/revision/config/merge/type/test/file",
+            Entity(type="system/revision/merge-config", data={"strategy": "handler"}),
+            EmitContext.protocol(author="operator"),
+        )
+        base, local, remote = self._entities(handler_context)
+        calls: list[dict] = []
+        handler_context._execute_dispatcher = self._dispatcher(
+            ExecuteResult(status=200, result={"data": {"resolved": False}}),
+            record=calls,
+        )
+
+        bindings, conflicts, _ = await _merge_bindings(
+            handler_context,
+            {"data/shared.txt": base},
+            {"data/shared.txt": local},
+            {"data/shared.txt": remote},
+            "three-way",
+        )
+        assert "data/shared.txt" in conflicts
+        assert bindings["data/shared.txt"] == local
+        assert calls == [], "dispatched with no handler path"
+
+
+# =============================================================================
 # W5 — Per-path/per-type merge config cascade
 # =============================================================================
+
+
+class TestMergeConfigStarScope:
+    """§5.1: a `pattern: "*"` merge config matches ALL paths, peer-wide.
+
+    core-go's A-6 E5 (HANDOFF-2026-08-14-c §6) names this a three-language
+    trap and lists Python among the languages whose stdlib pulls the other
+    way — "Python's `fnmatch` over a segment". For Go's `path.Match` and the
+    common Rust glob crates that is right; for Python's `fnmatch` it is not.
+    `fnmatch` translates `*` to `.*`, which crosses `/` — it has no concept of
+    path segments at all. So we get the spec's reading from the stdlib for
+    free, and the trap is real for two of the three languages, not three.
+
+    Pinned here because "we happen to be correct" is worth exactly nothing
+    without a row that fails if the behaviour changes — swapping in a
+    segment-aware matcher (pathlib's `PurePath.match`, a glob crate binding)
+    would silently narrow every `*` config on the peer.
+    """
+
+    def _put_config(self, ctx, name, data):
+        from entity_core.storage.emit import EmitContext
+        ctx.emit_pathway.emit(
+            f"system/revision/config/merge/path/{name}",
+            Entity(type="system/revision/merge-config", data=data),
+            EmitContext.protocol(author="operator"),
+        )
+
+    def test_star_matches_nested_path(self, handler_context):
+        """The v7.70 A1 footgun is peer-WIDE, and depth must not limit it."""
+        self._put_config(
+            handler_context, "everything",
+            {"pattern": "*", "strategy": "source-wins"},
+        )
+        for path in ("top.txt", "a/b.txt", "a/b/c/d/deep.txt"):
+            assert _find_merge_strategy(
+                handler_context, "", path, None, None,
+            ) == ("source-wins", None), path
+
+    def test_control_no_config_is_default(self, handler_context):
+        """Without this row the one above passes for a peer that returns
+        `source-wins` unconditionally."""
+        assert _find_merge_strategy(
+            handler_context, "", "a/b/c/d/deep.txt", None, None,
+        ) == ("three-way", None)
+
+    def test_more_specific_pattern_beats_star(self, handler_context):
+        """`*` matching everything must not mean `*` winning everything —
+        specificity still orders the two."""
+        self._put_config(
+            handler_context, "everything",
+            {"pattern": "*", "strategy": "source-wins"},
+        )
+        self._put_config(
+            handler_context, "txt-files",
+            {"pattern": "data/*.txt", "strategy": "target-wins"},
+        )
+        assert _find_merge_strategy(
+            handler_context, "", "data/notes.txt", None, None,
+        ) == ("target-wins", None)
+        assert _find_merge_strategy(
+            handler_context, "", "other/notes.md", None, None,
+        ) == ("source-wins", None)
 
 
 class TestMergeConfigCascade:

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from entity_core.capability.grant import Grant, create_owner_grant
 from entity_core.crypto.identity import Keypair
 from entity_core.peer import PeerBuilder
@@ -171,34 +173,198 @@ def test_seed_policy_default_drives_authenticate_for_unknown_peer() -> None:
     ), "default seed-policy entry not applied at authenticate"
 
 
-def test_with_seed_policy_from_file(tmp_path) -> None:
-    f = tmp_path / "seed-policy.json"
-    f.write_text(json.dumps({
-        "default": {
-            "grants": [{
-                "handlers": {"include": ["system/tree"]},
-                "resources": {"include": ["shared/*"]},
-                "operations": {"include": ["get"]},
-            }],
-        },
-    }))
+# ---------------------------------------------------------------------------
+# Seed-policy file format — the keystone-owned cross-peer canonical shape
+# (protocol-generator/shared/seed-policy/seed-policy.schema.json). All three
+# ground-up impls read this ONE format; these tests lock Python's side.
+# ---------------------------------------------------------------------------
 
-    peer, _ = _build(with_seed_policy_from_file=str(f))
+# The keystone examples/operator-admin.json pattern: a named operator hex
+# granted wide admin, everyone else falling to a declared floor.
+_ADMIN_HEX = (
+    "0098ddb68a95829a86dd50f328062fadb1926c3667866e4b389b161dfcf3c2a556"
+)
+
+
+def _canonical_seed_policy() -> dict:
+    return {
+        "version": 1,
+        "entries": [
+            {"grantee": "self", "grants": []},
+            {
+                "grantee": _ADMIN_HEX,
+                "grants": [{
+                    "handlers": {"include": ["*"]},
+                    "resources": {"include": ["*", "/*/*"]},
+                    "operations": {"include": ["*"]},
+                    "peers": {"include": ["self"]},
+                }],
+            },
+            {
+                "grantee": "default",
+                "grants": [{
+                    "handlers": {"include": ["system/tree"]},
+                    "resources": {"include": ["shared/*"]},
+                    "operations": {"include": ["get"]},
+                }],
+            },
+        ],
+    }
+
+
+def _write(tmp_path, doc: dict):
+    f = tmp_path / "seed-policy.json"
+    f.write_text(json.dumps(doc))
+    return str(f)
+
+
+def test_seed_policy_from_file_reads_keystone_canonical(tmp_path) -> None:
+    """`{version, entries:[{grantee, grants}]}` — the canonical container."""
+    peer, _ = _build(
+        with_seed_policy_from_file=_write(tmp_path, _canonical_seed_policy()),
+    )
+
     default_entry = _policy_entry(peer, "default")
     assert default_entry is not None
     assert default_entry.data["grants"][0]["resources"]["include"] == [
         "shared/*"
     ]
 
+    # `grantee` keys the entry; the lowercase §3.6 grant fields parse.
+    admin_entry = _policy_entry(peer, _ADMIN_HEX)
+    assert admin_entry is not None
+    admin_grant = admin_entry.data["grants"][0]
+    assert admin_grant["handlers"]["include"] == ["*"]
+    assert admin_grant["operations"]["include"] == ["*"]
+    assert admin_grant["peers"]["include"] == ["self"]
 
-def test_seed_policy_from_file_accepts_bare_grant_list(tmp_path) -> None:
-    f = tmp_path / "seed-policy.json"
-    f.write_text(json.dumps({
-        "default": [{
+
+def test_seed_policy_from_file_skips_self_entry(tmp_path) -> None:
+    """`self` is materialized from the owner identity, not the file — so the
+    file's self entry (empty grants above) must not overwrite the owner cap."""
+    peer, kp = _build(
+        with_seed_policy_from_file=_write(tmp_path, _canonical_seed_policy()),
+    )
+
+    assert _policy_entry(peer, "self") is None
+    self_hex = create_identity_entity(kp).compute_hash().hex()
+    owner_entry = _policy_entry(peer, self_hex)
+    assert owner_entry is not None, "owner cap lost to the file's self entry"
+    assert owner_entry.data["grants"], "owner cap emptied by the file"
+
+
+def test_seed_policy_from_file_carries_constraints_and_allowances(
+    tmp_path,
+) -> None:
+    """The schema types constraints/allowances as JSON objects; Python's grant
+    model holds them as dicts, so they survive the file → policy-entry path."""
+    doc = {
+        "version": 1,
+        "entries": [{
+            "grantee": "default",
+            "grants": [{
+                "handlers": {"include": ["system/query"]},
+                "resources": {"include": ["*"]},
+                "operations": {"include": ["find"]},
+                "constraints": {"type_scope": "docs/note"},
+                "allowances": {"max_results": 10},
+            }],
+        }],
+    }
+    peer, _ = _build(with_seed_policy_from_file=_write(tmp_path, doc))
+
+    grant = _policy_entry(peer, "default").data["grants"][0]
+    assert grant["constraints"] == {"type_scope": "docs/note"}
+    assert grant["allowances"] == {"max_results": 10}
+
+
+def test_seed_policy_from_file_tolerates_comment_keys(tmp_path) -> None:
+    """Both keystone examples ship `_comment` keys — top-level in
+    debug-open.json, entry-level in operator-admin.json — which the schema's
+    `additionalProperties: false` actually forbids (routed upstream). The
+    loader stays lenient so the shipped examples load, matching Go.
+    """
+    doc = {
+        "_comment": "the degenerate default -> * policy",
+        "version": 1,
+        "entries": [{
+            "_comment": "a named operator identity",
+            "grantee": "default",
+            "grants": [{
+                "handlers": {"include": ["*"]},
+                "resources": {"include": ["*", "/*/*"]},
+                "operations": {"include": ["*"]},
+            }],
+        }],
+    }
+    peer, _ = _build(with_seed_policy_from_file=_write(tmp_path, doc))
+
+    entry = _policy_entry(peer, "default")
+    assert entry is not None
+    assert entry.data["grants"][0]["resources"]["include"] == ["*", "/*/*"]
+
+
+def test_seed_policy_from_file_rejects_unsupported_version(tmp_path) -> None:
+    path = _write(tmp_path, {"version": 2, "entries": []})
+    with pytest.raises(ValueError, match="version"):
+        PeerBuilder().with_seed_policy_from_file(path)
+
+
+def test_seed_policy_from_file_rejects_missing_container(tmp_path) -> None:
+    """The pre-canonical Python shape (a keyed object of grantee → grants) has
+    no `version` — it must fail loudly, not seed an empty policy."""
+    path = _write(tmp_path, {
+        "default": {"grants": [{
             "handlers": {"include": ["*"]},
             "resources": {"include": ["*"]},
             "operations": {"include": ["get"]},
+        }]},
+    })
+    with pytest.raises(ValueError, match="version"):
+        PeerBuilder().with_seed_policy_from_file(path)
+
+
+def test_seed_policy_from_file_rejects_duplicate_grantee(tmp_path) -> None:
+    """Entries are keyed by grantee; a repeat would silently drop grants."""
+    grants = [{
+        "handlers": {"include": ["system/tree"]},
+        "resources": {"include": ["*"]},
+        "operations": {"include": ["get"]},
+    }]
+    path = _write(tmp_path, {
+        "version": 1,
+        "entries": [
+            {"grantee": "default", "grants": grants},
+            {"grantee": "default", "grants": grants},
+        ],
+    })
+    with pytest.raises(ValueError, match="duplicate grantee"):
+        PeerBuilder().with_seed_policy_from_file(path)
+
+
+def test_seed_policy_from_file_rejects_unhonourable_bounds(tmp_path) -> None:
+    """`bounds` is schema-optional but policy-entry has no not_before /
+    expires_at — seeding it as unbounded would be a silent authority upgrade."""
+    path = _write(tmp_path, {
+        "version": 1,
+        "entries": [{
+            "grantee": "default",
+            "grants": [{
+                "handlers": {"include": ["*"]},
+                "resources": {"include": ["*"]},
+                "operations": {"include": ["get"]},
+            }],
+            "bounds": {"expires_at": 1_800_000_000_000},
         }],
-    }))
-    peer, _ = _build(with_seed_policy_from_file=str(f))
-    assert _policy_entry(peer, "default") is not None
+    })
+    with pytest.raises(ValueError, match="bounds"):
+        PeerBuilder().with_seed_policy_from_file(path)
+
+
+def test_seed_policy_from_file_rejects_entry_without_grantee(tmp_path) -> None:
+    path = _write(tmp_path, {
+        "version": 1,
+        "entries": [{"grants": []}],
+    })
+    with pytest.raises(ValueError, match="grantee"):
+        PeerBuilder().with_seed_policy_from_file(path)

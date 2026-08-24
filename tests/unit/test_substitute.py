@@ -512,15 +512,17 @@ class TestHttpSubstituteHandler:
     def test_foreign_substitute_type_refused_without_fetching(self):
         """An entry declaring another convention is refused before the GET.
 
-        §6 pins the ORCHESTRATOR's type→handler routing and is silent on the
-        handler re-checking on arrival, so this is the safe direction on an
-        unpinned question rather than a conformance requirement (core-go scored
-        it WARN against us, correctly, and routed it to arch to pin). Adopted
-        because of what this component is: the entry is attacker-supplied input
-        to the one handler whose job is making an outbound request. We used to
-        build the URL and fetch, answering 502 having already made the call.
+        EXTENSION-SUBSTITUTE §6 [MUST] (v1.2, ruled 2026-08-14): refuse with
+        `400 wrong_substitute_type`, before any outbound fetch. We adopted the
+        refusal ahead of the ruling on the safe-direction argument; the ruling
+        agreed and pinned the code.
 
-        The negative half is the point — assert the fetcher was never touched.
+        Two halves, both load-bearing. The fetcher assertion: refusal must
+        precede the call, not follow it — we used to build the URL and GET,
+        answering 502 having already made the request on the publisher's
+        behalf. The code assertion: §6 (v1.2) pins reading `code`, not status,
+        because 400 is shared by every malformed-entry refusal here and cannot
+        distinguish "names another convention" from "entry was garbage".
         """
         ctx = _make_ctx()
         bad = _make_entry()
@@ -536,7 +538,7 @@ class TestHttpSubstituteHandler:
             )
         )
         assert result["status"] == 400
-        assert result["result"]["data"]["code"] == "invalid_entry"
+        assert result["result"]["data"]["code"] == "wrong_substitute_type"
         assert fetcher.url_seen is None, "refused entry still triggered an outbound fetch"
 
     def test_matching_substitute_type_still_fetches(self):

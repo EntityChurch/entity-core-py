@@ -319,26 +319,48 @@ class PeerBuilder:
         """Load a seed policy from a JSON file (V7 §6.9a / SDK-OPERATIONS §3.6).
 
         Ergonomic CLI/config wrapper that desugars to ``with_seed_policy``.
-        The cross-peer file format is keystone protocol-generator territory
-        (``protocol-generator/shared/seed-policy/``); this is the provisional
-        Python shape pending that ratification:
+        The file format is the **keystone-owned cross-peer convention**
+        (``protocol-generator/shared/seed-policy/seed-policy.schema.json``) —
+        §6.9a pins the invariant, the SDK builder shape is the spec's, and the
+        file format is keystone's, so every impl reads the ONE format:
 
         ```json
         {
-          "default": {"grants": [ <grant-entry>, ... ]},
-          "<identity-hash-hex-or-base58>": {"grants": [ ... ]}
+          "version": 1,
+          "entries": [
+            {"grantee": "self | default | <identity-hash-hex> | <base58-peer-id>",
+             "grants": [ <§3.6 grant-entry>, ... ]}
+          ]
         }
         ```
 
-        Each value is either a ``{"grants": [...]}`` object or a bare list
-        of grant entries. Grant entries are the §3.6 ``CapabilityScope``
-        shape (``handlers`` / ``resources`` / ``operations`` include/exclude).
+        Grant entries are the lowercase §3.6 shape (``handlers`` /
+        ``resources`` / ``operations`` as ``{include, exclude?}``, optional
+        ``peers`` / ``constraints`` / ``allowances``).
+
+        A ``self`` entry is **skipped**: the peer-owner capability is
+        materialized at peer-init from the owner identity
+        (``with_owner_identity``), not from a file, so a file entry cannot
+        conflict with the self-owner seed (keystone README §1, the §6.9a.0
+        minimum).
+
+        ``bounds`` is rejected rather than silently dropped — the
+        ``system/capability/policy-entry`` type carries no ``not_before`` /
+        ``expires_at`` field, so honouring it needs a ratified representation
+        upstream. Accepting-and-ignoring a temporal bound is a silent
+        authority *upgrade* (a grant that should expire never does); fail
+        closed instead (§7.1).
 
         Args:
             path: Filesystem path to the JSON seed-policy file.
 
         Returns:
             Self for method chaining.
+
+        Raises:
+            ValueError: The file is not the canonical shape, declares an
+                unsupported ``version``, repeats a ``grantee``, or carries a
+                declared-but-unhonoured ``bounds``.
         """
         import json
 
@@ -346,22 +368,70 @@ class PeerBuilder:
             raw = json.load(fh)
         if not isinstance(raw, dict):
             raise ValueError(
-                f"seed-policy file {path!r} must be a JSON object mapping "
-                "policy key → grants"
+                f"seed-policy file {path!r} must be a JSON object "
+                '{"version": 1, "entries": [...]} (keystone '
+                "seed-policy.schema.json)"
+            )
+
+        version = raw.get("version")
+        if version != 1:
+            raise ValueError(
+                f"seed-policy file {path!r}: unsupported version {version!r} "
+                "(keystone seed-policy.schema.json requires version 1)"
+            )
+
+        raw_entries = raw.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ValueError(
+                f"seed-policy file {path!r}: `entries` must be an array of "
+                "{grantee, grants} objects"
             )
 
         policy: dict[str, list[Grant]] = {}
-        for key, value in raw.items():
-            if isinstance(value, dict) and "grants" in value:
-                grant_dicts = value["grants"]
-            elif isinstance(value, list):
-                grant_dicts = value
-            else:
+        for index, entry in enumerate(raw_entries):
+            if not isinstance(entry, dict):
                 raise ValueError(
-                    f"seed-policy entry {key!r} must be a list of grants or "
-                    "an object with a `grants` array"
+                    f"seed-policy file {path!r}: entry {index} must be an "
+                    "object with `grantee` and `grants`"
                 )
-            policy[key] = [Grant.from_dict(g) for g in grant_dicts]
+
+            grantee = entry.get("grantee")
+            if not isinstance(grantee, str) or not grantee:
+                raise ValueError(
+                    f"seed-policy file {path!r}: entry {index} needs a "
+                    "non-empty `grantee` (self | default | identity-hash hex "
+                    "| Base58 PeerID, §6.9a.1)"
+                )
+
+            # The peer-owner cap is materialized from the owner identity at
+            # peer-init, never from the file.
+            if grantee == "self":
+                continue
+
+            if "bounds" in entry:
+                raise ValueError(
+                    f"seed-policy file {path!r}: entry {grantee!r} declares "
+                    "`bounds`, which this peer cannot honour — "
+                    "system/capability/policy-entry has no not_before / "
+                    "expires_at field. Refusing to seed an unbounded grant "
+                    "from a bounded declaration (fail closed, §7.1)."
+                )
+
+            grant_dicts = entry.get("grants")
+            if not isinstance(grant_dicts, list):
+                raise ValueError(
+                    f"seed-policy file {path!r}: entry {grantee!r} needs a "
+                    "`grants` array of §3.6 grant entries"
+                )
+
+            if grantee in policy:
+                raise ValueError(
+                    f"seed-policy file {path!r}: duplicate grantee "
+                    f"{grantee!r} — entries are keyed by grantee, so a repeat "
+                    "would silently drop the earlier grants"
+                )
+
+            policy[grantee] = [Grant.from_dict(g) for g in grant_dicts]
 
         return self.with_seed_policy(policy)
 

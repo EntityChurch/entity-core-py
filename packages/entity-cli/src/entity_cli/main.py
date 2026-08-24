@@ -1547,7 +1547,10 @@ def build_parser() -> argparse.ArgumentParser:
         dest="seed_policy",
         default=None,
         help="V7 §6.9a (F27): JSON file declaring the startup seed policy "
-             "(per-identity grants + a `default` entry). Desugars to the "
+             "(per-identity grants + a `default` entry), in the keystone "
+             "cross-peer canonical format "
+             '{\"version\":1,\"entries\":[{\"grantee\",\"grants\"}]} — see '
+             "protocol-generator/shared/seed-policy/. Desugars to the "
              "builder's with_seed_policy. The replacement for --open-access.",
     )
     start_parser.add_argument(

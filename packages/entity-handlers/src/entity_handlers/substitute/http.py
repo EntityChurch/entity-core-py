@@ -168,24 +168,22 @@ async def http_substitute_handler(
         )
 
     entry_data = entry.get("data") if "data" in entry else entry
-    # Handler-side re-validation of `substitute_type`. §6 pins the ORCHESTRATOR's
-    # type→handler routing (chain.py dispatches to `system/substitute/{type}`) and
-    # says nothing about the handler re-checking on arrival, so this is the safe
-    # direction on an unpinned question, not a conformance requirement — routed to
-    # arch to pin (core-go's E2, scored WARN against us deliberately rather than
-    # FAIL, which was the right call on their own reading).
+    # Handler-side re-validation of `substitute_type` — EXTENSION-SUBSTITUTE §6
+    # [MUST], ruled 2026-08-14 (v1.2): a convention handler MUST refuse an entry
+    # whose `substitute_type` is not its own with `400 wrong_substitute_type`,
+    # refused BEFORE any outbound fetch. We adopted the refusal ahead of the
+    # ruling as the safe direction on what was then an open question; the ruling
+    # went the same way, and pinned the code.
     #
-    # Adopted anyway because of what this component is: the entry is
-    # attacker-supplied input to the one handler whose job is making an outbound
-    # request. Without the check, an entry declaring some other convention still
-    # got its URL built and fetched — we answered 502 network_error, having
-    # already made the call. Refusing costs nothing on the routed path, where the
-    # type always matches by construction.
+    # The CODE, not just the 400, is the load-bearing half (§6 [MUST], v1.2):
+    # every malformed-entry refusal on this handler shares 400, so a status-only
+    # assertion cannot separate "names another convention" from "entry was
+    # garbage" — and a caller branching on the two needs them distinguishable.
     declared_type = entry_data.get("substitute_type") if isinstance(entry_data, dict) else None
     if declared_type is not None and declared_type != HTTP_SUBSTITUTE_TYPE:
         return error_response(
             400,
-            "invalid_entry",
+            "wrong_substitute_type",
             f"entry declares substitute_type {declared_type!r}; "
             f"{HTTP_HANDLER_PATTERN} serves {HTTP_SUBSTITUTE_TYPE!r} sources only",
         )

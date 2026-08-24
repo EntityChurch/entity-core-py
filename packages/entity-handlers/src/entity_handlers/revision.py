@@ -181,6 +181,14 @@ DELETION_RESOLUTION_VALID = (
 # commit metadata canonical deletion markers do not carry.
 DELETION_RESOLUTION_REJECTED = ("lww", "keep-both")
 
+# §2.3 `[corrected v3.9]` — custom merge dispatch is a SENTINEL plus a
+# companion field, NOT "any path string as the strategy value". That second
+# reading is retracted: §5.2's `apply_strategy(strategy, …, handler_path)`
+# takes the two as separate arguments and branches on this literal, and it is
+# the only reading compatible with §2.3's write-time strategy-rejection
+# contract, which cannot exist over a value set admitting any path string.
+MERGE_STRATEGY_HANDLER = "handler"
+
 
 def validate_merge_config(config_data: dict[str, Any]) -> list[str]:
     """Validate a `system/revision/merge-config` entity's data.
@@ -195,9 +203,32 @@ def validate_merge_config(config_data: dict[str, Any]) -> list[str]:
     additionally guards at read time so a non-conforming entity that
     bypassed write-time validation cannot drive merge classification.
 
+    Also per §2.3 `[corrected v3.9]`: ``strategy: "handler"`` is a
+    SENTINEL, and the handler path travels in the companion ``handler``
+    field. A config carrying the sentinel with no companion path can
+    never dispatch — there is nothing to dispatch to — so it is refused
+    here rather than surfacing later, at merge time, on some unrelated
+    path. §4.4.18's pseudocode defers "other field-shape validation
+    (strategy field, …) per §2.3" to this site; the rejection itself is
+    read out of the sentinel's shape rather than pinned verbatim, and is
+    routed to arch to make explicit (core-go found the same gap in their
+    own tree and in rust's — it is a cohort item, not one repo's slip).
+
     Returns a list of validation errors; empty list means valid.
     """
     errors: list[str] = []
+
+    strategy = config_data.get("strategy")
+    if strategy == MERGE_STRATEGY_HANDLER:
+        handler_path = config_data.get("handler")
+        if not isinstance(handler_path, str) or not handler_path:
+            errors.append(
+                f"invalid_strategy: strategy={MERGE_STRATEGY_HANDLER!r} is a "
+                "sentinel and REQUIRES the companion `handler` field naming "
+                "the merge handler path (§2.3, corrected v3.9); a sentinel "
+                "with no path can never dispatch"
+            )
+
     dr = config_data.get("deletion_resolution")
     if dr is not None:
         if not isinstance(dr, str):
@@ -703,12 +734,24 @@ def _find_merge_strategy(
     path: str,
     local_hash: bytes | None,
     remote_hash: bytes | None,
-) -> str:
+) -> tuple[str, str | None]:
     """Per-path merge strategy lookup per §5.1 cascade.
 
     1. Per-type config at system/revision/config/merge/type/{type_name}
     2. Per-path config at system/revision/config/merge/path/* with glob matching
     3. Default: "three-way"
+
+    Returns `(strategy, handler_path)`. The companion path travels WITH the
+    strategy because §2.3's custom dispatch is a sentinel plus a field, not a
+    path-valued strategy (`[corrected v3.9]`) — returning the strategy alone
+    would leave `handler` unreachable at the one site that needs it, which is
+    how this limb stayed unbuilt here. `handler_path` is None for every
+    built-in strategy.
+
+    A `pattern: "*"` config matches ALL paths, at any depth: `fnmatch` has no
+    segment concept and translates `*` to `.*`. That is §5.1's reading (and
+    v7.70 A1's peer-wide footgun) — see `TestMergeConfigStarScope`, which
+    exists so a swap to a segment-aware matcher cannot narrow it silently.
     """
     cs = ctx.emit_pathway.content_store
     tree = ctx.emit_pathway.entity_tree
@@ -726,11 +769,15 @@ def _find_merge_strategy(
         config_path = f"system/revision/config/merge/type/{type_name}"
         config_entity = _get_entity_at_path(ctx, config_path)
         if config_entity and config_entity.data.get("strategy"):
-            return config_entity.data["strategy"]
+            return (
+                config_entity.data["strategy"],
+                config_entity.data.get("handler"),
+            )
 
     config_prefix = "system/revision/config/merge/path/"
     full_config_prefix = tree.normalize_uri(config_prefix)
     best_strategy: str | None = None
+    best_handler: str | None = None
     best_specificity = -1
 
     for uri in tree.list_prefix(full_config_prefix):
@@ -748,12 +795,13 @@ def _find_merge_strategy(
             specificity = _pattern_specificity(pattern)
             if specificity > best_specificity:
                 best_strategy = config.data.get("strategy")
+                best_handler = config.data.get("handler")
                 best_specificity = specificity
 
     if best_strategy:
-        return best_strategy
+        return best_strategy, best_handler
 
-    return "three-way"
+    return "three-way", None
 
 
 def _find_deletion_resolution(
@@ -804,7 +852,78 @@ def _find_deletion_resolution(
     return _effective_deletion_resolution(best_value)
 
 
-def _merge_bindings(
+async def _dispatch_merge_handler(
+    ctx: HandlerContext,
+    handler_path: str,
+    ancestor_h: bytes | None,
+    local_h: bytes | None,
+    remote_h: bytes | None,
+) -> bytes | None:
+    """§5.3 custom merge handler delegation.
+
+    Returns the merged entity hash, or None to fall through to a conflict
+    entity. Every failure mode returns None: this function's contract is
+    "resolve it or say you didn't", and a conflict entity is the disposition
+    that protects state rather than merely recording it.
+
+    Request payload is `{base, local, remote}` — no `path`. The §5.3 EXECUTE
+    example shows a fourth `path` field, but §5.3's own normative type block
+    and §5.2's `dispatch_merge_handler` pseudocode both omit it, so the
+    example is the outlier two-to-one. core-go pinned the same choice in
+    their vector (A-6 E1, routed to arch); a ruling the other way moves this
+    payload and their vector together.
+
+    Dispatched under the CALLER's capability, not the revision handler's own
+    grant. The handler being named is application code chosen by whoever
+    wrote the merge config; running it under the revision handler's grant
+    would let a config author reach paths the merging caller cannot — a
+    privilege escalation through a configuration file. This matches core-go's
+    E4 disposition, published for the cohort to match or object.
+    """
+    request = {
+        "type": "system/revision/merge-request",
+        "data": {
+            "base": ancestor_h,
+            "local": local_h,
+            "remote": remote_h,
+        },
+    }
+    try:
+        result = await ctx.execute_with_capability(
+            handler_path,
+            "merge",
+            request,
+            capability_data=ctx.caller_capability,
+        )
+    except Exception:
+        # No such handler, no dispatcher wired, handler raised — all the
+        # same answer. §5.3 gives the framework; an absent or broken
+        # handler provides no intelligence, so the conflict stands.
+        return None
+
+    if not result.ok:
+        return None
+
+    data = result.result.get("data") if isinstance(result.result, dict) else None
+    if not isinstance(data, dict) or not data.get("resolved"):
+        return None
+
+    merged_hash = data.get("entity")
+    if not isinstance(merged_hash, (bytes, bytearray)):
+        # `resolved: true` with no usable entity hash is a malformed
+        # response. Trusting it would bind whatever came back; refusing it
+        # keeps both sides intact under a conflict.
+        return None
+
+    merged_hash = bytes(merged_hash)
+    if ctx.emit_pathway.content_store.get(merged_hash) is None:
+        # The handler resolved to an entity this peer does not hold. Binding
+        # a dangling hash would put an unreadable path in the merged trie.
+        return None
+    return merged_hash
+
+
+async def _merge_bindings(
     ctx: HandlerContext,
     ancestor_bindings: dict[str, bytes],
     local_bindings: dict[str, bytes],
@@ -813,6 +932,10 @@ def _merge_bindings(
     prefix: str = "",
 ) -> tuple[dict[str, bytes], dict[str, dict[str, Any]], list[tuple[str, bytes]]]:
     """Three-way merge of flat binding sets (Phase 1: flatten-then-compare).
+
+    Async because §5.3's `handler` strategy dispatches to another handler to
+    resolve a path (`_dispatch_merge_handler`); every built-in strategy
+    resolves without awaiting anything.
 
     Returns (merged_bindings, conflicts, additional_bindings).
     """
@@ -887,8 +1010,35 @@ def _merge_bindings(
                 continue
 
             # Both changed differently — resolve via strategy cascade (§5.1)
-            effective = strategy if strategy != "three-way" else _find_merge_strategy(
-                ctx, prefix, path, local_h, remote_h)
+            if strategy != "three-way":
+                # Request-level strategy wins; it carries no companion field,
+                # so a request cannot name a custom handler (§2.3 puts the
+                # path in the CONFIG, which is what the cascade reads).
+                effective, handler_path = strategy, None
+            else:
+                effective, handler_path = _find_merge_strategy(
+                    ctx, prefix, path, local_h, remote_h)
+
+            if effective == MERGE_STRATEGY_HANDLER:
+                merged_h = (
+                    await _dispatch_merge_handler(
+                        ctx, handler_path, ancestor_h, local_h, remote_h)
+                    if handler_path
+                    else None
+                )
+                if merged_h is not None:
+                    merged[path] = merged_h
+                    continue
+                # Sentinel with no companion path, or a handler that could
+                # not resolve — fall through to the conflict entity below.
+                conflicts[path] = {
+                    "base": ancestor_h,
+                    "local": local_h,
+                    "remote": remote_h,
+                }
+                if local_h:
+                    merged[path] = local_h
+                continue
 
             if effective == "keep-both" and local_h is not None and remote_h is not None:
                 merged[path] = local_h
@@ -1528,7 +1678,7 @@ async def _handle_merge(
             }
 
     # Three-way merge
-    merged_bindings, conflicts, additional_bindings = _merge_bindings(
+    merged_bindings, conflicts, additional_bindings = await _merge_bindings(
         ctx, ancestor_bindings, local_bindings, remote_bindings, strategy,
         prefix=prefix,
     )

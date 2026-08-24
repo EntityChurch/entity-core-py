@@ -731,6 +731,94 @@ class TestMergeConfigOperation:
             assert data["path"] == f"system/revision/config/merge/path/dr-{dr}"
 
     @pytest.mark.asyncio
+    async def test_op_rejects_handler_sentinel_without_companion_path(self) -> None:
+        """§2.3 `[corrected v3.9]`: `strategy: "handler"` is a sentinel and the
+        path travels in the companion `handler` field. Without it the config can
+        never dispatch, so the misconfiguration MUST surface at the write that
+        caused it — not later, at merge time, on some unrelated path.
+
+        Routed to us by core-go (HANDOFF-2026-08-14-c §5 item 1) as a cohort
+        item: they found the same gap in their own tree, and rust's is at least
+        as open. The rejection is read out of the sentinel's shape — §4.4.18
+        defers "other field-shape validation (strategy field, …) per §2.3" here
+        — rather than pinned verbatim; that ask is going upstream.
+        """
+        ctx = _make_handler_context()
+        r = await revision_handler(
+            "system/revision", "merge-config",
+            {"data": {
+                "scope": "path",
+                "name": "sentinel-no-path",
+                "action": "set",
+                "config": {
+                    "type": "system/revision/merge-config",
+                    "data": {"pattern": "notes/**", "strategy": "handler"},
+                },
+            }},
+            ctx,
+        )
+        assert r["status"] == 400, r
+        assert r["result"]["data"]["code"] == "invalid_strategy"
+        assert "handler" in r["result"]["data"]["message"]
+        # The point of write-time rejection: no binding landed.
+        tree = ctx.emit_pathway.entity_tree
+        assert tree.get(tree.normalize_uri(
+            "system/revision/config/merge/path/sentinel-no-path"
+        )) is None
+
+    @pytest.mark.asyncio
+    async def test_op_rejects_handler_sentinel_with_empty_path(self) -> None:
+        """An empty-string `handler` is the same misconfiguration wearing a
+        field — it names nothing to dispatch to."""
+        for bad in ("", None, 42):
+            ctx = _make_handler_context()
+            r = await revision_handler(
+                "system/revision", "merge-config",
+                {"data": {
+                    "scope": "type",
+                    "name": "app/note",
+                    "action": "set",
+                    "config": {
+                        "type": "system/revision/merge-config",
+                        "data": {"strategy": "handler", "handler": bad},
+                    },
+                }},
+                ctx,
+            )
+            assert r["status"] == 400, (bad, r)
+            assert r["result"]["data"]["code"] == "invalid_strategy", (bad, r)
+
+    @pytest.mark.asyncio
+    async def test_op_accepts_handler_sentinel_with_companion_path(self) -> None:
+        """The control. Without it, a check that rejected every `handler`
+        config — or every config — would read as conformant. Both scopes,
+        because the sentinel is legal in each."""
+        for scope, name, extra in (
+            ("path", "sentinel-ok", {"pattern": "notes/**"}),
+            ("type", "app/note", {}),
+        ):
+            ctx = _make_handler_context()
+            r = await revision_handler(
+                "system/revision", "merge-config",
+                {"data": {
+                    "scope": scope,
+                    "name": name,
+                    "action": "set",
+                    "config": {
+                        "type": "system/revision/merge-config",
+                        "data": {
+                            "strategy": "handler",
+                            "handler": "app/merge/text-handler",
+                            **extra,
+                        },
+                    },
+                }},
+                ctx,
+            )
+            assert r["status"] == 200, (scope, r)
+            assert r["result"]["data"]["status"] == "set"
+
+    @pytest.mark.asyncio
     async def test_op_idempotent_set_returns_no_change(self) -> None:
         ctx = _make_handler_context()
         cfg_data = {
