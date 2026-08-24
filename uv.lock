@@ -198,7 +198,7 @@ wheels = [
 
 [[package]]
 name = "entity-cli"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "packages/entity-cli" }
 dependencies = [
     { name = "entity-core" },
@@ -215,7 +215,7 @@ requires-dist = [
 
 [[package]]
 name = "entity-core"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "packages/entity-core" }
 dependencies = [
     { name = "argon2-cffi" },
@@ -236,7 +236,7 @@ requires-dist = [
 
 [[package]]
 name = "entity-core-workspace"
-version = "0.8.0"
+version = "0.9.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -269,7 +269,7 @@ dev = [
 
 [[package]]
 name = "entity-handlers"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "packages/entity-handlers" }
 dependencies = [
     { name = "entity-core" },
@@ -286,7 +286,7 @@ requires-dist = [
 
 [[package]]
 name = "entity-sdk"
-version = "0.8.0"
+version = "0.9.0"
 source = { editable = "packages/entity-sdk" }
 dependencies = [
     { name = "entity-core" },

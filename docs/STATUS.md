@@ -38,8 +38,11 @@ dispatching to pattern strings rather than importing them.
 
 Maturity: reasonably mature for a research preview. A broad suite — 3,611 test functions
 across 196 files (unit, integration, interop, and conformance directories), 4,061 passing
-with 0 failures — backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release,
-with package versions aligned to `0.8.0` alongside the parallel Rust/Go cores. This is
+with 0 failures — backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release.
+The next release is **0.9.0** — this package set's own version, which since 0.9.0 is deliberately
+**not** the protocol version it implements (0.8.2); at Genesis the two coincided because the
+package version was set to the protocol version of the day, and that was a starting condition
+rather than a scheme. See `CHANGELOG.md` and `AGENTS.md` §Versioning. This is
 **not a 1.0 API commitment.** The canonical build/test path needs only `make` + `podman`
 on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev uses
 Python 3.11–3.13 and `uv`.

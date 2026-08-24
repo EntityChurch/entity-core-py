@@ -1,6 +1,6 @@
 [project]
 name = "entity-core"
-version = "0.8.0"
+version = "0.9.0"
 description = "Python implementation of the Entity Core Protocol V7"
 # No `readme` field. It pointed at `../../README.md`, and current hatchling
 # rejects a readme outside the project directory outright — which broke the

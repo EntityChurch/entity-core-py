@@ -10,6 +10,36 @@ clean-room peer for **interoperability testing against the Rust implementation**
 validates that the spec is clear and complete enough to build compatible implementations.
 The spec is upstream; this repo implements it.
 
+## Versioning — ours, and it is NOT the protocol version
+
+**This repo's release version is its own. The protocol version is a different number and
+they are expected to disagree.** `entity-core` 0.9.0 implements Entity Core Protocol
+0.8.2. Full reasoning: the *"What the version numbers here mean"* section at the top of
+`CHANGELOG.md` — that section is the canonical statement and this is the pointer to it.
+
+The short form:
+
+- **Per [ADR-0002], the spec level an implementation targets is carried out-of-band**, never
+  baked into the release number. That ADR rejected a 4-field `W.X.Y.Z` scheme precisely
+  because one string cannot carry both *which spec level we target* and *our own release*
+  without conflating them. Each changelog entry names its protocol level on a `Protocol:` line.
+- At the `v0.8.0` Genesis release the two numbers coincided — the package version was simply
+  set to the protocol version of the day. **That was a starting condition, not a scheme.**
+  Reading it as one is how `0.8.2` nearly got stamped across this repo from outside.
+- **All four workspace packages share one version and release together**, and the
+  inter-package dependency floors move with them. A mixed installation is not a configuration
+  we test.
+- **`pyproject.toml` is the single source of truth.** `entity_core.__version__` is read from
+  installed package metadata — it is not a second literal to maintain, because it was one and
+  it silently drifted to `0.1.0`.
+- **The number is not the contract; conformance is** ([ADR-0012]). Cite a measurement by its
+  oracle commit, never by a release number — which is why a conformance emission pins
+  `impl_version` to the git sha.
+
+Bumping: 0.x SemVer — minor for added surface or a break, patch for fixes. Changing the number
+means editing **five** `version =` lines (root + four packages) plus the dependency floors, and
+then regenerating `uv.lock`, or the container build fails at `uv sync --frozen`.
+
 ## How we work here — tier **CORE**
 
 This repo runs the entity-OS methodology at the **Core** tier — the framework is
@@ -43,8 +73,8 @@ else's bug.
 - **Canonical build/test needs only `make` + `podman`** on the host — no host toolchain.
 - **Local dev (optional):** Python **3.11+** and **`uv`** on the host. The Dockerfile pins
   Python **3.12** + uv.
-- **uv workspace of 3 packages** (entity-core, entity-handlers, entity-cli); `uv sync`
-  installs all.
+- **uv workspace of 4 packages** (entity-core, entity-handlers, entity-sdk, entity-cli);
+  `uv sync` installs all.
 - `tests/interop/` runs against a **live Rust peer** — start one before running them
   (see Build & test).
 - Identities live in `~/.entity/identities/<name>/`.
