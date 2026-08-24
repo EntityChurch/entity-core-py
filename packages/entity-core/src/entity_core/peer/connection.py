@@ -75,6 +75,7 @@ from typing import Any
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.connect import (
     ConnectError,
+    connect_refusal,
     create_connect_hello_execute,
     create_connect_authenticate_execute,
     verify_connect_authenticate_response,
@@ -687,12 +688,11 @@ class Connection:
             response = ExecuteResponse.from_entity(authenticate_root)
 
             if response.status != 200:
-                error_msg = ""
-                if isinstance(response.result, dict):
-                    error_msg = response.result.get("message", response.result.get("error", ""))
-                raise ConnectError(
-                    f"Connect authenticate failed (status {response.status}): {error_msg}"
-                )
+                # Carry the remote's code, not just its prose: a refusal whose
+                # code is dropped here is a row that can only ever assert its
+                # status. The code goes in the message too, so a `match=`
+                # assertion sees it without reaching for the attribute.
+                raise connect_refusal("Connect authenticate failed", response)
 
             # Verify their authenticate data (signature over AUTHENTICATE hash)
             # Token hash is returned from verify function

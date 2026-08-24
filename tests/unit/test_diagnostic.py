@@ -118,7 +118,7 @@ class TestDispatchTap:
         # Filter to fetch-diff outcomes only (commit successes drown them).
         fetch_diff_rows = [
             (status, code, count)
-            for (pattern, op, status, code, count) in tap.histogram()
+            for (pattern, op, status, code, outcome, count) in tap.histogram()
             if op == "fetch-diff"
         ]
         # With the fix in place: 20 × status=200, no error codes.
@@ -150,6 +150,69 @@ class TestDispatchTap:
         assert "system/revision/fetch-diff" in s
         assert "status=400" in s
         assert "base_not_a_version" in s
+
+    @pytest.mark.asyncio
+    async def test_tap_sees_the_result_field_carrier_not_only_code(self):
+        """R-7 — the extractor, one layer below the checks.
+
+        Not every pinned value rides in ``code``. §6a.9's ``202`` row is
+        answered here by a ``register-result`` whose carrier is the result
+        FIELD ``status``, and the tap used to harvest ``code`` only — so the
+        one row someone would tap to inspect recorded as ``status=202
+        code=-``, blank exactly where the value was.
+
+        core-go's instance of this class gated on the status *class*
+        (``code`` harvested only when ``status >= 400``, so a 2xx-pinned code
+        could not have been asserted against any peer, however conformant);
+        ours gated on the field *name*. Auditing the checks does not reach
+        either — the defect is a layer below them.
+        """
+        tap = DispatchTap()
+
+        async def registry_like(path, op, params, ctx):
+            return {
+                "status": 202,
+                "result": {
+                    "type": "system/registry/register-result",
+                    "data": {"status": "pending_review", "pending_hash": b"\x00"},
+                },
+            }
+
+        wrapped = tap.wrap(registry_like)
+        await wrapped("system/registry", "register-request", {}, None)
+
+        rec = tap.records[-1]
+        assert rec.status == 202
+        assert rec.error_code is None       # this row has no `code`, correctly
+        assert rec.result_outcome == "pending_review"
+
+        (row,) = tap.histogram()
+        assert row[3] is None and row[4] == "pending_review"
+        assert "outcome=pending_review" in tap.summary()
+
+    @pytest.mark.asyncio
+    async def test_two_outcomes_at_one_status_are_distinct_buckets(self):
+        """The negative half: harvesting the field but keying the histogram
+        only on ``code`` would collapse ``registered`` and ``pending_review``
+        into one ``status=200`` bucket — the same blindness, moved."""
+        tap = DispatchTap()
+
+        async def registry_like(path, op, params, ctx):
+            return {
+                "status": 200,
+                "result": {
+                    "type": "system/registry/register-result",
+                    "data": {"status": params["outcome"]},
+                },
+            }
+
+        wrapped = tap.wrap(registry_like)
+        await wrapped("system/registry", "register-request", {"outcome": "registered"}, None)
+        await wrapped("system/registry", "register-request", {"outcome": "registered"}, None)
+        await wrapped("system/registry", "register-request", {"outcome": "pending_review"}, None)
+
+        buckets = {outcome: count for (_, _, _, _, outcome, count) in tap.histogram()}
+        assert buckets == {"registered": 2, "pending_review": 1}
 
 
 class TestContentTap:

@@ -22,8 +22,9 @@ Usage::
     wrapped = tap.wrap(revision_handler)
     # ...run a probe that calls `wrapped`...
     print(tap.histogram())
-    # → [('system/revision', 'fetch-diff', 400, 'base_not_a_version', 19),
-    #    ('system/revision', 'fetch-diff', 200, None, 1), ...]
+    # → [('system/revision', 'fetch-diff', 400, 'base_not_a_version', None, 19),
+    #    ('system/revision', 'fetch-diff', 200, None, None, 1), ...]
+    # (the 5th slot is the result-field carrier — see DispatchRecord)
 
     cs_tap = ContentTap(content_store)
     # ...run a probe that puts entities...
@@ -72,6 +73,20 @@ class DispatchRecord:
     the standard `result.data.{code,message}` shape used by
     ``_error_response``; if a handler returns a non-standard error shape
     both stay None and the raw result_type tells you why.
+
+    ``result_outcome`` is the second carrier, and it exists because
+    assuming there was only one is a real defect this instrument had.
+    Not every pinned value rides in ``code``: EXTENSION-REGISTRY §6a.9's
+    ``202`` row is answered here by ``system/registry/register-result``
+    with ``data.status = "pending_review"``, and a tap that harvests only
+    ``code`` records that dispatch as ``status=202 code=-`` — blank in the
+    exact row someone is taping to inspect. Same class as core-go's R-7
+    (their extractor harvested a code only when ``status >= 400``, so a
+    2xx-pinned code could never be asserted against any peer, however
+    conformant); ours gated on the field name rather than the status
+    class. Both encode "the value rides where I expect", and the tap is a
+    layer *below* the checks, so an audit of the checks alone does not
+    reach it.
     """
 
     timestamp: float
@@ -81,6 +96,11 @@ class DispatchRecord:
     error_code: str | None
     error_message: str | None
     result_type: str | None
+    #: ``result.data.status`` when it is a string — the result-field
+    #: carrier (``pending_review`` / ``registered`` / ``resolved``, …).
+    #: Deliberately str-only: the *envelope* status is an int and already
+    #: has a column.
+    result_outcome: str | None = None
 
 
 class DispatchTap:
@@ -138,12 +158,17 @@ class DispatchTap:
         error_code: str | None = None
         error_message: str | None = None
         result_type: str | None = None
+        result_outcome: str | None = None
         if isinstance(result, dict):
             result_type = result.get("type")
             data = result.get("data")
             if isinstance(data, dict):
                 error_code = data.get("code")
                 error_message = data.get("message")
+                # The second carrier — harvested on EVERY status, not only
+                # failures. See DispatchRecord.result_outcome.
+                outcome = data.get("status")
+                result_outcome = outcome if isinstance(outcome, str) else None
         self.records.append(
             DispatchRecord(
                 timestamp=time.monotonic(),
@@ -153,22 +178,31 @@ class DispatchTap:
                 error_code=error_code,
                 error_message=error_message,
                 result_type=result_type,
+                result_outcome=result_outcome,
             )
         )
 
-    def histogram(self) -> list[tuple[str, str, int, str | None, int]]:
-        """Return ``[(pattern, operation, status, error_code, count), ...]``
-        sorted by count descending.
+    def histogram(
+        self,
+    ) -> list[tuple[str, str, int, str | None, str | None, int]]:
+        """Return ``[(pattern, operation, status, error_code, result_outcome,
+        count), ...]`` sorted by count descending.
 
-        Identical-status records with distinct ``error_code`` are kept
-        separate — the whole point is naming the exact failure mode.
+        Identical-status records with a distinct ``error_code`` **or a
+        distinct ``result_outcome``** are kept separate — the whole point is
+        naming the exact outcome, and collapsing two different result-field
+        answers into one ``status=202`` bucket is the same blindness as not
+        harvesting the field at all.
         """
-        counter: Counter[tuple[str, str, int, str | None]] = Counter()
+        counter: Counter[tuple[str, str, int, str | None, str | None]] = Counter()
         for r in self.records:
-            counter[(r.handler_pattern, r.operation, r.status, r.error_code)] += 1
+            counter[
+                (r.handler_pattern, r.operation, r.status, r.error_code,
+                 r.result_outcome)
+            ] += 1
         return [
-            (pattern, op, status, code, count)
-            for (pattern, op, status, code), count in counter.most_common()
+            (pattern, op, status, code, outcome, count)
+            for (pattern, op, status, code, outcome), count in counter.most_common()
         ]
 
     def failures(self) -> list[DispatchRecord]:
@@ -181,17 +215,21 @@ class DispatchTap:
     def summary(self) -> str:
         """One-line-per-bucket histogram, formatted for log/REPL eyeballing.
 
-        Example output::
+        Both carriers are printed, and which one answered is itself the
+        signal — the ``202`` row below is the one that used to read
+        ``code=-`` with nothing beside it::
 
             19  system/revision/fetch-diff  status=400  code=base_not_a_version
              1  system/revision/fetch-diff  status=200  code=-
+             1  system/registry/register-request  status=202  code=-  outcome=pending_review
         """
         rows = self.histogram()
         if not rows:
             return "(no dispatches recorded)"
         return "\n".join(
             f"{count:>4}  {pattern}/{op}  status={status}  code={code or '-'}"
-            for (pattern, op, status, code, count) in rows
+            + (f"  outcome={outcome}" if outcome else "")
+            for (pattern, op, status, code, outcome, count) in rows
         )
 
 

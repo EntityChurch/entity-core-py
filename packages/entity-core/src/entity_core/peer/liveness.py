@@ -3,7 +3,10 @@
 The **liveness slice**: write ``system/peer/status/{peer}`` on connection
 state change — ``connected`` on establish (both ends of the handshake),
 ``suspect`` on transport error at the direct-dispatch seam (§A1),
-``suspect → disconnected`` on keepalive miss (§5.4) — and nothing more.
+``suspect → disconnected`` after the §5.4 grace period — and nothing
+more. That last escalation is owed by the **failure episode**, not by
+the connection (§5.4a `[MUST]`): it fires from either entry point, and
+the §A1 eviction MUST NOT cancel it.
 These are ordinary tree entities, so a write fires any
 ``system/subscription`` bound to the path: the "no poll" liveness signal
 consumers block on. The slice requires none of ``maintain-peer``, the
@@ -199,6 +202,28 @@ def write_peer_status(
     return result.hash if result.hash is not None else entity.compute_hash()
 
 
+def read_peer_status(
+    entity_tree: "EntityTree",
+    content_store: "ContentStore",
+    remote_identity_hash: bytes,
+) -> Entity | None:
+    """The current ``system/peer/status/{remote_hex}`` entity, or ``None``.
+
+    Soft read: a missing binding, a missing body, or a tree error all read
+    as "no status", because every caller is on a liveness path that must
+    not raise (§A1/§5.4a writers are observability-only).
+    """
+    if not remote_identity_hash:
+        return None
+    try:
+        h = entity_tree.get(entity_tree.normalize_uri(peer_status_path(remote_identity_hash)))
+        if h is None:
+            return None
+        return content_store.get(h)
+    except Exception:
+        return None
+
+
 def read_peer_status_failing_since(
     entity_tree: "EntityTree",
     content_store: "ContentStore",
@@ -211,19 +236,50 @@ def read_peer_status_failing_since(
     open episode's start forward rather than re-stamping it (only the
     ``connected`` write clears it). A ``0``/absent value reads as ``None``
     (no open episode)."""
-    if not remote_identity_hash:
+    ent = read_peer_status(entity_tree, content_store, remote_identity_hash)
+    if ent is None:
         return None
-    try:
-        h = entity_tree.get(entity_tree.normalize_uri(peer_status_path(remote_identity_hash)))
-        if h is None:
-            return None
-        ent = content_store.get(h)
-        if ent is None:
-            return None
-        fs = ent.data.get("failing_since")
-        return int(fs) if fs else None
-    except Exception:
-        return None
+    fs = ent.data.get("failing_since")
+    return int(fs) if fs else None
+
+
+def read_peer_status_episode(
+    entity_tree: "EntityTree",
+    content_store: "ContentStore",
+    remote_identity_hash: bytes,
+) -> tuple[str | None, str | None]:
+    """``(status, reason)`` from ``system/peer/status/{remote_hex}``.
+
+    The §5.4a escalation read, and it is BOTH halves of that rule:
+
+    - ``status`` is the **scope pin** — the ``suspect → disconnected``
+      escalation is owed only where a failure episode is open. The §10.2
+      dispatch-fallback and RELAY terminal-hop paths evict *without*
+      demoting (§A1 seam scope), so those bindings are still ``connected``
+      and an escalation there would manufacture a demotion that never
+      happened. Escalating on any *unbound* peer rather than any
+      *``suspect``* peer passes the positive vector and is a new defect —
+      which is why the negative half of the pair is not optional.
+    - ``reason`` is the **episode's originating reason**, which the
+      escalating write preserves rather than re-stamping (§5.4a `[MUST]`):
+      ``transport-error`` when the episode opened at the §A1 seam,
+      ``keepalive-miss`` when it opened at an idle miss. Re-stamping to
+      ``keepalive-miss`` on the transport path asserts pings that were
+      provably never sent, and destroys the one signal that distinguishes
+      the two paths.
+
+    Either element is ``None`` when absent (``reason`` is OPTIONAL to emit
+    per §A2).
+    """
+    ent = read_peer_status(entity_tree, content_store, remote_identity_hash)
+    if ent is None:
+        return None, None
+    status = ent.data.get("status")
+    reason = ent.data.get("reason")
+    return (
+        status if isinstance(status, str) else None,
+        reason if isinstance(reason, str) else None,
+    )
 
 
 def write_connection_status(

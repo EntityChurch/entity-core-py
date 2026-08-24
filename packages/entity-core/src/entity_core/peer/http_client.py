@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.connect import (
     ConnectError,
+    connect_refusal,
     create_connect_authenticate_execute,
     create_connect_hello_execute,
     verify_connect_authenticate_response,
@@ -370,14 +371,8 @@ class HttpConnection:
             )
         response = ExecuteResponse.from_entity(auth_root)
         if response.status != 200:
-            error_msg = ""
-            if isinstance(response.result, dict):
-                error_msg = response.result.get(
-                    "message", response.result.get("error", "")
-                )
-            raise ConnectError(
-                f"http connect authenticate failed (status {response.status}): {error_msg}"
-            )
+            # Same extractor as the TCP dialer — the remote's code survives.
+            raise connect_refusal("http connect authenticate failed", response)
 
         remote_peer_id, remote_public_key_bytes, token_hash = (
             verify_connect_authenticate_response(

@@ -102,11 +102,51 @@ class ConnectError(Exception):
     (e.g. ``"unsupported_key_type"``) so the wire-boundary handler
     in ``peer.py`` emits the canonical error code rather than
     collapsing every connect failure to ``bad_request``.
+
+    **Both directions carry the code.** Responder-side that was fixed once
+    already (the cohort sweep caught Python answering a generic
+    ``bad_request`` for an unallocated key type). Dialer-side it was still
+    collapsing: ``Connection.connect`` / ``HttpConnection.connect`` folded a
+    refusal into a message string and dropped the remote's ``code`` and
+    ``status`` entirely, so a check of a pinned handshake-refusal row could
+    only ever assert that *something* was raised. Same defect class as
+    core-go's R-7 extractor, on the other side of the same seam — which is
+    why the audit had to reach past the checks to the layer beneath them.
+    ``status`` is the remote's response status, ``None`` when the failure
+    was local (nothing was refused, so there is nothing to carry).
     """
 
-    def __init__(self, message: str, *, code: str = "bad_request") -> None:
+    def __init__(
+        self, message: str, *, code: str = "bad_request", status: int | None = None
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.status = status
+
+
+def connect_refusal(prefix: str, response: "ExecuteResponse") -> ConnectError:
+    """Build a ``ConnectError`` from a remote's non-200 handshake response,
+    preserving what the remote actually said.
+
+    The dialer-side extractor. Both transports route their refusals through
+    here so neither can quietly go back to collapsing the answer into prose:
+    the remote's ``code`` and ``status`` land on the exception AND in its
+    message, so an assertion can reach either.
+    """
+    code = "bad_request"
+    message = ""
+    if isinstance(response.result, dict):
+        data = response.result.get("data")
+        body = data if isinstance(data, dict) else response.result
+        raw_code = body.get("code")
+        if isinstance(raw_code, str) and raw_code:
+            code = raw_code
+        message = body.get("message", body.get("error", "")) or ""
+    return ConnectError(
+        f"{prefix} (status {int(response.status)} {code}): {message}",
+        code=code,
+        status=int(response.status),
+    )
 
 
 def handle_connect_hello(

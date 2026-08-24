@@ -148,6 +148,14 @@ class RemoteConnectionPool:
         # never disabled because a transport carries its own ping (§5.1).
         self._keepalive_config = keepalive_config or KeepaliveConfig()
         self._keepalive_tasks: dict[str, asyncio.Task] = {}
+        # §5.4a: the `suspect → disconnected` escalation is owed by the
+        # FAILURE EPISODE, not by the connection — so it is tracked in its
+        # own map, deliberately NOT in `_keepalive_tasks`. `remove_connection`
+        # cancels keepalive loops; if the escalator lived there, the §A1
+        # eviction would destroy the escalation at the moment it became owed.
+        # That is the defect the rule exists to forbid, and the separation of
+        # these two maps is where this implementation forbids it.
+        self._escalation_tasks: dict[str, asyncio.Task] = {}
         # §5.4 adaptive suppression: monotonic seconds of the last
         # successful exchange per peer; pings are skipped while the
         # connection is actively exchanging messages.
@@ -389,7 +397,16 @@ class RemoteConnectionPool:
         ``failed`` is still the currently-bound endpoint (identity guard
         in ``remove_connection``). A single transport error writes
         ``suspect``, not ``disconnected`` — one failure is not proof of a
-        dead peer; §5.4 keepalive escalates.
+        dead peer; the §5.4 grace period escalates.
+
+        §5.4a: that escalation is scheduled HERE, on this path, and not
+        left to the keepalive loop — ``remove_connection`` above just
+        cancelled that loop as it evicted the binding, which is the same
+        event as this demotion. A peer that stops at ``suspect`` stays
+        ``suspect`` forever: the ``disconnected`` write is what fires the
+        disconnect subscription, and §4.1 reconnect hangs off it, so
+        reconnect would never trigger on any transport-error-first path —
+        the way a dead peer is usually noticed first.
         """
         if not self.remove_connection(peer_id, expected=failed):
             # `failed` is no longer the bound endpoint — a concurrent
@@ -400,6 +417,9 @@ class RemoteConnectionPool:
             failed,
             status_reason=("suspect", "transport-error"),
             last_error=str(cause) if cause is not None else None,
+        )
+        self._schedule_escalation(
+            peer_id, failed, originating_reason="transport-error",
         )
 
     def _write_connected(
@@ -517,6 +537,100 @@ class RemoteConnectionPool:
         if task is not None and not task.done():
             task.cancel()
 
+    def _schedule_escalation(
+        self, peer_id: str, endpoint: "RemoteEndpoint", *, originating_reason: str
+    ) -> None:
+        """Arm the §5.4a ``suspect → disconnected`` escalation for an open
+        failure episode.
+
+        Deliberately not a keepalive task: nothing on the eviction path may
+        cancel this. ``originating_reason`` is only the fallback — the
+        escalating write prefers the ``reason`` actually on the status
+        entity, which is the episode's own (§5.4a `[MUST]`).
+
+        Idempotent per peer: the §A1 seam and a keepalive loop that wakes to
+        find its binding gone can both reach for the escalation on the same
+        episode, and one episode owes exactly one ``disconnected`` write.
+        """
+        pending = self._escalation_tasks.get(peer_id)
+        if pending is not None and not pending.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - pool used without a loop
+            return
+        self._escalation_tasks[peer_id] = loop.create_task(
+            self._escalate_after_grace(
+                peer_id, endpoint, originating_reason=originating_reason
+            )
+        )
+
+    async def _escalate_after_grace(
+        self, peer_id: str, endpoint: "RemoteEndpoint", *, originating_reason: str
+    ) -> None:
+        """§5.4a — write ``disconnected`` when the grace period expires on a
+        peer that is still ``suspect`` and still unbound.
+
+        Three guards, all load-bearing, in this order:
+
+        1. **The grace sleep comes first.** §5.4a pins the ordering because
+           the eviction and the ``suspect`` write are not one atomic event:
+           a status read taken at eviction time can still see ``connected``
+           and wrongly conclude nothing is owed.
+        2. **Reconnected → nothing owed.** A *different* endpoint bound to
+           this peer wrote its own ``connected``; do not clobber it. The
+           same endpoint still bound is the idle-miss path, where this
+           escalator owns the eviction (below).
+        3. **Still ``suspect`` → the scope pin.** Unbound is not the
+           condition; an *open failure episode* is. §10.2 fallback and RELAY
+           terminal-hop teardowns evict a ``connected`` peer without
+           demoting it, and escalating those would manufacture a demotion
+           that never happened.
+        """
+        from entity_core.peer import liveness
+
+        try:
+            await asyncio.sleep(self._keepalive_config.timeout_ms / 1000.0)
+
+            bound = self._connections.get(peer_id)
+            if bound is not None and bound is not endpoint:
+                return
+
+            session_obj = getattr(endpoint, "session", None)
+            if session_obj is None:
+                return
+            status, reason = liveness.read_peer_status_episode(
+                self._entity_tree,
+                self._content_store,
+                session_obj.remote_identity_hash,
+            )
+            if status != liveness.STATUS_SUSPECT:
+                return
+
+            if bound is endpoint:
+                # The idle-miss path: this episode's connection is still the
+                # binding. Evict WITHOUT the cancel-self path racing us — drop
+                # the binding first, then write.
+                self._keepalive_tasks.pop(peer_id, None)
+                self._connections.pop(peer_id, None)
+                self._last_activity.pop(peer_id, None)
+                try:
+                    asyncio.get_running_loop().create_task(endpoint.aclose())
+                except RuntimeError:  # pragma: no cover
+                    pass
+
+            self._write_demotion(
+                endpoint,
+                status_reason=(
+                    liveness.STATUS_DISCONNECTED, reason or originating_reason,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._escalation_tasks.get(peer_id) is asyncio.current_task():
+                self._escalation_tasks.pop(peer_id, None)
+
     async def _keepalive_loop(
         self, peer_id: str, endpoint: "RemoteEndpoint"
     ) -> None:
@@ -525,15 +639,18 @@ class RemoteConnectionPool:
         Idle-period app-level ping (EXECUTE ``system/protocol/connect``
         op ``ping``); any successful exchange resets the missed counter
         (adaptive suppression). On ``max_missed`` consecutive misses:
-        write ``suspect`` (reason ``keepalive-miss``), grace-wait
-        ``timeout_ms``, then — if no reconnection replaced the binding —
-        write ``disconnected`` and evict. A dead idle connection that
-        never went ``suspect`` via §A1 goes through this same path; both
-        orderings are §5.4-conformant.
+        write ``suspect`` (reason ``keepalive-miss``) and hand the
+        escalation to ``_schedule_escalation``.
 
-        The loop exits when its endpoint is no longer the pool binding
-        (evicted or replaced) — the no-clobber discipline applied to the
-        keepalive writer.
+        **The loop does not own the escalation** (§5.4a). It arms it and
+        returns, on both of its exits: the miss path, and the path where
+        it wakes to find its endpoint is no longer the binding. Losing the
+        connection does not end the failure episode — and this loop's own
+        lifetime is scoped to the connection, which is exactly the scope
+        §5.4a forbids the escalation from having. The scope pin lives in
+        the escalator's status read, so the no-clobber discipline still
+        holds for the replaced/evicted-while-``connected`` cases: they
+        arm an escalation that reads ``connected`` and writes nothing.
         """
         from entity_core.peer import liveness
 
@@ -546,6 +663,16 @@ class RemoteConnectionPool:
             while True:
                 await asyncio.sleep(interval_s)
                 if self._connections.get(peer_id) is not endpoint:
+                    # §5.4a: the connection this loop watched may have been
+                    # evicted at the §A1 seam. That does NOT end the failure
+                    # episode — the escalation is still owed, so arm it rather
+                    # than returning into silence. `transport-error` is the
+                    # fallback reason because the seam is the only way to
+                    # reach unbound-and-`suspect`; if the eviction did not
+                    # demote, the escalator's scope pin writes nothing.
+                    self._schedule_escalation(
+                        peer_id, endpoint, originating_reason="transport-error",
+                    )
                     return
                 # §5.4 adaptive suppression: skip the ping during active
                 # message exchange; activity also resets the counter.
@@ -595,27 +722,14 @@ class RemoteConnectionPool:
                     continue
 
                 # Connection failed (§5.4): suspect → grace → disconnected.
+                # The grace half is the escalator's, not this loop's (§5.4a)
+                # — otherwise a concurrent §A1 eviction, which cancels this
+                # task, would take the pending escalation down with it.
                 self._write_demotion(
                     endpoint, status_reason=("suspect", "keepalive-miss"),
                 )
-                await asyncio.sleep(timeout_s)
-                if self._connections.get(peer_id) is not endpoint:
-                    # Reconnected during the grace period — the new
-                    # binding wrote its own `connected`. Do not clobber.
-                    return
-                # Evict WITHOUT the cancel-self path racing us: drop the
-                # binding first, then write. remove_connection cancels
-                # this task; from here the loop only returns.
-                self._keepalive_tasks.pop(peer_id, None)
-                del self._connections[peer_id]
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(endpoint.aclose())
-                except RuntimeError:  # pragma: no cover
-                    pass
-                self._write_demotion(
-                    endpoint,
-                    status_reason=("disconnected", "keepalive-miss"),
+                self._schedule_escalation(
+                    peer_id, endpoint, originating_reason="keepalive-miss",
                 )
                 return
         except asyncio.CancelledError:
@@ -735,8 +849,14 @@ class RemoteConnectionPool:
         (R3a / TV-LT2).
         """
         # Stop keepalive loops first so no ping races the close below.
-        tasks = list(self._keepalive_tasks.values())
+        # Pending §5.4a escalations go with them: a local shutdown is not a
+        # peer failure, and a `disconnected` write landing after the tree is
+        # torn down would be a demotion nobody observed.
+        tasks = list(self._keepalive_tasks.values()) + list(
+            self._escalation_tasks.values()
+        )
         self._keepalive_tasks.clear()
+        self._escalation_tasks.clear()
         for task in tasks:
             if not task.done():
                 task.cancel()

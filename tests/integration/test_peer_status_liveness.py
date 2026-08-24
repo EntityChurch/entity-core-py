@@ -480,6 +480,277 @@ class TestKeepalive:
         asyncio.run(run())
 
 
+class TestEscalationOwedByTheEpisode:
+    """§5.4a `[MUST]` — the `suspect → disconnected` escalation is owed by the
+    **failure episode**, not by the connection.
+
+    go found this in their own tree (`b55101f`) and then measured it against
+    both siblings: `liveness_escalate_after_eviction` FAILed against py
+    `2c1aa1b` and rust `21eb223` with identical text. py's defect was the same
+    shape as theirs — `demote_on_transport_error` evicts the binding, eviction
+    cancels the keepalive loop, and the loop was the only thing that owed the
+    escalation. The peer stayed `suspect` forever, so the disconnect
+    subscription never fired and **§4.1 reconnect never triggered on any
+    transport-error-first path** — which is how a dead peer is usually noticed
+    first, so the common case rather than a corner.
+
+    Why nothing already here could see it: `test_keepalive_miss_escalates_to_
+    disconnected` above arms a **fresh** counterpart, so it exercises the idle
+    timer and says nothing about a peer already demoted at the §A1 seam. Our
+    four-run negative control for go's flaky check was an honest pass over a
+    surface it structurally could not reach. The composition of the two vectors
+    we already had is the state no check occupied — the second gap of exactly
+    that shape in two cycles, after the §5.5a granter frame.
+    """
+
+    def test_escalate_after_eviction(self):
+        """`NET-LIVENESS-ESCALATE-AFTER-EVICTION-1` — establish, drop the
+        remote, one dispatch (→ `suspect`/`transport-error`), then stay idle:
+        the escalation still lands, and carries the episode's ORIGINATING
+        reason rather than re-stamping to `keepalive-miss`."""
+        async def run():
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            server = _build_server(server_kp)
+            await server.start("127.0.0.1", 0)
+            client = _build_client(
+                client_kp, server, server_kp, _bound_port(server),
+                interval_ms=50, timeout_ms=100, max_missed=1,
+            )
+            try:
+                await client._remote_pool.get_connection(server.peer_id)
+                await server.stop()
+
+                # One dispatch over the connection believed active: the §A1
+                # seam demotes and evicts.
+                result = await client._remote_execute(
+                    f"entity://{server.peer_id}/system/status", "get", None
+                )
+                assert result.status == 502
+                suspect = _read_status(client, server_kp)
+                assert suspect.data["status"] == STATUS_SUSPECT
+                assert suspect.data["reason"] == "transport-error"
+                failing_since = suspect.data["failing_since"]
+
+                # The escalation outlived the eviction that cancelled the
+                # keepalive loop — the structural half of the rule. The two
+                # live in separate maps precisely so this holds.
+                pool = client._remote_pool
+                assert server.peer_id not in pool._keepalive_tasks
+                escalation = pool._escalation_tasks.get(server.peer_id)
+                assert escalation is not None and not escalation.done(), (
+                    "the §A1 eviction cancelled the pending §5.4 escalation"
+                )
+
+                # NOTHING further is dispatched — no ping is sent, no
+                # counterpart is re-armed. The grace period alone owes this.
+                status = await _wait_for(
+                    lambda: (
+                        (s := _read_status(client, server_kp)) is not None
+                        and s.data["status"] == STATUS_DISCONNECTED
+                        and s
+                    ),
+                    timeout=5.0,
+                )
+                assert status, (
+                    "peer demoted to suspect at the §A1 seam never escalated "
+                    "to disconnected — §4.1 reconnect can never fire"
+                )
+                # The RULED half: `keepalive-miss` here would assert pings
+                # that were provably never sent (the connection was gone
+                # before the loop could send one) and would destroy the only
+                # signal distinguishing a transport-first episode.
+                assert status.data["reason"] == "transport-error", (
+                    "the escalation re-stamped the episode's originating reason"
+                )
+                # One episode, one `failing_since` — the escalation is a
+                # transition inside it, not a new one (§2 retry-state).
+                assert status.data["failing_since"] == failing_since
+            finally:
+                await client.stop()
+
+        asyncio.run(run())
+
+    def test_idle_path_still_escalates_with_its_own_reason(self):
+        """The other entry point, unchanged by the §5.4a rework: an episode
+        that opens at an idle keepalive miss escalates carrying
+        `keepalive-miss`. Both reasons are preserved by the same code path,
+        which is the point — the escalator reads the episode rather than
+        assuming which timer armed it."""
+        async def run():
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            server = _build_server(server_kp)
+            await server.start("127.0.0.1", 0)
+            client = _build_client(
+                client_kp, server, server_kp, _bound_port(server),
+                interval_ms=50, timeout_ms=100, max_missed=1,
+            )
+            try:
+                await client._remote_pool.get_connection(server.peer_id)
+                await server.stop()
+                status = await _wait_for(
+                    lambda: (
+                        (s := _read_status(client, server_kp)) is not None
+                        and s.data["status"] == STATUS_DISCONNECTED
+                        and s
+                    ),
+                    timeout=5.0,
+                )
+                assert status, "idle-dead peer never escalated"
+                assert status.data["reason"] == "keepalive-miss"
+                assert server.peer_id not in client._remote_pool._connections
+            finally:
+                await client.stop()
+
+        asyncio.run(run())
+
+    def test_reconnect_during_grace_writes_nothing(self):
+        """§5.4a guard 2 — a peer that comes back during the grace period is
+        `connected` again, and the pending escalation must not clobber the new
+        binding's own write."""
+        async def run():
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            server = _build_server(server_kp)
+            await server.start("127.0.0.1", 0)
+            port = _bound_port(server)
+            client = _build_client(
+                client_kp, server, server_kp, port,
+                interval_ms=10_000, timeout_ms=300, max_missed=3,
+            )
+            try:
+                conn = await client._remote_pool.get_connection(server.peer_id)
+                # Demote without killing the server: the episode opens, the
+                # escalation arms, and the peer is reachable the whole time.
+                client._remote_pool.demote_on_transport_error(
+                    server.peer_id, conn, ConnectionError("injected")
+                )
+                assert _read_status(client, server_kp).data["status"] == STATUS_SUSPECT
+
+                # Re-dial inside the grace window.
+                await client._remote_pool.get_connection(server.peer_id)
+                assert _read_status(client, server_kp).data["status"] == STATUS_CONNECTED
+
+                # Let the grace expire; the escalation reads a reconnected,
+                # `connected` peer and writes nothing.
+                await asyncio.sleep(0.5)
+                final = _read_status(client, server_kp)
+                assert final.data["status"] == STATUS_CONNECTED, (
+                    "the escalation clobbered a recovered peer"
+                )
+            finally:
+                await client.stop()
+                await server.stop()
+
+        asyncio.run(run())
+
+
+class TestNoEscalationWithoutEpisode:
+    """`NET-LIVENESS-NO-ESCALATION-WITHOUT-EPISODE-1` — the §5.4a scope pin,
+    and the negative half of the pair.
+
+    **DECLARED EXCLUSION (§5.4a satisfaction mode; GUIDE-CONFORMANCE §5.2b).**
+    This half is satisfied **in-process**, not at the wire, and no cross-impl
+    result covers it. The state it requires — *unbound yet still `connected`* —
+    is reachable only from the two paths §A1 deliberately excludes from
+    demoting (§10.2 dispatch fallback, RELAY terminal hop), and py deploys
+    neither, so a conformance client cannot construct it. §5.4a rejects the
+    obvious wire proxy (a live idle counterpart) on the grounds that a bound
+    counterpart exercises a timer-driven escalation and never the scope-pin
+    defect: it would read as coverage while missing the case.
+
+    **The mutation this is verified against, named as §5.4a requires:** remove
+    the `status != suspect` guard in `RemoteConnectionPool._escalate_after_
+    grace`. `test_mutation_removing_the_suspect_guard_fails_this` below does
+    not merely name it — it executes it, and asserts the write appears. An
+    unexecuted mutation claim is the same species of vacuous control we shipped
+    on the §5.5a probe last cycle: it varied scope while holding form fixed,
+    and could not have failed.
+
+    Recorded in `docs/CONFORMANCE-EXCLUSIONS.md` as well, because an exclusion
+    that lives only in a test docstring is one report away from being lost —
+    and an in-process result reported as a cross-impl vector pass is a false
+    conformance claim.
+    """
+
+    @staticmethod
+    async def _armed_on_a_connected_peer(client, server, server_kp):
+        """Arm the escalator against a peer that was evicted WITHOUT being
+        demoted — the §10.2 / RELAY shape, in process."""
+        conn = await client._remote_pool.get_connection(server.peer_id)
+        assert _read_status(client, server_kp).data["status"] == STATUS_CONNECTED
+        # The bare guarded evict: what the excluded paths use, and what
+        # `demote_on_transport_error` calls before it writes anything.
+        assert client._remote_pool.remove_connection(server.peer_id, expected=conn)
+        client._remote_pool._schedule_escalation(
+            server.peer_id, conn, originating_reason="transport-error",
+        )
+        task = client._remote_pool._escalation_tasks[server.peer_id]
+        await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+
+    def test_evict_without_demote_produces_no_disconnected_write(self):
+        async def run():
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            server = _build_server(server_kp)
+            await server.start("127.0.0.1", 0)
+            client = _build_client(
+                client_kp, server, server_kp, _bound_port(server),
+                interval_ms=10_000, timeout_ms=50, max_missed=3,
+            )
+            try:
+                await self._armed_on_a_connected_peer(client, server, server_kp)
+                status = _read_status(client, server_kp)
+                assert status.data["status"] == STATUS_CONNECTED, (
+                    "escalated a peer with no open failure episode — the scope "
+                    "pin is what keeps §10.2 fallback and RELAY terminal-hop "
+                    "evictions from manufacturing a demotion"
+                )
+                assert "reason" not in status.data
+            finally:
+                await client.stop()
+                await server.stop()
+
+        asyncio.run(run())
+
+    def test_mutation_removing_the_suspect_guard_fails_this(self):
+        """The declared mutation, executed. With the guard's discriminating
+        value neutralized, the same arrangement DOES write `disconnected` —
+        so the assertion above has teeth and is not passing by construction.
+
+        Escalating on any *unbound* peer rather than any *`suspect`* peer is
+        precisely the defect that satisfies the positive vector while breaking
+        the §A1 seam scope; this is the shape of it."""
+        async def run():
+            from entity_core.peer import liveness
+
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            server = _build_server(server_kp)
+            await server.start("127.0.0.1", 0)
+            client = _build_client(
+                client_kp, server, server_kp, _bound_port(server),
+                interval_ms=10_000, timeout_ms=50, max_missed=3,
+            )
+            original = liveness.STATUS_SUSPECT
+            try:
+                # `status != STATUS_SUSPECT → return` now admits `connected`:
+                # the guard is present but no longer discriminates, which is
+                # what "removing the suspect guard" means behaviorally.
+                liveness.STATUS_SUSPECT = STATUS_CONNECTED
+                await TestNoEscalationWithoutEpisode._armed_on_a_connected_peer(
+                    client, server, server_kp
+                )
+                status = _read_status(client, server_kp)
+                assert status.data["status"] == STATUS_DISCONNECTED, (
+                    "the mutation did not reach the write — this negative "
+                    "vector would pass against a peer with no scope pin at "
+                    "all, which makes it worthless"
+                )
+            finally:
+                liveness.STATUS_SUSPECT = original
+                await client.stop()
+                await server.stop()
+
+        asyncio.run(run())
+
+
 class TestStatusShape:
     """Ruling D: the §3.13 type is registered with the canonical field
     set; the enum is THREE states (no `reconnecting`)."""

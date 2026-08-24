@@ -170,6 +170,67 @@ async def test_replayed_authenticate_rejected_401_invalid_nonce(server_peer: Pee
 
 
 @pytest.mark.asyncio
+async def test_dialer_refusal_carries_the_remotes_code_not_just_prose():
+    """R-7 — the dialer-side extractor, one layer below the checks.
+
+    The responder side of this was fixed once already (the cohort sweep
+    caught `ConnectError` collapsing every failure mode to a generic
+    `bad_request` at the wire boundary). The **dialer** side was still
+    collapsing: `Connection.connect` folded a refusal into a message string
+    and dropped the remote's `code` and `status`, so a check of a pinned
+    handshake-refusal row could only ever assert that *something* raised.
+
+    Why nothing here saw it: `test_replayed_authenticate_rejected_401_
+    invalid_nonce` above — the one check that does assert a handshake
+    refusal code — drives a **raw socket** and reads the `ExecuteResponse`
+    itself, so it never touches the extractor. Auditing the checks does not
+    reach a layer the checks route around. That is core-go's R-7 lesson
+    landing on our own tree, on the opposite side of the same seam.
+
+    The stub responder is the point: only a *remote* refusal exercises the
+    extractor, and the peer under test refuses nothing at authenticate
+    without a replay it cannot be made to perform through this API.
+    """
+    from entity_core.handlers.connect import ConnectState, handle_connect_hello
+
+    responder_kp = Keypair.generate()
+
+    async def refuse_at_authenticate(reader, writer):
+        try:
+            state = ConnectState(phase="awaiting_hello")
+            hello_env = await recv_envelope(reader)
+            hello = Execute.from_entity(hello_env.root)
+            state, hello_response = handle_connect_hello(
+                state, hello.params, responder_kp, hello.request_id,
+            )
+            await send_envelope(writer, Envelope(root=hello_response.to_entity()))
+
+            auth_env = await recv_envelope(reader)
+            auth = Execute.from_entity(auth_env.root)
+            await send_envelope(writer, Envelope(root=ExecuteResponse.unauthorized(
+                auth.request_id, "nonce already consumed", code="invalid_nonce",
+            ).to_entity()))
+        except Exception:
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(refuse_at_authenticate, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(ConnectError) as exc:
+            await Connection.connect("127.0.0.1", port, Keypair.generate())
+        # The attributes a check can assert on...
+        assert exc.value.code == "invalid_nonce"
+        assert exc.value.status == 401
+        # ...and the message, so `match=` sees it without reaching in.
+        assert "invalid_nonce" in str(exc.value)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_pre_connect_execute_rejected(server_peer: Peer):
     """EXECUTE before connect is rejected with 403."""
     reader, writer = await asyncio.open_connection("127.0.0.1", 19000)

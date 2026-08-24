@@ -675,7 +675,7 @@ async def test_reg_register_proof_1(peer):
     # 401: layer-1 is authentication (proof of key control), so a failure there
     # is "you did not prove it", not "policy says no" (403 not_entitled).
     assert r["status"] == 401
-    assert r["result"]["data"]["code"] == "proof_failed"
+    assert r["result"]["data"]["code"] == "signature_invalid"
 
 
 @pytest.mark.asyncio
@@ -692,7 +692,7 @@ async def test_reg_register_wholly_unsigned_rejected_401(peer):
     # deliberately no _sign_into_store
     r = await _call(peer, "register-request", data)
     assert r["status"] == 401
-    assert r["result"]["data"]["code"] == "proof_failed"
+    assert r["result"]["data"]["code"] == "signature_invalid"
     resolved = (await _call(peer, "resolve", {"name": "unsigned.com"}))["result"]["data"]
     assert resolved["status"] != "resolved"
 
@@ -972,7 +972,7 @@ async def test_reg_unsigned_revoke_refused_401(peer):
     outright, a permanent denial-of-name against every binding in the registry
     since revocation is monotonic.
 
-    401 `proof_failed`, not 403 `not_entitled`: absent proof is an
+    401 `signature_invalid`, not 403 `not_entitled`: absent proof is an
     authentication result; 403 is "proof accepted, policy says no".
     """
     _emit_issuer_policy(peer, "open")
@@ -986,7 +986,7 @@ async def test_reg_unsigned_revoke_refused_401(peer):
     r = await _call(peer, "revoke-request", {"binding_hash": binding_hash,
                                              "reason": "not mine to revoke"})
     assert r["status"] == 401
-    assert r["result"]["data"]["code"] == "proof_failed"
+    assert r["result"]["data"]["code"] == "signature_invalid"
 
     # §2.4a negative half: refused AND nothing published. A 401 that emitted
     # the revocation anyway would satisfy a status-only check while leaving the
@@ -1009,9 +1009,55 @@ async def test_reg_unsigned_renew_refused_401(peer):
 
     r = await _call(peer, "renew-request", {"binding_hash": binding_hash, "ttl": 999999})
     assert r["status"] == 401
-    assert r["result"]["data"]["code"] == "proof_failed"
+    assert r["result"]["data"]["code"] == "signature_invalid"
 
     # Negative half: no superseding binding was issued.
     resolved = await _call(peer, "resolve", {"name": "renewme.com"})
     assert resolved["result"]["data"]["status"] == "resolved"
     assert bytes(resolved["result"]["data"]["binding"]) == bytes(binding_hash)
+
+
+@pytest.mark.asyncio
+async def test_layer1_row_is_401_signature_invalid_at_all_three_sites(peer):
+    """§6a.9's ratified status table — layer-1 is **401 + `signature_invalid`**,
+    and the three sites answer it identically.
+
+    The three per-op vectors above each pin their own site. What none of them
+    can see is *drift between* the sites, which is the shape this row actually
+    failed in: register moved to 401 at `4cdf805`, revoke/renew followed at
+    `9ac97bb`, and all three then carried `proof_failed` — a code the spec does
+    not name — for a month, green the whole time, because go's instrument
+    asserted the status and stopped (their R-3, fixed at `6aed8f1`, measured
+    against py at `2c1aa1b`: three FAILs).
+
+    So this asserts the tuple, once, across the row: same status, same code,
+    from the same constant. A future site that hand-rolls its own literal
+    fails here rather than at a cross-impl run three weeks later.
+    """
+    from entity_handlers.registry import LAYER1_PROOF_ERROR_CODE
+
+    _emit_issuer_policy(peer, "open")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+
+    # A live binding to aim the revoke/renew at (register signed; those two not).
+    data = _register_data(reg_kp.peer_id, "threesites.com")
+    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
+    binding_hash = (await _call(peer, "register-request", data))["result"]["data"]["binding_hash"]
+
+    answers = {
+        "register-request": await _call(
+            peer, "register-request", _register_data(reg_kp.peer_id, "unsigned-three.com")
+        ),
+        "revoke-request": await _call(
+            peer, "revoke-request", {"binding_hash": binding_hash}
+        ),
+        "renew-request": await _call(
+            peer, "renew-request", {"binding_hash": binding_hash}
+        ),
+    }
+    for op, r in answers.items():
+        assert r["status"] == 401, f"{op} layer-1 status"
+        assert r["result"]["data"]["code"] == LAYER1_PROOF_ERROR_CODE, f"{op} layer-1 code"
+    # The spec's value, not merely our own constant echoed back at us.
+    assert LAYER1_PROOF_ERROR_CODE == "signature_invalid"

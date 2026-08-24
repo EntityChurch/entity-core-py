@@ -122,7 +122,7 @@ async def test_live_register_wire_proof_failure(registry_peer: Peer):
         )
         assert resp.status == 401
         body = resp.result["data"] if "data" in resp.result else resp.result
-        assert body["code"] == "proof_failed"
+        assert body["code"] == "signature_invalid"
     finally:
         conn.close()
         await conn.wait_closed()
