@@ -103,7 +103,9 @@ def _recording_dispatcher(result: ExecuteResult | None = None):
     )
 
     async def disp(uri, operation, params, dispatch_capability, bounds,
-                   chain_id, resource_targets, included=None):
+                   chain_id, resource_targets, included=None, **_kwargs):
+        # **_kwargs swallows optional dispatcher kwargs (propagated_*,
+        # dispatch_capability_*, reactive_trigger) the real closure accepts.
         calls.append(
             {
                 "uri": uri,

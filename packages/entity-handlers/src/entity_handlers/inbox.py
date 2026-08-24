@@ -75,6 +75,18 @@ async def _advance_continuation_if_present(
             "advance",
             advance_params,
             resource_targets=[continuation_path],
+            # PROPOSAL-CONTINUATION-STANDING-MODEL §3 (arch ruling, MUST): this
+            # advance is a REACTIVE trigger — the inbox delivery mechanism is
+            # advancing the continuation as a consequence of a delivered event.
+            # Declared explicitly (the standing-model O1 signal, mirroring Go's
+            # WithReactiveTrigger) so the continuation advances under its OWN
+            # dispatch_capability, gated by delivery-reachability (the inbound
+            # `receive` already enforced its own path check to land here), and
+            # MUST NOT require the delivering caller to hold advance-cap on the
+            # continuation's path. Cross-peer this is what lets peer A trigger a
+            # continuation resident on B without holding rights over B's own
+            # continuation state (the Q2 return-leg defect).
+            reactive_trigger=True,
         )
     except Exception as e:
         logger.warning(

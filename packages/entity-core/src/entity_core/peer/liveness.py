@@ -133,6 +133,7 @@ def write_peer_status(
     last_error: str | None = None,
     connected_at: int | None = None,
     last_seen: int | None = None,
+    failing_since: int | None = None,
     connection_ref: str | None = None,
     ctx: EmitContext | None = None,
 ) -> bytes | None:
@@ -172,6 +173,16 @@ def write_peer_status(
         data["connected_at"] = Uint(int(connected_at))
     if last_seen is not None:
         data["last_seen"] = Uint(int(last_seen))
+    # §2 retry-state ruling: `failing_since` stamps the START of the failure
+    # episode — ONE transition-written field, the durable input the derived
+    # §2.2 retry pacing reads (attempt/next_attempt_at are NOT stored). Present
+    # on a demotion, omitted on the `connected` write (that omission is what
+    # clears the episode). Carried forward across a suspect→disconnected
+    # escalation by the caller (the one field a demotion writer must preserve),
+    # so the derived backoff curve does not restart at min_ms every time the
+    # peer fails a little harder.
+    if failing_since is not None:
+        data["failing_since"] = Uint(int(failing_since))
     if connection_ref is not None:
         data["connection"] = connection_ref
 
@@ -186,6 +197,33 @@ def write_peer_status(
         )
         return None
     return result.hash if result.hash is not None else entity.compute_hash()
+
+
+def read_peer_status_failing_since(
+    entity_tree: "EntityTree",
+    content_store: "ContentStore",
+    remote_identity_hash: bytes,
+) -> int | None:
+    """The current ``failing_since`` on ``system/peer/status/{remote_hex}``,
+    or ``None`` when there is no status entity or it carries no episode.
+
+    The §2 preserve-across-escalation read: a demotion writer carries an
+    open episode's start forward rather than re-stamping it (only the
+    ``connected`` write clears it). A ``0``/absent value reads as ``None``
+    (no open episode)."""
+    if not remote_identity_hash:
+        return None
+    try:
+        h = entity_tree.get(entity_tree.normalize_uri(peer_status_path(remote_identity_hash)))
+        if h is None:
+            return None
+        ent = content_store.get(h)
+        if ent is None:
+            return None
+        fs = ent.data.get("failing_since")
+        return int(fs) if fs else None
+    except Exception:
+        return None
 
 
 def write_connection_status(

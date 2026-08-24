@@ -19,6 +19,28 @@ from entity_core.primitives import TreePath
 DEFAULT_TTL = 64
 DEFAULT_BUDGET = 100000
 
+# Canonical rejection messages for a dispatch refused because a *local*
+# resource bound (a per-request hop/work budget) is exhausted. Shared so the
+# producing site (peer dispatch) and the consuming site (continuation advance,
+# which attributes the chain-terminating brake honestly) agree on one spelling
+# rather than matching a scattered literal. These are LOCAL bounds — distinct
+# from the continuation causal-chain `chain_depth` GLOBAL brake
+# (PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4a): TTL/budget exhaustion is an
+# additional local bound, never a substitute for the depth brake.
+TTL_EXHAUSTED_MESSAGE = "TTL exhausted"
+BUDGET_EXHAUSTED_MESSAGE = "Budget exhausted"
+
+# Wire error CODES for the same refusal. Unlike the human message, the code is
+# the attributable identifier a *caller* keys on: a cross-peer continuation
+# chain that hits a bound at a peer's ingress is refused pre-dispatch, and the
+# terminal the caller observes MUST name the bound rather than collapse to a
+# generic `bad_request` (which cannot be told from a malformed request). Shared
+# here so the producing site (peer ingress) and the continuation handler's
+# chain-error `{reason}` agree on one spelling. Matches `relay.py`'s
+# source-route `ttl_hops` code.
+TTL_EXHAUSTED_CODE = "ttl_exhausted"
+BUDGET_EXHAUSTED_CODE = "budget_exhausted"
+
 
 @dataclass
 class Bounds:

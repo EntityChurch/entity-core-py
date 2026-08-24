@@ -87,7 +87,13 @@ import secrets
 import time
 from typing import Any
 
-from entity_core.protocol.bounds import Bounds
+from entity_core.protocol.bounds import (
+    Bounds,
+    BUDGET_EXHAUSTED_CODE,
+    BUDGET_EXHAUSTED_MESSAGE,
+    TTL_EXHAUSTED_CODE,
+    TTL_EXHAUSTED_MESSAGE,
+)
 from entity_core.capability.delegation import (
     ChainCollectStatus,
     check_creator_authority,
@@ -214,6 +220,46 @@ CONTINUATION_HANDLER_PATTERN = "system/continuation"
 # entity-core-go's DefaultMaxChainDepth for cohort parity.
 DEFAULT_MAX_CHAIN_DEPTH = 64
 CHAIN_DEPTH_EXCEEDED_REASON = "chain_depth_exceeded"
+
+# PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4a (arch ruling 2026-07-18): the
+# chain_depth brake is GLOBAL and independent; TTL/budget exhaustion is an
+# ADDITIONAL LOCAL bound that terminates a continuation causal chain, never a
+# substitute for the depth brake. When a local bound is what actually
+# terminated the chain, attribute it honestly (not the misleading
+# `protocol_error` a delivered non-2xx would carry) so the terminal is
+# observable AND correctly named — the O1 discipline arch asked for: the
+# suspension's cause must be attributable, depth vs. a local bound must not
+# collapse. Same-peer, TTL (a local bound, default 64) reaches exhaustion
+# before depth (64) in a synchronous self-loop (~2 dispatches/advance), so it
+# legitimately fires first — arch blessed that as "locally safe"; the depth
+# brake governs where TTL cannot (the cross-peer chain, once rung-4 refills
+# per hop — deferred, a shared cohort hold).
+# The chain-error `{reason}` is the same identifier the peer's ingress emits as
+# the wire code (bounds.py) — one spelling for the sender-side lost marker and
+# the caller-observed terminal.
+TTL_EXHAUSTED_REASON = TTL_EXHAUSTED_CODE
+BUDGET_EXHAUSTED_REASON = BUDGET_EXHAUSTED_CODE
+
+
+def _resource_bound_reason(dispatch_result: Any) -> str | None:
+    """If ``dispatch_result`` is a dispatch REFUSED because a local resource
+    bound (ttl/budget) is exhausted, return the honest ``{reason}`` for the
+    chain-error marker; otherwise None.
+
+    A ttl/budget-exhausted dispatch is refused *pre-handler* (peer dispatch
+    returns 400 with the canonical message, the handler never runs) — so it is
+    NOT a delivered non-2xx (§3.4 v1.10) and MUST NOT be attributed
+    `protocol_error`. It is the local resource brake terminating the causal
+    chain; naming it as such is what makes the terminal attributable (§4a O1).
+    """
+    if getattr(dispatch_result, "status", None) != 400:
+        return None
+    err = getattr(dispatch_result, "error", None)
+    if err == TTL_EXHAUSTED_MESSAGE:
+        return TTL_EXHAUSTED_REASON
+    if err == BUDGET_EXHAUSTED_MESSAGE:
+        return BUDGET_EXHAUSTED_REASON
+    return None
 
 # Type names
 CONTINUATION_TYPE = "system/continuation"
@@ -513,6 +559,50 @@ async def _handle_advance(
     cont_type = continuation_entity.type
     cont_data = continuation_entity.data
 
+    # PROPOSAL-CONTINUATION-STANDING-MODEL §3 (arch ruling 2026-07-18, MUST) —
+    # the advance-authority split. A standing continuation is subscription-
+    # shaped: a trigger reaches it, but does not own it. Two authorities:
+    #
+    #  * REACTIVE (ctx.reactive_trigger) — a delivery mechanism (inbox route,
+    #    subscription/timer poke) advancing the continuation as a consequence of
+    #    a delivered event. Gated by delivery-REACHABILITY: the inbound delivery
+    #    already passed its own Level-2 path check to land here. The advance then
+    #    runs under the continuation's OWN dispatch_capability (below), and MUST
+    #    NOT additionally require the delivering caller to hold advance-cap on
+    #    the continuation's path. Cross-peer, ctx.caller_capability is the
+    #    triggering peer's narrowly-scoped cap (V7 §6.8 propagation) — precisely
+    #    the cap that does NOT cover B's own continuation state, the Q2 defect.
+    #
+    #  * ADMINISTRATIVE (marker absent) — a bare `advance` EXECUTE, an operator
+    #    or handler directly managing continuations. Stays capability-gated on
+    #    the path: the caller MUST hold `advance` on the continuation path. (The
+    #    wire dispatcher's §5.2 resource-scope check already enforces this for a
+    #    wire advance; this is the same gate expressed at the handler, so an
+    #    internal administrative advance under a propagated caller cap is held to
+    #    the same rule — defense-in-depth, one explicit site keyed on the
+    #    marker, not an inference from dispatch surface.)
+    #
+    # The escalation mitigation remains the §3.1a INSTALL-time in-chain check on
+    # dispatch_capability (a continuation can only have been installed by an
+    # in-chain granter); the residual on the reactive path is timing/frequency
+    # (DoS, bounded by the continuation's own `bounds`), not escalation.
+    # Defense-in-depth, scoped like every other `check_caller_permission` use:
+    # it corrects a *present but insufficient* caller capability, it does not
+    # invent a gate where the dispatcher already authorized. An internal /
+    # synthesized advance carries no caller capability ({} / falsy) — the
+    # peer's §5.2 dispatcher already ran the primary authorization for a wire
+    # advance, and the handler trusts that — so an absent caller cap is trusted
+    # here (not treated as "grants nothing"). The gate therefore fires only for
+    # an ADMINISTRATIVE advance that arrived with a real caller capability which
+    # does not cover `advance` on the continuation's path.
+    if not ctx.reactive_trigger and ctx.caller_capability:
+        if not ctx.check_caller_permission("advance", continuation_path):
+            return _error_response(
+                403,
+                CODE_CAPABILITY_DENIED,
+                f"insufficient capability for path: {continuation_path}",
+            )
+
     if cont_type == CONTINUATION_TYPE:
         # Forward continuation
         return await _advance_forward(cont_data, result, status, continuation_path, full_uri, content_hash, ctx)
@@ -642,6 +732,27 @@ def _suspend_chain_depth_exceeded(
     )
     emit_ctx = EmitContext.from_handler_grant(ctx, "advance")
     ctx.emit_pathway.emit(full_uri, suspended, emit_ctx)
+    # §4a observability: bind a chain-error-lost marker so the depth brake is
+    # attributable in the tree event log — the signal a cross-impl probe reads
+    # to confirm the *depth* brake fired (Go binds a `bounds_exceeded` marker at
+    # its 429 seam; Python's `{reason}` is `chain_depth_exceeded`, matching the
+    # proposal §8 anchor and this suspend's own reason). Without this the depth
+    # suspension persisted a resumable entity but left no marker in the lost
+    # sink, so a probe watching that sink could not distinguish depth from a
+    # local-bound brake (the divergence §4a O1 is about).
+    request_id_for_marker = (
+        ctx.request_id
+        if getattr(ctx, "request_id", None)
+        else _synthesized_step_key("depth", continuation_path)
+    )
+    _bind_lost_marker(
+        ctx,
+        code=CHAIN_DEPTH_EXCEEDED_REASON,
+        status=429,
+        request_id=request_id_for_marker,
+        continuation_path=continuation_path,
+        extra_body={"suspended_path": suspended_path},
+    )
     logger.info(
         "continuation chain_depth exceeded ceiling %d (chain_id=%s) — suspended "
         "at %s", DEFAULT_MAX_CHAIN_DEPTH, chain_id, suspended_path,
@@ -1014,7 +1125,20 @@ async def _advance_forward(
     # v1.20: timestamp captured at observation-origination here (right
     # after dispatch returns) per §3.10.6 discipline.
     if on_error_data is None and dispatch_result.status >= 400:
-        dispatch_code = _extract_response_code(dispatch_result.result)
+        # §4a: a dispatch REFUSED because a local resource bound (ttl/budget)
+        # is exhausted is NOT a delivered non-2xx — the peer refused it
+        # pre-handler. Attribute the honest brake reason so the terminal of a
+        # continuation causal chain that hit its LOCAL bound is observable and
+        # correctly named (not the misleading `protocol_error` a missing
+        # downstream code would otherwise yield). This is what makes the
+        # self-referential runaway's terminal attributable to *ttl*, keeping it
+        # distinct from the *chain_depth* brake (§4a O1: cause must not
+        # collapse). The depth brake fires (and suspends) at its own site.
+        resource_reason = _resource_bound_reason(dispatch_result)
+        dispatch_code = resource_reason or (
+            _extract_response_code(dispatch_result.result)
+            or TRANSPORT_CODE_PROTOCOL_ERROR
+        )
         origination_ms = int(time.time() * 1000)
         # CONTINUATION v1.14 §3.4: {step_index} MUST be the original
         # request_id of the forward dispatch — pinned cross-impl. Fall
@@ -1027,7 +1151,7 @@ async def _advance_forward(
         )
         _bind_lost_marker(
             ctx,
-            code=dispatch_code or TRANSPORT_CODE_PROTOCOL_ERROR,
+            code=dispatch_code,
             status=int(dispatch_result.status),
             request_id=request_id_for_marker,
             continuation_path=continuation_path,

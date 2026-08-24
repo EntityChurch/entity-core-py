@@ -43,7 +43,13 @@ from entity_core.peer.session_entity import (
     read_minted_capability,
     write_session,
 )
-from entity_core.protocol.bounds import Bounds
+from entity_core.protocol.bounds import (
+    Bounds,
+    BUDGET_EXHAUSTED_CODE,
+    BUDGET_EXHAUSTED_MESSAGE,
+    TTL_EXHAUSTED_CODE,
+    TTL_EXHAUSTED_MESSAGE,
+)
 from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.framing import recv_envelope, send_envelope
@@ -607,6 +613,8 @@ class Peer:
                 resource_targets: list[str] | None = None,
                 bounds: Bounds | None = None,
                 included: dict[bytes, dict[str, Any]] | None = None,
+                *,
+                reactive_trigger: bool = False,
             ) -> ExecuteResult:
                 """Execute a request from an extension using system grant.
 
@@ -615,6 +623,12 @@ class Peer:
                 envelope entities (V7 §3.3 v7.51) — e.g. the subscription
                 engine bundling an ``include_payload`` entity so the
                 subscriber's continuation can ``deref_included`` it.
+
+                ``reactive_trigger`` (STANDING-MODEL §3): an extension that
+                advances a continuation as a delivery/timer poke (the network
+                retry-timer re-arm, a subscription poke) declares it reactive,
+                so the advance runs under the continuation's own authority
+                rather than being treated as an administrative invoke.
                 """
                 # Use full access grant for extension operations
                 system_grant = {
@@ -626,6 +640,7 @@ class Peer:
                     uri, operation, params, system_grant, bounds, None,
                     resource_targets=resource_targets,
                     included=included,
+                    reactive_trigger=reactive_trigger,
                 )
 
             for ext_config in state.extensions:
@@ -2735,6 +2750,7 @@ class Peer:
             dispatch_capability_entity: dict[str, Any] | None = None,
             dispatch_capability_chain: list[dict[str, Any]] | None = None,
             included: dict[bytes, dict[str, Any]] | None = None,
+            reactive_trigger: bool = False,
         ) -> ExecuteResult:
             return await self._dispatch_local_execute(
                 uri,
@@ -2763,6 +2779,7 @@ class Peer:
                 dispatch_capability_chain=dispatch_capability_chain,
                 included=included if included is not None else seed_included,
                 reentry=reentry,
+                reactive_trigger=reactive_trigger,
             )
 
         return execute_dispatcher
@@ -2867,17 +2884,37 @@ class Peer:
         bounds.apply_defaults()
 
         if bounds_data:
-            logger.debug("[dispatch] bounds: ttl=%s budget=%s chain=%s",
-                        bounds.ttl, bounds.budget, bounds.chain_id[:12] if bounds.chain_id else "none")
+            # chain_depth is the continuation causal-chain axis (§3.9), inherited
+            # across the wire and independent of the per-hop TTL. Logged here so
+            # the *inbound* depth is observable on the cross-peer path — without
+            # it, a cross-impl probe cannot see the global depth accumulate vs.
+            # TTL decrement (the Go↔Python anchor-1 "no chain_depth in the line").
+            logger.debug("[dispatch] bounds: ttl=%s budget=%s chain=%s chain_depth=%s",
+                        bounds.ttl, bounds.budget,
+                        bounds.chain_id[:12] if bounds.chain_id else "none",
+                        bounds.chain_depth if bounds.chain_depth is not None else "none")
             # Cross-peer cascade tracking (SYSTEM-COMPOSITION §3.4)
             if bounds.chain_id and bounds.cascade_depth is not None:
                 self.emit_pathway.track_chain_depth(bounds.chain_id, bounds.cascade_depth)
 
-        # Pre-dispatch check: reject if bounds exhausted
+        # Pre-dispatch check: reject if bounds exhausted.
+        #
+        # The wire response MUST name the bound that terminated the request
+        # (`ttl_exhausted` / `budget_exhausted`), NOT a generic `bad_request`:
+        # a cross-peer continuation chain that hits a bound at a peer's ingress
+        # is refused *here*, before any handler runs, so this is the only site
+        # that spells the terminal the *caller* observes. The sender-side lost
+        # marker the continuation handler attributes (§4a O1) never reaches this
+        # wire code. An unattributed `bad_request` is what left the Go↔Python
+        # cross-impl anchor-1 probe unable to tell a bounds brake from a
+        # malformed request (entity-core-go
+        # 2026-07-18-crosspeer-continuation-bounds-anchor1-cohort.md, finding 2).
+        # Same wire surface `relay.py` already emits for source-route `ttl_hops`.
         if bounds.ttl_exhausted:
             response = ExecuteResponse.bad_request(
                 request_id=request_id,
-                message="TTL exhausted",
+                message=TTL_EXHAUSTED_MESSAGE,
+                code=TTL_EXHAUSTED_CODE,
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return
@@ -2885,7 +2922,8 @@ class Peer:
         if bounds.budget_exhausted:
             response = ExecuteResponse.bad_request(
                 request_id=request_id,
-                message="Budget exhausted",
+                message=BUDGET_EXHAUSTED_MESSAGE,
+                code=BUDGET_EXHAUSTED_CODE,
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return
@@ -3725,6 +3763,7 @@ class Peer:
         dispatch_capability_chain: list[dict[str, Any]] | None = None,
         included: dict[bytes, dict[str, Any]] | None = None,
         reentry: "ReentryChannel | None" = None,
+        reactive_trigger: bool = False,
     ) -> ExecuteResult:
         """Dispatch an internal execute request to handlers.
 
@@ -3812,9 +3851,9 @@ class Peer:
         if bounds is not None:
             bounds = bounds.copy()  # Don't mutate caller's bounds
             if bounds.ttl_exhausted:
-                return ExecuteResult(status=400, error="TTL exhausted")
+                return ExecuteResult(status=400, error=TTL_EXHAUSTED_MESSAGE)
             if bounds.budget_exhausted:
-                return ExecuteResult(status=400, error="Budget exhausted")
+                return ExecuteResult(status=400, error=BUDGET_EXHAUSTED_MESSAGE)
             bounds.decrement_ttl()
 
         # Compute local peer identity hash for internal dispatch author tracking
@@ -3893,6 +3932,13 @@ class Peer:
             parent_chain_id=bounds.parent_chain_id if bounds else None,
             resource_targets=resource_targets,
             handler_pattern=handler_pattern,
+            # STANDING-MODEL §3: the explicit reactive-trigger marker, sourced
+            # per-dispatch from the caller (the inbox/subscription delivery
+            # route sets it True on the advance it initiates). NOT inherited —
+            # a fresh child context is built per sub-dispatch and defaults
+            # False, so the marker tags only the one advance the delivery
+            # mechanism initiated, never the continuation's onward dispatches.
+            reactive_trigger=reactive_trigger,
             caller_capability_hash=caller_cap_hash,
             caller_capability_granter_peer_id=caller_cap_granter_frame,  # V7 §PR-8
             remote_identity_hash=effective_author_identity_hash,

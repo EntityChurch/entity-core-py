@@ -143,10 +143,20 @@ def _upstream_error(result: Any) -> tuple[str, str]:
     return "internal_error", str(result.error or payload or "")
 
 
-def _backoff_delay_s(backoff: dict[str, Any] | None, attempt: int) -> float:
-    """§2.2 delay in seconds for the given consecutive-failure attempt
-    (1-based) under the session's backoff config (spec-issue 5: the delay
-    sits between failure and the backoff-continuation advance)."""
+def _delay_ms(backoff: dict[str, Any] | None, k: int) -> int:
+    """§2.2 delay in ms before retry ``k``, ``k`` 1-INDEXED: ``k=1`` is the
+    first retry after the failure, ``_delay_ms(_, 0) == 0`` (no retry, no
+    wait). Mirrors the Go reference ``BackoffConfigData.DelayMs``.
+
+        constant     min
+        linear       min · k
+        exponential  min · 2^(k-1)
+
+    all clamped to max (max raised to min when a config inverts them, so the
+    delay is never below min). Python ints are unbounded, so no saturation
+    dance is needed — the exponential loop still short-circuits at the cap."""
+    if k <= 0:
+        return 0
     cfg = backoff or {}
     min_ms = int(cfg.get("min_ms", DEFAULT_BACKOFF_MIN_MS))
     max_ms = int(cfg.get("max_ms", DEFAULT_BACKOFF_MAX_MS))
@@ -156,14 +166,110 @@ def _backoff_delay_s(backoff: dict[str, Any] | None, attempt: int) -> float:
     if strategy == "constant":
         ms = min_ms
     elif strategy == "linear":
-        ms = min_ms * attempt
+        ms = min_ms * k
     else:  # exponential (default; unknown strategies fall back per spec)
         ms = min_ms
-        for _ in range(1, attempt):
-            ms *= 2
+        for _ in range(1, k):
             if ms >= max_ms:
                 break
-    return min(ms, max_ms) / 1000.0
+            ms *= 2
+    return min(ms, max_ms)
+
+
+@dataclass(frozen=True)
+class RetryState:
+    """§2.2 retry pacing for one failure episode, DERIVED from
+    ``(failing_since, backoff cfg, now)`` — never stored. Mirrors the Go
+    reference ``types.RetryState`` (`ROUTING`/`HANDOFF-2026-07-16` §2)."""
+
+    #: Retries that have already FIRED this episode: 0 in the interval between
+    #: the failure and the first retry coming due.
+    attempt: int = 0
+    #: When the next retry comes due, ms since epoch. 0 when ``exhausted`` —
+    #: there is no next attempt.
+    next_attempt_at: int = 0
+    #: An OPTIONAL §2.2 bound (``max_attempts`` / ``max_elapsed_ms``) has been
+    #: reached and the relationship is abandoned. Always False under the
+    #: default retry-forever config.
+    exhausted: bool = False
+
+
+def derive_retry_state(
+    backoff: dict[str, Any] | None, failing_since_ms: int | None, now_ms: int
+) -> RetryState:
+    """The whole §2.2 retry state machine as one pure function: the pacing for
+    the failure episode that began at ``failing_since_ms``, as of ``now_ms``.
+
+    Nothing counts attempts and nothing is written per attempt (§A4): the
+    k-th retry is due at a fixed offset from ``failing_since``, so "which
+    retry are we on" is a question about elapsed time, answerable from a stamp
+    the tree already holds. Restart-hammering dies (a process restarting beside
+    a month-dead peer re-derives a large ``attempt`` + a max-length wait, where
+    an in-memory counter would reset to 0 and redial in ``min_ms``), and pacing
+    converges (two peers reading the same ``failing_since`` agree on the
+    schedule without exchanging retry state).
+
+    Schedule, ``elapsed = now - failing_since`` (INCLUSIVE boundary — at
+    exactly ``elapsed_to(k)`` the k-th retry has fired):
+
+        elapsed_to(0) = 0
+        elapsed_to(k) = elapsed_to(k-1) + delay_ms(k)
+        attempt       = max{ k : elapsed_to(k) <= elapsed }
+        next_attempt_at = failing_since + elapsed_to(attempt + 1)
+
+    ``failing_since`` None/0 ⇒ no episode ⇒ zero state. A degenerate config
+    whose delay is 0 is always due, never counted (``attempt`` 0,
+    ``next_attempt_at == failing_since``) rather than looping forever.
+    """
+    if not failing_since_ms:
+        return RetryState()
+    elapsed = now_ms - failing_since_ms if now_ms > failing_since_ms else 0
+    attempt, next_at = _derive_pacing(backoff, failing_since_ms, elapsed)
+
+    cfg = backoff or {}
+    # OPTIONAL §2.2 give-up bounds. Unset ⇒ retry-forever (the default never
+    # takes these branches). Whichever bound trips first wins; an exhausted
+    # episode reports no next attempt (a nonzero would have the caller schedule
+    # a retry it just decided not to make).
+    max_attempts = cfg.get("max_attempts")
+    if max_attempts is not None and attempt >= int(max_attempts):
+        return RetryState(attempt=attempt, next_attempt_at=0, exhausted=True)
+    max_elapsed = cfg.get("max_elapsed_ms")
+    if max_elapsed is not None and elapsed >= int(max_elapsed):
+        return RetryState(attempt=attempt, next_attempt_at=0, exhausted=True)
+    return RetryState(attempt=attempt, next_attempt_at=next_at, exhausted=False)
+
+
+def _derive_pacing(
+    backoff: dict[str, Any] | None, failing_since_ms: int, elapsed: int
+) -> tuple[int, int]:
+    """Walk the schedule; returns ``(attempt, next_attempt_at)``. The delay
+    sequence is non-decreasing and every strategy plateaus, so once two
+    consecutive delays match the tail is arithmetic and closes in one step —
+    without which a month-dead peer at a 60s cap would cost ~43k iterations."""
+    attempt = 0  # retries fired so far
+    cum = 0      # elapsed_to(attempt)
+    prev_delay = 0
+    k = 1
+    while True:
+        delay = _delay_ms(backoff, k)
+        if delay == 0:
+            # Degenerate zero-delay config: always due, never counted.
+            return attempt, failing_since_ms + cum
+        if k > 1 and delay == prev_delay:
+            # Plateaued: every remaining retry costs exactly `delay`, and
+            # cum <= elapsed still holds (we would have returned otherwise).
+            extra = (elapsed - cum) // delay
+            attempt += extra
+            cum += extra * delay
+            return attempt, failing_since_ms + cum + delay
+        nxt = cum + delay
+        if nxt > elapsed:
+            return attempt, failing_since_ms + nxt
+        cum = nxt
+        attempt = k
+        prev_delay = delay
+        k += 1
 
 
 @dataclass
@@ -180,9 +286,15 @@ class _MaintainSession:
     #: Lifecycle subscription ids (on-disconnect + on-reconnect deliveries);
     #: release-peer unsubscribes them.
     subscription_ids: list[str] = field(default_factory=list)
-    #: Consecutive failed reconnect attempts since the last successful
-    #: establish; drives the §2.2 backoff delay.
-    attempt: int = 0
+    #: §2 retry-state: the failure episode start (ms since epoch), the ONE
+    #: input the derived §2.2 pacing reads. The TREE's ``failing_since``
+    #: (written by the demotion seam) wins when present — it is durable, so a
+    #: restart re-derives the curve instead of resetting a counter. This
+    #: in-memory copy is only the FALLBACK for a peer that never connected
+    #: (no demotion transition ever stamped the tree). ``None`` = no open
+    #: episode; cleared on recovery. Replaces the old per-attempt counter,
+    #: which reset to 0 on restart and re-hammered a long-dead peer.
+    failing_since: int | None = None
     #: Pending backoff-advance timer task, if any.
     retry_task: asyncio.Task | None = None
     #: The §4.1 continuations + subscriptions exist in the tree, so
@@ -417,7 +529,10 @@ class NetworkExtension(Extension):
                 502, "connection_failed", f"connect to {peer_id}: {e}"
             )
 
-        sess.attempt = 0
+        # Recovery: close the failure episode. The TREE's `failing_since` is
+        # cleared by the ambient `connected` write (§3.13, by omission); this
+        # clears the in-memory never-connected fallback in lockstep.
+        sess.failing_since = None
         sess.params = clean_params
 
         # 2–4. Install the continuation graph + lifecycle subscriptions.
@@ -689,20 +804,67 @@ class NetworkExtension(Extension):
         its own advance. The re-install this used to do was the one-shot's
         self-re-arm — the very write that lost the race with the consume.
         """
-        self._schedule_backoff_advance(sess)
+        failing_since = self._resolve_failing_since(ctx, sess)
+        self._schedule_backoff_advance(sess, failing_since)
 
-    def _schedule_backoff_advance(self, sess: _MaintainSession) -> None:
-        """Start (or replace) the session's retry timer: after the computed
-        delay, self-advance the backoff continuation, which one-shot
-        re-EXECUTEs maintain-peer. The advance is a self-authored dispatch —
-        there is no request context alive when the timer fires."""
-        sess.attempt += 1
-        delay_s = _backoff_delay_s(sess.params.get("backoff"), sess.attempt)
-        sess.cancel_retry()
+    def _resolve_failing_since(
+        self, ctx: HandlerContext, sess: _MaintainSession
+    ) -> int:
+        """The §2 episode start driving the derived retry pacing.
+
+        The TREE's ``failing_since`` (stamped by the demotion seam) wins: it is
+        durable, so a process restarting beside a long-dead peer re-derives the
+        curve. Absent (a peer that has NEVER connected made no demotion
+        transition), the in-memory session copy is the fallback — opened now on
+        the first failure with no episode on record. Keeps the two in sync so a
+        later restart still prefers the tree once one exists.
+        """
+        tree_fs = liveness.read_peer_status_failing_since(
+            ctx.emit_pathway.entity_tree,
+            ctx.emit_pathway.content_store,
+            sess.remote_hash,
+        )
+        if tree_fs is not None:
+            sess.failing_since = tree_fs
+            return tree_fs
+        if sess.failing_since is None:
+            sess.failing_since = liveness.now_ms()
+        return sess.failing_since
+
+    def _schedule_backoff_advance(
+        self, sess: _MaintainSession, failing_since: int
+    ) -> None:
+        """Start (or replace) the session's retry timer: at the DERIVED
+        ``next_attempt_at``, self-advance the backoff continuation, which
+        one-shot re-EXECUTEs maintain-peer. The advance is a self-authored
+        dispatch — there is no request context alive when the timer fires.
+
+        Pacing is derived from ``(failing_since, cfg, now)`` (§2), never a
+        stored counter: ``next_attempt_at`` is a fixed offset from the episode
+        start, so the wait is a question about elapsed time. An OPTIONAL §2.2
+        bound (``max_attempts``/``max_elapsed_ms``) reaching its limit stops the
+        loop; the default config is retry-forever and never does."""
+        now = liveness.now_ms()
+        state = derive_retry_state(sess.params.get("backoff"), failing_since, now)
         peer_id = sess.peer_id
+        sess.cancel_retry()
+        if state.exhausted:
+            # §2.2 give-up bound reached — abandon the retry loop (terminal).
+            # Writing the §A2 `reason: retry-exhausted` terminal status is the
+            # OPTIONAL Group-B follow-up; the load-bearing behaviour is that we
+            # STOP rather than hammer. Unreachable under the retry-forever
+            # default (max_attempts/max_elapsed_ms unset).
+            logger.debug(
+                "reconnect %s: §2.2 retry bound reached after %d attempt(s) "
+                "(failing_since=%d) — giving up",
+                peer_id[:16], state.attempt, failing_since,
+            )
+            return
+        delay_s = max(0.0, (state.next_attempt_at - now) / 1000.0)
         logger.debug(
-            "reconnect %s: attempt %d failed, next retry in %.3fs",
-            peer_id[:16], sess.attempt, delay_s,
+            "reconnect %s: %d attempt(s) fired since failing_since=%d, "
+            "next retry in %.3fs",
+            peer_id[:16], state.attempt, failing_since, delay_s,
         )
 
         async def _fire() -> None:
@@ -718,6 +880,17 @@ class NetworkExtension(Extension):
                     "advance",
                     {"type": "system/continuation/advance-request", "data": {}},
                     resource_targets=[backoff_path(peer_id)],
+                    # STANDING-MODEL §3: the retry timer firing is a reactive
+                    # owner-poke (a timer delivery advancing the peer's own
+                    # backoff continuation), not an administrative operator
+                    # invoke — there is no request context alive when the timer
+                    # fires. Declared reactive so it advances under the
+                    # continuation's own dispatch_capability. (Go left its
+                    # `selfExecute` unmarked because it already holds its own
+                    # path cap; Python declares it reactive — the consistency
+                    # follow-up Go's scope note names — so the owner-poke is not
+                    # subject to the administrative caller-cap check.)
+                    reactive_trigger=True,
                 )
                 if not result.ok:
                     logger.debug(
@@ -780,7 +953,8 @@ class NetworkExtension(Extension):
             return error_response(
                 502, "connection_failed", f"reconnect to {peer_id}: {e}"
             )
-        sess.attempt = 0
+        # Recovery: close the failure episode (see the maintain-peer clear).
+        sess.failing_since = None
         return ok_response("primitive/any", {"outcome": "reconnected"})
 
     async def _handle_restore_subscriptions(

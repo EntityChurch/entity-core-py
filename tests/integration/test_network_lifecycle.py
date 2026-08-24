@@ -409,12 +409,111 @@ class TestReconnectLifecycle:
                         f"found {len(live_subs)}"
                     )
 
-                    # The backoff loop settled: attempt counter reset.
+                    # The backoff loop settled: the §2 failure episode is
+                    # closed on recovery (failing_since cleared; the derived
+                    # pacing has no episode to pace).
                     sess = _network_ext(client).get_session(server.peer_id)
                     assert sess is not None, "session lost across the outage"
-                    assert sess.attempt == 0, (
-                        f"attempt counter {sess.attempt} after successful "
-                        f"re-establish, want 0"
+                    assert sess.failing_since is None, (
+                        f"failure episode {sess.failing_since} still open after "
+                        f"successful re-establish, want cleared"
+                    )
+                finally:
+                    await server2.stop()
+            finally:
+                await client.stop()
+                await server.stop()  # idempotent
+
+        asyncio.run(run())
+
+    def test_demotion_stamps_failing_since_recovery_clears_it(self):
+        """§2 retry-state ruling — the Go↔Python reconnect anchor WARN
+        (`entity-core-go 2026-07-19-reconnect-disconnect-crossimpl.md`): the
+        killed peer's §3.13 status MUST carry a durable ``failing_since`` (the
+        failure-episode start the derived §2.2 pacing reads), and recovery MUST
+        clear it. Without the stamp, retry pacing is in-memory only and cannot
+        survive a restart — the exact gap the WARN named.
+
+        This asserts the field on the wire status entity directly (Go/Rust
+        PASS the same anchor because they carry it); the pacing math is the
+        pure-function vector table in tests/unit/test_network_backoff.py.
+        """
+        async def run():
+            server_kp, client_kp = Keypair.generate(), Keypair.generate()
+            fixed_port = _free_port()
+            server = _build_lifecycle_peer(server_kp)
+            await server.start("127.0.0.1", fixed_port)
+            client = _build_lifecycle_peer(
+                client_kp, interval_ms=100, timeout_ms=150, max_missed=1,
+            )
+            try:
+                result = await _exec_network(
+                    client, "maintain-peer",
+                    {
+                        "peer_id": server.peer_id,
+                        "address": f"127.0.0.1:{fixed_port}",
+                        "backoff": {"min_ms": 100, "max_ms": 400},
+                    },
+                    params_type="system/network/maintain-request",
+                )
+                assert result.status == 200, result.error
+
+                connected = await _wait_for(
+                    lambda: (
+                        (s := _read_status(client, server_kp)) is not None
+                        and s.data["status"] == STATUS_CONNECTED
+                    )
+                )
+                assert connected, "never reached connected"
+                # A live relationship carries no episode.
+                assert _read_status(client, server_kp).data.get("failing_since") is None
+
+                # Kill → the §5.4 keepalive demotes off connected and stamps the
+                # episode start on the same transition write.
+                await server.stop()
+                stamped = await _wait_for(
+                    lambda: (
+                        (s := _read_status(client, server_kp)) is not None
+                        and s.data["status"] != STATUS_CONNECTED
+                        and s.data.get("failing_since")
+                    ),
+                    timeout=10.0,
+                )
+                assert stamped, (
+                    "killed peer's §3.13 status carries no failing_since — the "
+                    "reconnect-anchor WARN: the failure episode has no durable "
+                    "record, so §2.2 pacing cannot survive a restart"
+                )
+                episode_start = _read_status(client, server_kp).data["failing_since"]
+
+                # The episode start is CARRIED FORWARD across the
+                # suspect→disconnected escalation (and every failed redial), not
+                # re-stamped — else the backoff curve restarts at min_ms each time.
+                await asyncio.sleep(0.6)
+                s_now = _read_status(client, server_kp)
+                assert s_now.data.get("failing_since") == episode_start, (
+                    f"failing_since moved from {episode_start} to "
+                    f"{s_now.data.get('failing_since')} mid-episode — the demotion "
+                    f"seam re-stamped it instead of preserving the episode start"
+                )
+
+                # Recovery: restart at the same address → the retry loop
+                # re-establishes and the `connected` write clears the episode.
+                server2 = _build_lifecycle_peer(server_kp)
+                await server2.start("127.0.0.1", fixed_port)
+                try:
+                    cleared = await _wait_for(
+                        lambda: (
+                            (s := _read_status(client, server_kp)) is not None
+                            and s.data["status"] == STATUS_CONNECTED
+                            and s.data.get("failing_since") is None
+                        ),
+                        timeout=15.0,
+                    )
+                    assert cleared, (
+                        "recovery did not clear failing_since — a reconnected "
+                        "peer must close the failure episode (§3.13 connected "
+                        "write omits the field)"
                     )
                 finally:
                     await server2.stop()

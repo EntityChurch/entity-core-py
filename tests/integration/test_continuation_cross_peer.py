@@ -267,3 +267,60 @@ async def test_chain_depth_rides_the_cross_peer_wire(peer_b):
     finally:
         conn.close()
         await conn.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_crosspeer_bound_terminal_is_attributable(peer_b):
+    """Cross-impl anchor-1 WARN follow-up (entity-core-go
+    `2026-07-18-crosspeer-continuation-bounds-anchor1-cohort.md`, finding 2):
+    when a cross-peer continuation chain hits a resource bound at B's ingress,
+    the wire response B returns MUST name the bound (``ttl_exhausted`` /
+    ``budget_exhausted``) — NOT a generic ``bad_request``.
+
+    Go's probe bound a lost marker reading ``status=400 code="bad_request"`` at
+    the terminal and WARN'd because ``bad_request`` is not an attributable
+    bounds reason. The pre-dispatch bounds check (peer ingress) is the exact
+    site: an inbound EXECUTE arriving with ttl already at 0 is refused
+    *before* any handler runs, so the honest terminal has to be spelled at that
+    check — the sender-side lost-marker attribution the continuation handler
+    already does never reaches the wire code the *caller* observes.
+
+    This is the same wire surface `relay.py` already emits for source-route
+    `ttl_hops` exhaustion (`ttl_exhausted`/400); the core bounds check must be
+    consistent with it.
+    """
+    from entity_core.protocol.bounds import Bounds
+
+    kp_a = Keypair.generate()
+    conn = await Connection.connect("127.0.0.1", 19077, kp_a)
+    try:
+        # ttl already exhausted on arrival — refused at B's pre-dispatch bounds
+        # check, before the tree handler runs.
+        resp = await conn.execute(
+            uri=f"entity://{peer_b.peer_id}/system/tree",
+            operation="get",
+            params={"type": "primitive/any", "data": {"path": "data/probe"}},
+            bounds=Bounds(chain_id="chain-ttl", ttl=0, budget=100000),
+        )
+        assert resp.status == 400, resp.result
+        # Error results ride the wire as a `system/protocol/error` typed entity
+        # (V7 §3.3): the code is under `data`.
+        assert resp.result["data"]["code"] == "ttl_exhausted", (
+            "cross-peer TTL-exhausted terminal is not attributable — Go's "
+            f"anchor-1 WARN: expected code='ttl_exhausted', got {resp.result!r}"
+        )
+
+        # budget exhausted on arrival — the same attributable-terminal rule.
+        resp2 = await conn.execute(
+            uri=f"entity://{peer_b.peer_id}/system/tree",
+            operation="get",
+            params={"type": "primitive/any", "data": {"path": "data/probe"}},
+            bounds=Bounds(chain_id="chain-bud", ttl=64, budget=0),
+        )
+        assert resp2.status == 400, resp2.result
+        assert resp2.result["data"]["code"] == "budget_exhausted", (
+            f"cross-peer budget-exhausted terminal is not attributable: {resp2.result!r}"
+        )
+    finally:
+        conn.close()
+        await conn.wait_closed()

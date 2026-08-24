@@ -437,6 +437,21 @@ class RemoteConnectionPool:
         from entity_core.peer import liveness
 
         status, reason = status_reason
+        # §2 retry-state: stamp `failing_since` at the START of the failure
+        # episode and carry it forward — a suspect→disconnected escalation (or
+        # a redial that trips the transport seam again mid-episode) must NOT
+        # re-stamp it, or the derived §2.2 backoff curve restarts at min_ms
+        # every time the peer fails a little harder. Only the `connected` write
+        # clears it (by omission). This preserve is the demotion writer's job:
+        # only the caller knows the episode's history (same seam that owns the
+        # §A1 no-clobber guard).
+        failing_since = liveness.read_peer_status_failing_since(
+            self._entity_tree,
+            self._content_store,
+            session_obj.remote_identity_hash,
+        )
+        if failing_since is None:
+            failing_since = liveness.now_ms()
         liveness.write_peer_status(
             self._emit_pathway,
             local_peer_id=self._keypair.peer_id,
@@ -446,6 +461,7 @@ class RemoteConnectionPool:
             reason=reason,
             last_error=last_error,
             last_seen=self._last_heard_ms.get(session_obj.remote_peer_id),
+            failing_since=failing_since,
         )
         liveness.mark_connection_closed(
             self._emit_pathway,

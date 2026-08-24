@@ -36,9 +36,17 @@ from entity_core.storage.emit import EmitPathway
 from entity_core.storage.entity_tree import EntityTree
 from entity_core.utils.ecf import ecf_encode
 from entity_handlers.continuation import (
+    BUDGET_EXHAUSTED_REASON,
+    CHAIN_DEPTH_EXCEEDED_REASON,
     DEFAULT_MAX_CHAIN_DEPTH,
+    TTL_EXHAUSTED_REASON,
     _advance_forward,
     _handle_resume,
+    _resource_bound_reason,
+)
+from entity_core.protocol.bounds import (
+    BUDGET_EXHAUSTED_MESSAGE,
+    TTL_EXHAUSTED_MESSAGE,
 )
 
 
@@ -224,6 +232,131 @@ class TestChainDepthCeilingBrake:
             content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
         )
         assert resp["status"] == 200  # rooted at 1, nowhere near the ceiling
+
+
+async def _advance_with_dispatch(ctx, cap_hash, dispatch_result: ExecuteResult):
+    """Run one forward advancement whose dispatch returns ``dispatch_result``."""
+    orig = HandlerContext.execute_with_capability
+
+    async def _patched(self, *a, **k) -> ExecuteResult:
+        return dispatch_result
+
+    HandlerContext.execute_with_capability = _patched  # type: ignore[method-assign]
+    try:
+        return await _advance_forward(
+            cont_data=_cont(cap_hash), result={"data": {}}, status=200,
+            continuation_path="test-cont", full_uri="/peer/test-cont",
+            content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
+        )
+    finally:
+        HandlerContext.execute_with_capability = orig  # type: ignore[method-assign]
+
+
+def _chain_error_markers(emit_pathway) -> list[dict]:
+    """The chain-error-lost marker bodies currently in the tree."""
+    tree = emit_pathway.entity_tree
+    out = []
+    for p in tree.list_prefix("system/runtime/chain-errors"):
+        h = tree.get(p)
+        if h is not None:
+            out.append(emit_pathway.content_store.get(h).data)
+    return out
+
+
+class TestQ1DepthBrakeIsObservable:
+    """PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4a (arch ruling 2026-07-18):
+    the chain_depth brake is INDEPENDENT of TTL and OBSERVABLE.
+
+    Before this cycle the depth suspension persisted a resumable entity but
+    bound no chain-error-lost marker, so a cross-impl probe watching the lost
+    sink could not confirm the *depth* brake fired. Go binds a `bounds_exceeded`
+    marker at its 429 seam; Python now binds one with `{reason}` =
+    `chain_depth_exceeded` (matching the suspend's own reason + proposal §8).
+    """
+
+    @pytest.mark.asyncio
+    async def test_depth_suspend_binds_observable_marker(self) -> None:
+        emit_pathway, ctx, cap_hash = _make_ctx(
+            Bounds(chain_id="chain-run", chain_depth=DEFAULT_MAX_CHAIN_DEPTH)
+        )
+        resp = await _advance_forward(
+            cont_data=_cont(cap_hash), result={"data": {}}, status=200,
+            continuation_path="test-cont", full_uri="/peer/test-cont",
+            content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
+        )
+        assert resp["status"] == 429
+        markers = _chain_error_markers(emit_pathway)
+        depth_markers = [
+            m for m in markers if m.get("reason") == CHAIN_DEPTH_EXCEEDED_REASON
+        ]
+        assert len(depth_markers) == 1, (
+            "the depth brake MUST leave an observable chain-error-lost marker "
+            "(§4a) — a probe reads the lost sink to confirm depth, not TTL, "
+            "terminated the chain"
+        )
+        assert depth_markers[0]["code"] == CHAIN_DEPTH_EXCEEDED_REASON
+
+    @pytest.mark.asyncio
+    async def test_no_depth_marker_when_rooted_fresh(self) -> None:
+        """Confirm-capable-of-failing: a fresh-rooted advance does not brake, so
+        no depth marker is bound — the marker keys on the *inherited* count."""
+        emit_pathway, ctx, cap_hash = _make_ctx(Bounds(chain_id="c1"))
+        await _advance_forward(
+            cont_data=_cont(cap_hash), result={"data": {}}, status=200,
+            continuation_path="test-cont", full_uri="/peer/test-cont",
+            content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
+        )
+        assert not [
+            m for m in _chain_error_markers(emit_pathway)
+            if m.get("reason") == CHAIN_DEPTH_EXCEEDED_REASON
+        ]
+
+
+class TestQ1LocalBoundHonestlyAttributed:
+    """§4a: TTL/budget exhaustion is an ADDITIONAL LOCAL bound — when it is what
+    terminated the continuation causal chain, it is attributed honestly (not the
+    misleading `protocol_error`), so depth vs. a local bound never collapse."""
+
+    def test_resource_bound_reason_maps_ttl_and_budget(self) -> None:
+        assert _resource_bound_reason(
+            ExecuteResult(status=400, error=TTL_EXHAUSTED_MESSAGE)
+        ) == TTL_EXHAUSTED_REASON
+        assert _resource_bound_reason(
+            ExecuteResult(status=400, error=BUDGET_EXHAUSTED_MESSAGE)
+        ) == BUDGET_EXHAUSTED_REASON
+        # A genuine downstream 400 (not a resource brake) is NOT reclassified.
+        assert _resource_bound_reason(
+            ExecuteResult(status=400, error="something else")
+        ) is None
+        assert _resource_bound_reason(ExecuteResult(status=200)) is None
+
+    @pytest.mark.asyncio
+    async def test_ttl_exhausted_dispatch_binds_honest_marker(self) -> None:
+        """A dispatch refused for TTL exhaustion (no on_error) binds a
+        `ttl_exhausted` marker — NOT `protocol_error`. Confirm-capable-of-
+        failing: before §4a this same input bound `protocol_error` (the
+        missing-downstream-code fallback), making a runaway's terminal look
+        like a downstream protocol fault rather than the local resource brake."""
+        emit_pathway, ctx, cap_hash = _make_ctx(Bounds(chain_id="c1"))
+        await _advance_with_dispatch(
+            ctx, cap_hash, ExecuteResult(status=400, error=TTL_EXHAUSTED_MESSAGE)
+        )
+        reasons = {m.get("reason") for m in _chain_error_markers(emit_pathway)}
+        assert TTL_EXHAUSTED_REASON in reasons
+        assert "protocol_error" not in reasons
+
+    @pytest.mark.asyncio
+    async def test_genuine_downstream_400_still_uses_its_code(self) -> None:
+        """A DELIVERED non-2xx keeps the §3.4 v1.10 behavior: its own code is
+        the marker reason (resource-brake reclassification is narrow)."""
+        emit_pathway, ctx, cap_hash = _make_ctx(Bounds(chain_id="c1"))
+        await _advance_with_dispatch(
+            ctx, cap_hash,
+            ExecuteResult(status=400, result={"data": {"code": "bad_request"}}),
+        )
+        reasons = {m.get("reason") for m in _chain_error_markers(emit_pathway)}
+        assert "bad_request" in reasons
+        assert TTL_EXHAUSTED_REASON not in reasons
 
 
 class TestOrdinaryDispatchAddsNoBounds:

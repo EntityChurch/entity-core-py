@@ -113,6 +113,25 @@ class HandlerContext:
     request_id: str | None = None
     resource_targets: list[str] | None = None
     handler_pattern: str | None = None
+    # PROPOSAL-CONTINUATION-STANDING-MODEL §3 (arch ruling 2026-07-18, MUST) —
+    # the explicit reactive-trigger marker. Set True by a *delivery mechanism*
+    # (the inbox route, a subscription poke) on the ONE advance it initiates as
+    # a consequence of a delivered event; a bare administrative `advance`
+    # EXECUTE (operator/handler directly invoking advance) leaves it False.
+    #
+    # This is the standing-model O1 signal, pinned as an EXPLICIT per-dispatch
+    # declaration — NOT inferred from caller identity, cap shape, or dispatch
+    # surface (an inference is what "springs apart at the cross-peer seam").
+    # It mirrors entity-core-go's `HandlerContext.ReactiveTrigger` /
+    # `WithReactiveTrigger()`. Per-dispatch, NOT inherited: it tags only the
+    # advance the delivery mechanism initiated, never the continuation's onward
+    # chain dispatches (each sub-dispatch context is built fresh and defaults
+    # False). It never serializes — the marker is set locally on B when B's
+    # inbox re-dispatches advance, after the inbound `receive` already crossed
+    # the wire. Read by the continuation advance to gate the authority split:
+    # reactive → own `dispatch_capability`, delivery-reachability the gate;
+    # administrative → the caller must hold `advance` on the path.
+    reactive_trigger: bool = False
     # V7 §3.3 (v7.51) request-side envelope-`included` preservation: the
     # request envelope's `included` map (hash -> entity dict) that arrived
     # with this EXECUTE, preserved across dispatch surfaces and propagated to
@@ -172,6 +191,8 @@ class HandlerContext:
         params: dict[str, Any] | None = None,
         resource_targets: list[str] | None = None,
         included: dict[bytes, dict[str, Any]] | None = None,
+        *,
+        reactive_trigger: bool = False,
     ) -> ExecuteResult:
         """Execute operation using handler's own grant.
 
@@ -210,6 +231,12 @@ class HandlerContext:
             self.chain_id,
             resource_targets,
             included=included,
+            # STANDING-MODEL §3: a delivery mechanism (inbox route, subscription
+            # poke) declares the advance it initiates is a reactive trigger, so
+            # the continuation advances under its OWN dispatch_capability rather
+            # than requiring the delivering caller to hold advance-cap on the
+            # continuation's path. Explicit, per-dispatch, never inferred.
+            reactive_trigger=reactive_trigger,
         )
 
     async def execute_with_capability(
@@ -357,6 +384,13 @@ class HandlerContext:
             Bounds(),  # Fresh bounds for async delivery
             None,  # No chain_id for async delivery
             [target.uri],  # Per INBOX §4.1
+            # STANDING-MODEL §3: deliver_async IS a delivery mechanism — any
+            # continuation advance it drives (an inbox receive that re-advances,
+            # or an on_error routed directly to an `advance`) is a REACTIVE
+            # trigger, not an administrative invoke, so it runs under the
+            # continuation's own dispatch_capability. Per-dispatch and not
+            # inherited: it marks only this delivery dispatch's context.
+            reactive_trigger=True,
         )
 
     def check_caller_permission(
