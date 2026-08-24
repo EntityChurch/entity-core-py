@@ -779,6 +779,23 @@ def cmd_list_identities() -> None:
             print(f"  {name}: (error loading: {e})")
 
 
+def _keepalive_config_from_args(args: argparse.Namespace) -> dict[str, int] | None:
+    """Map the ``--keepalive-*`` start flags to ``with_keepalive_config`` kwargs.
+
+    Returns a kwargs dict containing only the explicitly-set fields — each
+    omitted field keeps its EXTENSION-NETWORK §2.3 spec default via the
+    builder — or ``None`` when no keepalive flag was given (leave the loop
+    at spec defaults).
+    """
+    mapping = {
+        "interval_ms": getattr(args, "keepalive_interval_ms", None),
+        "timeout_ms": getattr(args, "keepalive_timeout_ms", None),
+        "max_missed": getattr(args, "keepalive_max_missed", None),
+    }
+    kwargs = {k: v for k, v in mapping.items() if v is not None}
+    return kwargs or None
+
+
 async def cmd_start(args: argparse.Namespace) -> None:
     """Start a peer and listen for connections."""
     host, port_str = args.listen.rsplit(":", 1)
@@ -878,6 +895,15 @@ async def cmd_start(args: argparse.Namespace) -> None:
               "`default -> *`. Migrate to --seed-policy with a real "
               "`default` entry.")
         builder.debug_mode(True)
+
+    # EXTENSION-NETWORK §2.3 keepalive override (validate-peer liveness
+    # harness): apply only the explicitly-set --keepalive-* flags; omitted
+    # fields keep their §2.3 spec defaults inside with_keepalive_config.
+    keepalive_kwargs = _keepalive_config_from_args(args)
+    if keepalive_kwargs is not None:
+        builder.with_keepalive_config(**keepalive_kwargs)
+        print(f"Keepalive override (EXTENSION-NETWORK §2.3): {keepalive_kwargs}")
+
     peer = builder.build()
 
     # Install the role extension's initial-grant policy resolver so the
@@ -1340,8 +1366,12 @@ def _add_identity_arg(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def main() -> None:
-    """Main entry point."""
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the top-level argument parser (all subcommands).
+
+    Extracted from ``main`` so the flag surface is testable without
+    spawning a peer.
+    """
     parser = argparse.ArgumentParser(
         prog="entity-core",
         description="Entity Core Protocol - Python Implementation",
@@ -1589,6 +1619,46 @@ def main() -> None:
              "are fetchable. Amendment 10: with whole-store the closure is "
              "covered trivially.",
     )
+    # --- EXTENSION-NETWORK §2.3 keepalive-override flags ---
+    # Cross-impl aliases for the Go peer-manager's `--keepalive
+    # interval,timeout,max_missed` triple, which forwards to the peer binary
+    # as -keepalive-interval-ms / -keepalive-timeout-ms / -keepalive-max-missed
+    # (Python --double-dash dialect per the Chunk D/E precedent). Compresses
+    # the §5.4 liveness escalation from the ~100s spec-default envelope to
+    # seconds so validate-peer's reconnect anchor is observable fast against a
+    # Python peer. Keepalive itself is MUST (§12.1) and always runs; these only
+    # tune parameters. Any omitted field keeps its §2.3 spec default.
+    start_parser.add_argument(
+        "--keepalive-interval-ms",
+        dest="keepalive_interval_ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="EXTENSION-NETWORK §2.3: keepalive ping interval in ms "
+             "(spec default 30000). Cross-impl alias for the Go peer's "
+             "-keepalive-interval-ms — lets validate-peer run the §5.4 "
+             "escalation in seconds against a Python peer.",
+    )
+    start_parser.add_argument(
+        "--keepalive-timeout-ms",
+        dest="keepalive_timeout_ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="EXTENSION-NETWORK §2.3: keepalive response timeout in ms "
+             "(spec default 10000). Cross-impl alias for the Go peer's "
+             "-keepalive-timeout-ms.",
+    )
+    start_parser.add_argument(
+        "--keepalive-max-missed",
+        dest="keepalive_max_missed",
+        type=int,
+        default=None,
+        metavar="N",
+        help="EXTENSION-NETWORK §2.3: consecutive missed keepalives before "
+             "the suspect→disconnected demotion (spec default 3). Cross-impl "
+             "alias for the Go peer's -keepalive-max-missed.",
+    )
 
     # --- ls command ---
     ls_parser = subparsers.add_parser("ls", help="List entities at a path")
@@ -1735,6 +1805,13 @@ def main() -> None:
         "--impl-version", default=None,
         help="Impl version string (default: 'git-<short-sha>')",
     )
+
+    return parser
+
+
+def main() -> None:
+    """Main entry point."""
+    parser = build_parser()
 
     # --- Parse and dispatch ---
     args = parser.parse_args()

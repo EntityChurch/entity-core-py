@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from entity_core.capability.grant import Grant
     from entity_core.crypto.identity import Keypair
     from entity_core.handlers.context import ExecuteResult
+    from entity_core.peer.peer import Peer
     from entity_core.storage.emit import EmitPathway
 
 
@@ -47,12 +48,18 @@ class ExtensionContext:
             Available after peer is fully built.
         emit_pathway: Storage access for subscribing to tree changes.
             Extensions can use this to register async listeners.
+        peer: The peer under construction, for extensions that need its
+            imperative seams (e.g. the network extension's connect-if-
+            needed / evict surface). The peer's core infrastructure
+            (storage, pool, handler registry) is set up by the time
+            extensions initialize; the peer is not yet started.
     """
 
     keypair: Keypair
     max_scope: list[Grant] | None = None
     execute: Callable[..., Awaitable[ExecuteResult]] | None = None
     emit_pathway: EmitPathway | None = None
+    peer: Peer | None = None
 
     @property
     def peer_id(self) -> str:

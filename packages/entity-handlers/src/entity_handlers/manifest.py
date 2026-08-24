@@ -99,6 +99,14 @@ CONNECT_HANDLER_MANIFEST = build_handler_manifest(
             "input_type": "system/protocol/connect/authenticate",
             "output_type": "system/capability/grant",
         },
+        # NETWORK §5.1 keepalive, served post-handshake on the same
+        # bootstrap layer. Advertised per Amendment 12 §A5: every op a
+        # handler dispatches on an established connection MUST appear in
+        # its operations manifest.
+        "ping": {
+            "input_type": "system/network/ping",
+            "output_type": "system/network/pong",
+        },
     },
 )
 TREE_HANDLER_MANIFEST = build_handler_manifest(
@@ -198,6 +206,83 @@ SUBSCRIPTION_HANDLER_MANIFEST = build_handler_manifest(
             "input_type": "system/subscription/cancel",
         },
     },
+)
+
+# Network handler manifest (EXTENSION-NETWORK §3.1 — Amendment 12 rung 3).
+#
+# Beyond the four §3.1 operations it advertises the internal operations the
+# §4.1 lifecycle graph dispatches (`reconnect`, `restore-subscriptions`) —
+# §A5: advertise what you dispatch. `restore-subscriptions` is dispatched by
+# the spec's own §4.1 pseudocode yet missing from the spec's §3.1 manifest
+# (Go spec-issue 3, converged on here).
+#
+# The internal_scope extends the §3.1 block with the handler's own pattern
+# and the continuation surface: the §4.1 graph's dispatch_capability is this
+# handler's grant (§11), so the grant must authorize the EXECUTEs the graph
+# performs at advance time (system/network reconnect / maintain-peer /
+# restore-subscriptions) and the handler's own backoff-timer advances. The
+# spec's §3.1 scope block cannot authorize the §4.1 graph it specifies —
+# same spec-issue, same fix shape as the Go reference manifest.
+NETWORK_HANDLER_MANIFEST = build_handler_manifest(
+    name="network",
+    pattern="system/network",
+    operations={
+        "maintain-peer": {
+            "input_type": "system/network/maintain-request",
+            "output_type": "system/network/maintain-result",
+        },
+        "release-peer": {
+            "input_type": "system/network/release-request",
+            "output_type": "system/network/release-result",
+        },
+        "status": {
+            "output_type": "system/network/status",
+        },
+        "close": {
+            "input_type": "system/network/close-request",
+        },
+        # Internal — dispatched by the §4.1 lifecycle continuations,
+        # advertised per §A5.
+        "reconnect": {
+            "input_type": "system/network/maintain-request",
+        },
+        "restore-subscriptions": {
+            "input_type": "primitive/any",
+        },
+    },
+    internal_scope=[
+        # §3.1 block.
+        {
+            "handlers": {"include": ["system/tree"]},
+            "resources": {"include": ["system/*"]},
+            "operations": {"include": ["get", "put"]},
+        },
+        {
+            "handlers": {"include": ["system/subscription"]},
+            "resources": {"include": ["system/*"]},
+            "operations": {"include": ["subscribe", "unsubscribe"]},
+        },
+        {
+            "handlers": {"include": ["system/protocol/connect"]},
+            "resources": {"include": ["*"]},
+            "operations": {"include": ["hello", "authenticate"]},
+        },
+        # Rung-3 additions (spec-issue: §3.1's block cannot authorize the
+        # §4.1 graph's own advance-time dispatches).
+        {
+            "handlers": {"include": ["system/network"]},
+            "resources": {"include": ["system/network/*", "system/inbox/network/*"]},
+            "operations": {"include": [
+                "maintain-peer", "release-peer", "status", "close",
+                "reconnect", "restore-subscriptions",
+            ]},
+        },
+        {
+            "handlers": {"include": ["system/continuation"]},
+            "resources": {"include": ["system/network/*", "system/inbox/network/*"]},
+            "operations": {"include": ["advance"]},
+        },
+    ],
 )
 
 # Revision handler manifest (EXTENSION-REVISION v2.1)
@@ -814,6 +899,7 @@ ALL_HANDLER_MANIFESTS = [
     CONTINUATION_HANDLER_MANIFEST,  # V7.8 continuation handler
     INBOX_HANDLER_MANIFEST,  # V7.8 inbox handler
     SUBSCRIPTION_HANDLER_MANIFEST,
+    NETWORK_HANDLER_MANIFEST,  # EXTENSION-NETWORK §3.1 (Amendment 12 rung 3)
     REVISION_HANDLER_MANIFEST,  # EXTENSION-REVISION v2.1
     CLOCK_HANDLER_MANIFEST,  # EXTENSION-CLOCK v1.0
     QUERY_HANDLER_MANIFEST,  # EXTENSION-QUERY v1.0

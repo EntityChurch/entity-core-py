@@ -59,6 +59,7 @@ from entity_core.handlers.registry import Handler
 if TYPE_CHECKING:
     from entity_core.crypto.identity import Keypair
     from entity_core.peer.extensions import Extension
+    from entity_core.peer.liveness import KeepaliveConfig
     from entity_core.peer.peer import Peer
     from entity_core.protocol.durability import DurabilityPolicy
     from entity_core.protocol.entity import Entity
@@ -131,6 +132,10 @@ class _BuilderState:
     # though §6 makes clear the inbox is one example of a durable store,
     # not the canonical store).
     durability_policy: "DurabilityPolicy | None" = None
+    # EXTENSION-NETWORK §2.3 / §5: keepalive parameters for the outbound
+    # pool's per-connection loop. None = spec defaults (30000/10000/3;
+    # impl-defined per §12.4). Keepalive itself is MUST (§12.1).
+    keepalive_config: "KeepaliveConfig | None" = None
 
 
 class PeerBuilder:
@@ -568,6 +573,33 @@ class PeerBuilder:
             Self for method chaining.
         """
         self._state.durability_policy = policy
+        return self
+
+    def with_keepalive_config(
+        self,
+        *,
+        interval_ms: int = 30_000,
+        timeout_ms: int = 10_000,
+        max_missed: int = 3,
+    ) -> PeerBuilder:
+        """Configure the §5 keepalive loop (EXTENSION-NETWORK §2.3).
+
+        Keepalive itself is MUST (§12.1) and always runs on pooled
+        outbound connections; this only tunes the parameters (defaults
+        per §2.3, exact values impl-defined per §12.4). The §A3 floor's
+        consumer latency contract: an idle-dead connection demotes within
+        ``interval_ms × max_missed + timeout_ms``.
+
+        Returns:
+            Self for method chaining.
+        """
+        from entity_core.peer.liveness import KeepaliveConfig
+
+        self._state.keepalive_config = KeepaliveConfig(
+            interval_ms=interval_ms,
+            timeout_ms=timeout_ms,
+            max_missed=max_missed,
+        )
         return self
 
     def with_continuation_handler(self) -> PeerBuilder:
@@ -1430,6 +1462,47 @@ class PeerBuilder:
             self._state.extensions.append(_ExtensionConfig(SubscriptionExtension()))
         return self
 
+    def with_network_handler(self) -> PeerBuilder:
+        """Register the system/network handler (EXTENSION-NETWORK §3–§4,
+        Amendment 12 rung 3).
+
+        `maintain-peer` / `release-peer` / `status` / `close` plus the
+        internal `reconnect` / `restore-subscriptions` operations the §4.1
+        reconnect lifecycle continuation graph dispatches (§A5: advertised).
+        The handler composes on the §A3 liveness floor (status transition
+        writes + §5.4 keepalive, ambient in entity-core) and needs the
+        peer's connect/evict seams plus retry-timer state, so it ships as a
+        NetworkExtension exposing the handler.
+
+        For the graph to actually run, the peer also needs the inbox,
+        continuation, and subscription handlers + the subscription
+        extension (`with_all_handlers()` wires everything).
+
+        Requires the entity-handlers package to be installed.
+
+        Returns:
+            Self for method chaining.
+        """
+        from entity_handlers.network import (
+            NETWORK_HANDLER_PATTERN,
+            NetworkExtension,
+        )
+
+        patterns = {h.pattern for h in self._state.handlers}
+        if NETWORK_HANDLER_PATTERN in patterns:
+            return self
+        extension = NetworkExtension()
+        self._state.handlers.append(
+            _HandlerConfig(
+                pattern=NETWORK_HANDLER_PATTERN,
+                handler=extension.handler,
+                priority=118,  # Owns system/network; wins over system/* (100).
+                name="network",
+            )
+        )
+        self._state.extensions.append(_ExtensionConfig(extension))
+        return self
+
     def with_substitute_handler(self) -> PeerBuilder:
         """Register the `http` storage-substitute handler (CDN corridor v1).
 
@@ -1512,6 +1585,7 @@ class PeerBuilder:
             .with_registry_handler()
             .with_discovery_handler()
             .with_relay_handler()
+            .with_network_handler()
             .with_root_tracker()
             .with_auto_version_extension()
             .with_subscription_extension()

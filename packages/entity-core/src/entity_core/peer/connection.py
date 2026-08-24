@@ -378,10 +378,25 @@ class Connection:
                     continue
                 if not fut.done():
                     fut.set_result(env)
-        except (asyncio.IncompleteReadError, asyncio.CancelledError):
-            # Clean EOF or explicit cancel — both are normal shutdown.
+        except asyncio.IncompleteReadError:
+            # Remote-initiated drop (EOF mid-frame or between frames): the
+            # connection is dead. Mark it closed so the next execute()
+            # fails fast at the write-lock check instead of waiting out
+            # its full request timeout on a Future nothing will ever
+            # complete — the failure the Amendment 12 §A1 dispatch seam
+            # then demotes reactively. Release the socket without waiting
+            # for the local caller's close().
+            self._closed = True
+            if not self.writer.is_closing():
+                self.writer.close()
+        except asyncio.CancelledError:
+            # Explicit cancel — close() owns the writer/flag transitions.
             pass
         except Exception as exc:  # noqa: BLE001
+            # Reader error with the transport possibly still alive (e.g.
+            # the F-WB28 concurrent-raw-read pattern wire tests use). The
+            # demuxer is dead but the socket is not provably so: fail the
+            # pending callers below, leave the writer to close().
             logger.warning("F-WB28: reader loop error: %s", exc)
         finally:
             # Wake every pending caller so they don't hang on a closed
@@ -404,12 +419,14 @@ class Connection:
         pending Futures with :class:`ConnectionError`) and closes the
         underlying writer. Safe to call multiple times.
         """
-        if self._closed:
-            return
         self._closed = True
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
-        self.writer.close()
+        # Idempotence rides the writer state, not the _closed flag: the
+        # reader loop's finally also sets _closed (remote-initiated drop),
+        # and close() must still release the writer in that case.
+        if not self.writer.is_closing():
+            self.writer.close()
 
     async def wait_closed(self) -> None:
         """Wait for the connection to fully close."""

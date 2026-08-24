@@ -37,12 +37,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Protocol
 
 from entity_core.protocol.messages import ExecuteResponse
 
 if TYPE_CHECKING:
     from entity_core.crypto.identity import Keypair
+    from entity_core.peer.liveness import KeepaliveConfig
     from entity_core.storage.content_store import ContentStore
     from entity_core.storage.emit import EmitPathway
     from entity_core.storage.entity_tree import EntityTree
@@ -127,13 +129,32 @@ class RemoteConnectionPool:
         content_store: ContentStore,
         entity_tree: EntityTree,
         emit_pathway: "EmitPathway | None" = None,
+        keepalive_config: "KeepaliveConfig | None" = None,
     ) -> None:
+        from entity_core.peer.liveness import KeepaliveConfig
+
         self._keypair = keypair
         self._content_store = content_store
         self._entity_tree = entity_tree
         self._emit_pathway = emit_pathway
         self._connections: dict[str, RemoteEndpoint] = {}
         self._lock = asyncio.Lock()
+        # §5 keepalive: one loop task per pooled outbound connection
+        # (outbound is what liveness tracks). MUST per §12.1 — app-level,
+        # never disabled because a transport carries its own ping (§5.1).
+        self._keepalive_config = keepalive_config or KeepaliveConfig()
+        self._keepalive_tasks: dict[str, asyncio.Task] = {}
+        # §5.4 adaptive suppression: monotonic seconds of the last
+        # successful exchange per peer; pings are skipped while the
+        # connection is actively exchanging messages.
+        self._last_activity: dict[str, float] = {}
+        # §A4: per-tick freshness is impl-internal — the status entity is
+        # transition-written only. Wall-clock ms of the last exchange per
+        # peer, snapshotted into a demotion write as its `last_seen`
+        # evidence ("when I last heard from this peer as of this
+        # transition"). Peer-level fact, deliberately not popped on
+        # eviction: the demotion write happens after the binding is gone.
+        self._last_heard_ms: dict[str, int] = {}
 
     async def get_connection(self, peer_id: str) -> RemoteEndpoint:
         """Get or create a connection to a remote peer.
@@ -194,6 +215,10 @@ class RemoteConnectionPool:
                     peer_id[:16], transport_type, profile_id,
                 )
                 self._persist_session(endpoint)
+                # Amendment 12 §A3: `connected` on establish (dialer end;
+                # the responder end writes its own at authenticate-complete).
+                self._write_connected(endpoint, transport_type, url)
+                self._start_keepalive(peer_id, endpoint)
                 return endpoint
 
             raise ConnectionError(
@@ -260,7 +285,9 @@ class RemoteConnectionPool:
                 session_obj.remote_peer_id[:16], e,
             )
 
-    def remove_connection(self, peer_id: str) -> None:
+    def remove_connection(
+        self, peer_id: str, expected: "RemoteEndpoint | None" = None
+    ) -> bool:
         """Evict a connection from the pool (e.g., on error).
 
         The connection's close is best-effort; the next get_connection()
@@ -269,21 +296,283 @@ class RemoteConnectionPool:
         a flag flip — the bg cleanup is scheduled if a running loop is
         available, else dropped (the next dial re-handshakes anyway).
 
+        No-clobber guard (Amendment 12 §A1, behavioral): when ``expected``
+        is given, evict only if it is still the currently-bound endpoint
+        for this peer — object identity, the ``Arc::ptr_eq`` analog. A
+        concurrent re-dial that already replaced the binding (and wrote
+        its own ``connected``) is left untouched; a concurrent identical
+        failure that already evicted makes this a no-op. Returns whether
+        the eviction happened, so the caller can gate the liveness
+        demotion on it.
+
         R6 §9.1 R6-c: the session entity is the durable AUTH record and
         is NOT touched here. Connection-lifecycle marker lives on
         ``system/peer/status``, not on the session entity. The held cap
         survives connection close — that persistence is the whole point
         (cap reuse across reconnect / restart).
         """
-        endpoint = self._connections.pop(peer_id, None)
-        if endpoint is None:
-            return
+        bound = self._connections.get(peer_id)
+        if bound is None:
+            return False
+        if expected is not None and bound is not expected:
+            return False
+        del self._connections[peer_id]
+        self._cancel_keepalive(peer_id)
+        self._last_activity.pop(peer_id, None)
         logger.debug("Evicting connection to peer %s", peer_id[:16])
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            return True
+        loop.create_task(bound.aclose())
+        return True
+
+    # --- Amendment 12 liveness slice (rungs 1-2) -------------------------
+
+    def note_activity(self, peer_id: str) -> None:
+        """Record a successful exchange for §5.4 adaptive suppression.
+
+        Called by the dispatch seam on every successful remote EXECUTE so
+        keepalive pings are suppressed (and the missed counter reset)
+        while the connection is actively exchanging messages.
+        """
+        self._last_activity[peer_id] = time.monotonic()
+        self._last_heard_ms[peer_id] = int(time.time() * 1000)
+
+    def demote_on_transport_error(
+        self, peer_id: str, failed: "RemoteEndpoint", cause: Exception
+    ) -> None:
+        """§A1 reactive demotion: a transport failure observed on a
+        connection believed active MUST demote peer liveness by writing
+        ``system/peer/status = suspect`` (reason ``transport-error``),
+        firing the same subscription the keepalive path fires. Also
+        evicts the dead connection so the next dispatch re-dials.
+
+        Seam discipline (ruling E, normative): called from the
+        direct-dispatch send site only — the caller that both observes
+        the send error and holds ``peer_id``. The RELAY terminal-hop
+        forward and the dispatch-fallback path MUST NOT demote (they use
+        the bare guarded ``remove_connection``).
+
+        No-clobber / idempotency (§A1): the demotion fires only if
+        ``failed`` is still the currently-bound endpoint (identity guard
+        in ``remove_connection``). A single transport error writes
+        ``suspect``, not ``disconnected`` — one failure is not proof of a
+        dead peer; §5.4 keepalive escalates.
+        """
+        if not self.remove_connection(peer_id, expected=failed):
+            # `failed` is no longer the bound endpoint — a concurrent
+            # re-establishment owns liveness now, or a concurrent failure
+            # already demoted. Do not clobber.
             return
-        loop.create_task(endpoint.aclose())
+        self._write_demotion(
+            failed,
+            status_reason=("suspect", "transport-error"),
+            last_error=str(cause) if cause is not None else None,
+        )
+
+    def _write_connected(
+        self, endpoint: "RemoteEndpoint", transport: str, address: str
+    ) -> None:
+        """Write `connected` + the §3.13 connection entity (dialer end).
+
+        Soft-fail: liveness writes are observability-only and never turn
+        a successful dial into an error (same contract as
+        ``_persist_session``). Skipped for bare pools (no emit pathway),
+        endpoints without a session, and self-dials.
+        """
+        if self._emit_pathway is None:
+            return
+        session_obj = getattr(endpoint, "session", None)
+        if session_obj is None:
+            return
+        from entity_core.peer import liveness
+
+        ts = liveness.now_ms()
+        # Connection entity first (ruling C: write-on-transition, full-
+        # conformance surface) so the status entity can carry the path ref.
+        write_connection = liveness.write_connection_status(
+            self._emit_pathway,
+            remote_peer_id=session_obj.remote_peer_id,
+            remote_identity_hash=session_obj.remote_identity_hash,
+            transport=transport,
+            address=address,
+            status="active",
+            established_at=ts,
+        )
+        liveness.write_peer_status(
+            self._emit_pathway,
+            local_peer_id=self._keypair.peer_id,
+            remote_peer_id=session_obj.remote_peer_id,
+            remote_identity_hash=session_obj.remote_identity_hash,
+            status=liveness.STATUS_CONNECTED,
+            connected_at=ts,
+            connection_ref=(
+                liveness.connection_path(session_obj.remote_identity_hash)
+                if write_connection is not None else None
+            ),
+        )
+
+    def _write_demotion(
+        self,
+        endpoint: "RemoteEndpoint",
+        *,
+        status_reason: tuple[str, str],
+        last_error: str | None = None,
+    ) -> None:
+        """Write the demotion status + flip ``system/connection`` to closed.
+
+        §A4: the write carries a ``last_seen`` snapshot — the demotion's
+        evidence ("when I last heard from this peer as of this
+        transition"), taken from the impl-internal freshness map, never
+        refreshed at cadence.
+        """
+        if self._emit_pathway is None:
+            return
+        session_obj = getattr(endpoint, "session", None)
+        if session_obj is None:
+            return
+        from entity_core.peer import liveness
+
+        status, reason = status_reason
+        liveness.write_peer_status(
+            self._emit_pathway,
+            local_peer_id=self._keypair.peer_id,
+            remote_peer_id=session_obj.remote_peer_id,
+            remote_identity_hash=session_obj.remote_identity_hash,
+            status=status,
+            reason=reason,
+            last_error=last_error,
+            last_seen=self._last_heard_ms.get(session_obj.remote_peer_id),
+        )
+        liveness.mark_connection_closed(
+            self._emit_pathway,
+            self._content_store,
+            self._entity_tree,
+            session_obj.remote_identity_hash,
+        )
+
+    def _start_keepalive(self, peer_id: str, endpoint: "RemoteEndpoint") -> None:
+        """Start the §5 keepalive loop for a freshly pooled connection."""
+        self._cancel_keepalive(peer_id)
+        self._last_activity[peer_id] = time.monotonic()
+        self._last_heard_ms[peer_id] = int(time.time() * 1000)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - pool used without a loop
+            return
+        self._keepalive_tasks[peer_id] = loop.create_task(
+            self._keepalive_loop(peer_id, endpoint)
+        )
+
+    def _cancel_keepalive(self, peer_id: str) -> None:
+        task = self._keepalive_tasks.pop(peer_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _keepalive_loop(
+        self, peer_id: str, endpoint: "RemoteEndpoint"
+    ) -> None:
+        """§5.4 failure detection for one pooled outbound connection.
+
+        Idle-period app-level ping (EXECUTE ``system/protocol/connect``
+        op ``ping``); any successful exchange resets the missed counter
+        (adaptive suppression). On ``max_missed`` consecutive misses:
+        write ``suspect`` (reason ``keepalive-miss``), grace-wait
+        ``timeout_ms``, then — if no reconnection replaced the binding —
+        write ``disconnected`` and evict. A dead idle connection that
+        never went ``suspect`` via §A1 goes through this same path; both
+        orderings are §5.4-conformant.
+
+        The loop exits when its endpoint is no longer the pool binding
+        (evicted or replaced) — the no-clobber discipline applied to the
+        keepalive writer.
+        """
+        from entity_core.peer import liveness
+
+        cfg = self._keepalive_config
+        interval_s = cfg.interval_ms / 1000.0
+        timeout_s = cfg.timeout_ms / 1000.0
+        missed = 0
+        sequence = 0
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                if self._connections.get(peer_id) is not endpoint:
+                    return
+                # §5.4 adaptive suppression: skip the ping during active
+                # message exchange; activity also resets the counter.
+                last = self._last_activity.get(peer_id, 0.0)
+                if time.monotonic() - last < interval_s:
+                    missed = 0
+                    continue
+
+                sequence += 1
+                ok = False
+                try:
+                    response = await asyncio.wait_for(
+                        endpoint.execute(
+                            "system/protocol/connect",
+                            "ping",
+                            {
+                                "type": "system/network/ping",
+                                "data": {
+                                    "timestamp": liveness.now_ms(),
+                                    "sequence": sequence,
+                                },
+                            },
+                        ),
+                        timeout=timeout_s,
+                    )
+                    ok = response.status == 200
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(
+                        "keepalive ping %d to %s failed: %s",
+                        sequence, peer_id[:16], e,
+                    )
+
+                if ok:
+                    # §A4: pong freshness is impl-internal bookkeeping —
+                    # no tree write. The status entity is transition-
+                    # written only; `last_seen` is snapshotted into the
+                    # demotion write when a transition happens.
+                    missed = 0
+                    self._last_activity[peer_id] = time.monotonic()
+                    self._last_heard_ms[peer_id] = liveness.now_ms()
+                    continue
+
+                missed += 1
+                if missed < cfg.max_missed:
+                    continue
+
+                # Connection failed (§5.4): suspect → grace → disconnected.
+                self._write_demotion(
+                    endpoint, status_reason=("suspect", "keepalive-miss"),
+                )
+                await asyncio.sleep(timeout_s)
+                if self._connections.get(peer_id) is not endpoint:
+                    # Reconnected during the grace period — the new
+                    # binding wrote its own `connected`. Do not clobber.
+                    return
+                # Evict WITHOUT the cancel-self path racing us: drop the
+                # binding first, then write. remove_connection cancels
+                # this task; from here the loop only returns.
+                self._keepalive_tasks.pop(peer_id, None)
+                del self._connections[peer_id]
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(endpoint.aclose())
+                except RuntimeError:  # pragma: no cover
+                    pass
+                self._write_demotion(
+                    endpoint,
+                    status_reason=("disconnected", "keepalive-miss"),
+                )
+                return
+        except asyncio.CancelledError:
+            raise
 
     def _list_profile_candidates(
         self, peer_id: str
@@ -398,6 +687,14 @@ class RemoteConnectionPool:
         held cap survives shutdown for the next process's pool to reuse
         (R3a / TV-LT2).
         """
+        # Stop keepalive loops first so no ping races the close below.
+        tasks = list(self._keepalive_tasks.values())
+        self._keepalive_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         async with self._lock:
             endpoints = list(self._connections.items())
             self._connections.clear()

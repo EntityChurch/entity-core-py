@@ -5059,6 +5059,314 @@ def type_system_peer_session() -> Entity:
     )
 
 
+def type_system_peer_status() -> Entity:
+    """`system/peer/status/{peer_id}` — remote-peer connection liveness.
+
+    Per ENTITY-CORE-PROTOCOL §3.13 (the type's single canonical
+    declaration home — Amendment 12 rung-1 ruling D: NETWORK's put-sites
+    are minimal writes, NOT exhaustive shapes; do not re-derive the field
+    set from examples). This is the sanctioned liveness home for the
+    cohort: the session entity deliberately dropped its own
+    `status`/`last_active` fields (§9.1 R6-b/R6-c) because they duplicated
+    this entity.
+
+    The entity is an ordinary tree entity, so a write fires any
+    `system/subscription` on the path — the "no poll" liveness signal
+    consumers block on (EXTENSION-NETWORK Amendment 12 §A3: the liveness
+    slice).
+
+    `status` is a THREE-state enum (`connected` / `suspect` /
+    `disconnected` — ruling D; `reconnecting` is a
+    `system/network/peer-summary` §2.8 derived value, NOT a status-entity
+    state). Transitions: (unknown) → connected → suspect → disconnected;
+    reconnection returns to connected.
+
+    `reason` / `last_error` are the Amendment 12 §A2 additive OPTIONAL
+    fields (declaration routed upstream to §3.13 at fold — ruling A; the
+    enum semantics + recovery mapping stay in NETWORK). A reader treats an
+    unrecognized `reason` as generic (MUST-ignore-unknowns) and falls back
+    to backoff.
+
+    Path: `system/peer/status/{remote_peer_id_hex}` (V7 v7.64 §1.4 — the
+    segment is lowercase hex of the remote's `system/peer` content_hash,
+    same convention as the session entity). A bare `{peer_id, status}`
+    write is conformant.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/peer/status",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "status": {"type_ref": "primitive/string"},
+                "connected_at": {"type_ref": "primitive/uint", "optional": True},
+                "last_seen": {"type_ref": "primitive/uint", "optional": True},
+                "connection": {"type_ref": "system/tree/path", "optional": True},
+                # Amendment 12 §A2 additive OPTIONAL fields (ruling A: the
+                # §3.13 declaration delta travels upstream at fold).
+                "reason": {"type_ref": "primitive/string", "optional": True},
+                "last_error": {"type_ref": "primitive/string", "optional": True},
+            },
+        },
+    )
+
+
+def type_system_connection() -> Entity:
+    """`system/connection/{peer_id}` — active connection state.
+
+    Per ENTITY-CORE-PROTOCOL §3.13. Write-on-transition ONLY (establish →
+    `active`, close/failure → `closed`) — no per-activity writes. MUST at
+    full NETWORK conformance (§12.1) but NOT part of the §A3 liveness
+    floor (Amendment 12 rung-1 ruling C): a consumer of a floor-only peer
+    MUST NOT assume this entity exists.
+
+    Division of labor vs `system/peer/status`: `status` answers *is the
+    peer here* (subscribe for reactivity); `connection` answers *how am I
+    attached right now* (read-on-demand diagnostics — "connected via
+    tcp://…").
+
+    Path: `system/connection/{remote_peer_id_hex}` (V7 v7.64 §1.4 hex
+    segment). Referenced by `system/peer/status` via its `connection`
+    path-ref field.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/connection",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "transport": {"type_ref": "primitive/string"},
+                "address": {"type_ref": "primitive/string"},
+                "status": {"type_ref": "primitive/string"},
+                "established_at": {"type_ref": "primitive/uint"},
+                "parameters": {"map_of": {"type_ref": "primitive/any"}, "optional": True},
+            },
+        },
+    )
+
+
+def type_system_network_keepalive_config() -> Entity:
+    """`system/network/keepalive-config` — §2.3 keepalive parameters.
+
+    Per EXTENSION-NETWORK §2.3. All fields optional; defaults
+    interval_ms=30000, timeout_ms=10000, max_missed=3 (exact values
+    impl-defined per §12.4). Keepalive itself is MUST (§12.1) and is
+    inside the Amendment 12 §A3 floor: consumers MAY rely on an idle-dead
+    connection demoting within `interval_ms × max_missed + timeout_ms`.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/keepalive-config",
+            "fields": {
+                "interval_ms": {"type_ref": "primitive/uint", "optional": True},
+                "timeout_ms": {"type_ref": "primitive/uint", "optional": True},
+                "max_missed": {"type_ref": "primitive/uint", "optional": True},
+            },
+        },
+    )
+
+
+def type_system_network_backoff_config() -> Entity:
+    """`system/network/backoff-config` — §2.2 reconnection backoff.
+
+    Per EXTENSION-NETWORK §2.2. Consumed by the rung-3 `maintain-peer`
+    reconnect continuation (not yet built); the type lands with rung 2 so
+    the §13 type surface is complete. Defaults: min_ms=1000, max_ms=60000,
+    strategy="exponential".
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/backoff-config",
+            "fields": {
+                "min_ms": {"type_ref": "primitive/uint", "optional": True},
+                "max_ms": {"type_ref": "primitive/uint", "optional": True},
+                "strategy": {"type_ref": "primitive/string", "optional": True},
+            },
+        },
+    )
+
+
+def type_system_network_ping() -> Entity:
+    """`system/network/ping` — §5.2 keepalive ping payload.
+
+    App-level keepalive (EXECUTE `system/protocol/connect` op `ping`),
+    independent of any transport-level ping — a peer may be TCP-alive but
+    protocol-unresponsive (§5.1; MUST NOT be disabled because transport
+    pings are active).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/ping",
+            "fields": {
+                "timestamp": {"type_ref": "primitive/uint"},
+                "sequence": {"type_ref": "primitive/uint"},
+            },
+        },
+    )
+
+
+def type_system_network_pong() -> Entity:
+    """`system/network/pong` — §5.3 keepalive pong payload.
+
+    Echoes the ping's `timestamp`/`sequence`; `server_time` is the
+    responder's clock (ms since epoch).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/pong",
+            "fields": {
+                "timestamp": {"type_ref": "primitive/uint"},
+                "sequence": {"type_ref": "primitive/uint"},
+                "server_time": {"type_ref": "primitive/uint"},
+            },
+        },
+    )
+
+
+def type_system_network_maintain_request() -> Entity:
+    """`system/network/maintain-request` — §2.1 maintain-peer input.
+
+    Rung-3 surface (EXTENSION-NETWORK §4.1): asks the local peer to
+    maintain a lifecycle relationship with `peer_id` — connect if needed,
+    install the reconnect/resubscribe continuation graph, keep it alive.
+    `keepalive` is accepted per §2.1 but the pool-level keepalive config
+    governs in this impl (§12.4 implementation-defined; same posture as
+    the Go reference).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/maintain-request",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "address": {"type_ref": "primitive/string", "optional": True},
+                "reconnect": {"type_ref": "primitive/bool", "optional": True},
+                "resubscribe": {"type_ref": "primitive/bool", "optional": True},
+                "keepalive": {
+                    "type_ref": "system/network/keepalive-config",
+                    "optional": True,
+                },
+                "backoff": {
+                    "type_ref": "system/network/backoff-config",
+                    "optional": True,
+                },
+            },
+        },
+    )
+
+
+def type_system_network_maintain_result() -> Entity:
+    """`system/network/maintain-result` — §2.4 maintain-peer output."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/maintain-result",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "session_id": {"type_ref": "primitive/string"},
+                "subscriptions": {
+                    "array_of": {"type_ref": "primitive/string"},
+                    "optional": True,
+                },
+                "chain_id": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
+def type_system_network_release_request() -> Entity:
+    """`system/network/release-request` — §2.5 release-peer input.
+
+    `reason` defaults to "shutdown" (§4.2); "idle"/"migration" preserve
+    the connection and subscriptions for potential resumption.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/release-request",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "reason": {"type_ref": "primitive/string", "optional": True},
+            },
+        },
+    )
+
+
+def type_system_network_release_result() -> Entity:
+    """`system/network/release-result` — §2.6 release-peer output."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/release-result",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "cleaned_up": {"array_of": {"type_ref": "system/tree/path"}},
+            },
+        },
+    )
+
+
+def type_system_network_status() -> Entity:
+    """`system/network/status` — §2.7 status-op output.
+
+    `pending_count` is bare zero in this impl: no §8 outbox is shipped
+    (Amendment 11 — the bare-error terminal is conformant; rung 4 stays
+    optional cohort-wide).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/status",
+            "fields": {
+                "maintained_peers": {
+                    "array_of": {"type_ref": "system/network/peer-summary"},
+                },
+                "pending_count": {"type_ref": "primitive/uint"},
+            },
+        },
+    )
+
+
+def type_system_network_peer_summary() -> Entity:
+    """`system/network/peer-summary` — §2.8 per-peer row in the status op.
+
+    `status` here is the DERIVED read-model value (rung-1 ruling D:
+    "reconnecting" lives HERE, never on the `system/peer/status` entity,
+    whose enum is the three §3.13 states).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/peer-summary",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "session_id": {"type_ref": "primitive/string"},
+                "status": {"type_ref": "primitive/string"},
+                "pending_count": {"type_ref": "primitive/uint"},
+                "subscriptions": {"type_ref": "primitive/uint"},
+            },
+        },
+    )
+
+
+def type_system_network_close_request() -> Entity:
+    """`system/network/close-request` — §2.9 close-op input (§4.4/§9)."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/close-request",
+            "fields": {
+                "peer_id": {"type_ref": "system/peer-id"},
+                "reason": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
 def type_system_substitute_endpoint() -> Entity:
     """`system/substitute/endpoint` — the HTTP convention's endpoint shape.
 
@@ -6672,6 +6980,24 @@ ALL_TYPE_DEFINITIONS = [
     type_system_peer_published_root,
     # Per-peer authenticated session entity (PROPOSAL-TRANSPORT-FAMILY R6)
     type_system_peer_session,
+    # Operational liveness + connection state (ENTITY-CORE-PROTOCOL §3.13;
+    # EXTENSION-NETWORK Amendment 12 rungs 1-2 — the liveness slice)
+    type_system_peer_status,
+    type_system_connection,
+    # NETWORK keepalive/backoff + ping/pong (EXTENSION-NETWORK §2.2, §2.3, §5)
+    type_system_network_keepalive_config,
+    type_system_network_backoff_config,
+    type_system_network_ping,
+    type_system_network_pong,
+    # NETWORK handler op types (EXTENSION-NETWORK §2 — Amendment 12 rung 3,
+    # the system/network maintain-peer lifecycle surface)
+    type_system_network_maintain_request,
+    type_system_network_maintain_result,
+    type_system_network_release_request,
+    type_system_network_release_result,
+    type_system_network_status,
+    type_system_network_peer_summary,
+    type_system_network_close_request,
     # Storage-substitute extension types (CDN corridor v1; renamed
     # from CONTENT-SUBSTITUTE per RULINGS §3 — substitutes
     # the whole storage layer (tree + content) via the two-prefix profile)

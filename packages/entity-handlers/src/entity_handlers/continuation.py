@@ -546,11 +546,20 @@ async def _advance_forward(
             cause_detail = (
                 result.get("code") if isinstance(result, dict) else None
             )
+            # CONTINUATION v1.14 §3.4 (F1 ratification): {step_index} is
+            # the ORIGINAL request_id of the dispatch, same pin as the
+            # other marker sites — synthesized key only when the EXECUTE
+            # carried none.
+            request_id_for_marker = (
+                ctx.request_id
+                if getattr(ctx, "request_id", None)
+                else f"cont-error-{continuation_path}"
+            )
             _bind_lost_marker(
                 ctx,
                 code=ENGINE_CODE_ON_ERROR_DISPATCH_FAILED,
                 status=effective_status,
-                request_id=f"cont-error-{continuation_path}",
+                request_id=request_id_for_marker,
                 continuation_path=continuation_path,
                 on_error_uri=getattr(on_error, "uri", None),
                 extra_body={"cause_detail": cause_detail} if cause_detail else None,
@@ -722,11 +731,17 @@ async def _advance_forward(
                 )
             except Exception as e2:
                 logger.error(f"Error routing to on_error: {e2}")
+                # F1 ratification: {step_index} = original request_id.
+                request_id_for_marker = (
+                    ctx.request_id
+                    if getattr(ctx, "request_id", None)
+                    else f"cont-error-{continuation_path}"
+                )
                 _bind_lost_marker(
                     ctx,
                     code=ENGINE_CODE_ON_ERROR_DISPATCH_FAILED,
                     status=500,
-                    request_id=f"cont-error-{continuation_path}",
+                    request_id=request_id_for_marker,
                     continuation_path=continuation_path,
                     on_error_uri=getattr(on_error, "uri", None),
                     target_uri=target,

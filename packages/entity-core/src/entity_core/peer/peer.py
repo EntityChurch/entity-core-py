@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -235,6 +236,11 @@ class PeerConnectionState:
     pending_reentry: dict[str, asyncio.Future[Envelope]] = field(
         default_factory=dict,
     )
+    # Ruling C (full tier): content hash of the `system/connection` entity
+    # this connection's authenticate-complete wrote — the close-transition's
+    # no-clobber token (a re-handshake's fresh `active` write must not be
+    # flipped `closed` by a stale handler's teardown).
+    connection_entity_hash: bytes | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -425,6 +431,7 @@ class Peer:
         peer._remote_pool = RemoteConnectionPool(
             peer.keypair, peer.content_store, peer.entity_tree,
             emit_pathway=peer.emit_pathway,
+            keepalive_config=state.keepalive_config,
         )
 
         # R3a (granter idempotency) — R6 (PROPOSAL §7.1 #1):
@@ -603,6 +610,7 @@ class Peer:
                     max_scope=ext_config.max_scope,
                     emit_pathway=peer.emit_pathway,
                     execute=extension_execute,
+                    peer=peer,
                 )
                 ext_config.extension.initialize(ctx)
                 peer._extensions.append(ext_config.extension)
@@ -923,6 +931,37 @@ class Peer:
             pattern,
         )
         return None
+
+    async def ensure_connected(self, peer_id: str) -> None:
+        """Connect-if-needed seam (EXTENSION-NETWORK §4.1 step 1).
+
+        Reuses the pooled outbound binding when one exists, else resolves
+        the peer's transport profiles, dials, and handshakes. The establish
+        path writes the §3.13 ``connected`` status and starts the §5.4
+        keepalive loop — callers (the network handler's reconnect graph)
+        double-build nothing (§A4). Raises ``ConnectionError`` when no
+        profile connects.
+
+        This is the impl-internal reconnect target the §4.1 graph uses
+        instead of the pseudocode's ``system/protocol/connect hello``
+        (which is the responder-side handshake op and cannot dial — Go
+        spec-issue 4, converged on cohort-wide).
+        """
+        await self._remote_pool.get_connection(peer_id)
+
+    def evict_remote_connection(self, peer_id: str) -> bool:
+        """Evict the pooled outbound connection to ``peer_id``, if any.
+
+        Cancels its keepalive loop; the next dispatch re-dials. Returns
+        whether an eviction happened. Liveness writes are the caller's
+        concern — this is the bare pool seam (§4.2/§4.4 close paths write
+        their own terminal transitions).
+        """
+        return self._remote_pool.remove_connection(peer_id)
+
+    def is_connected(self, peer_id: str) -> bool:
+        """Whether an outbound connection to ``peer_id`` is currently pooled."""
+        return peer_id in self._remote_pool._connections
 
     def register_remote(
         self,
@@ -1483,13 +1522,22 @@ class Peer:
             error = None
             if response.status >= 400 and isinstance(result, dict):
                 error = result.get("message", result.get("error", ""))
+            # §5.4 adaptive suppression: a successful exchange counts as
+            # liveness — keepalive pings are skipped while active.
+            self._remote_pool.note_activity(peer_id)
             return ExecuteResult(
                 status=response.status,
                 result=result if isinstance(result, dict) else None,
                 error=error,
             )
         except Exception as e:
-            self._remote_pool.remove_connection(peer_id)
+            # Amendment 12 §A1: transport error on a connection believed
+            # active — the §10-step-1 direct-dispatch seam. Evict the dead
+            # conn AND demote peer liveness to `suspect` (idempotent under
+            # the no-clobber guard). This is the seam that both observes
+            # the send error and holds peer_id (seam rule); the RELAY
+            # terminal-hop below MUST NOT demote (ruling E).
+            self._remote_pool.demote_on_transport_error(peer_id, conn, e)
             logger.warning("Remote execute to %s failed: %s", peer_id[:16], e)
             return ExecuteResult(status=502, error=f"Remote execute failed: {e}")
 
@@ -1559,7 +1607,12 @@ class Peer:
             await send_raw(frame)
             return True
         except Exception as e:
-            self._remote_pool.remove_connection(destination)
+            # Ruling E (Amendment 12 §A1, pinned normative): the RELAY
+            # terminal-hop forward MUST NOT demote peer liveness — a
+            # store-and-forward target is not "a connection believed
+            # active"; Mode-S fallback owns this path's failure semantics.
+            # Guarded eviction only (no status write).
+            self._remote_pool.remove_connection(destination, expected=conn)
             logger.warning(
                 "relay terminal-hop deliver to %s failed: %s", destination[:16], e
             )
@@ -1612,14 +1665,22 @@ class Peer:
 
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
 
-        # Cancel all connection handlers
+        # Cancel all connection handlers BEFORE awaiting wait_closed():
+        # on Python 3.12+ Server.wait_closed() waits for every live
+        # connection handler to finish, so awaiting it first deadlocks
+        # whenever a remote peer still holds an open connection — local
+        # shutdown must never depend on remote goodwill. (Each handler's
+        # finally closes its writer, so remotes observe EOF and their §A1
+        # / §5.4 liveness paths demote us reactively.)
         for task in self._connections:
             task.cancel()
         if self._connections:
             await asyncio.gather(*self._connections, return_exceptions=True)
         self._connections.clear()
+
+        if self._server:
+            await self._server.wait_closed()
 
         # Close outbound connections
         if hasattr(self, "_remote_pool"):
@@ -2016,6 +2077,24 @@ class Peer:
                 await writer.wait_closed()
             except Exception:
                 pass
+            # Ruling C (full tier): the responder's close transition —
+            # flip `system/connection` to `closed` when the inbound
+            # connection ends (EOF, error, cancel). CAS-guarded on the
+            # entity this handler wrote at establish so a re-handshake's
+            # fresh `active` is never clobbered. NOT a status demotion:
+            # peer-status demotions stay at the §A1/§5.4 seams only.
+            if (
+                conn_state.session is not None
+                and conn_state.connection_entity_hash is not None
+            ):
+                from entity_core.peer import liveness
+                liveness.mark_connection_closed(
+                    self.emit_pathway,
+                    self.content_store,
+                    self.entity_tree,
+                    conn_state.session.remote_identity_hash,
+                    expected_hash=conn_state.connection_entity_hash,
+                )
             if task:
                 self._connections.discard(task)
 
@@ -2286,6 +2365,51 @@ class Peer:
                     local_peer_id=self.keypair.peer_id,
                     remote_peer_id=conn_state.connect.remote_peer_id,
                     remote_public_key=conn_state.connect.remote_public_key_bytes,
+                )
+
+                # Amendment 12 §A3: `connected` on establish — the
+                # responder end of the handshake (the dialer end writes
+                # its own in RemoteConnectionPool). Soft-fail inside the
+                # helpers; skipped when the identity hash isn't derivable.
+                # Ruling C (full tier): the responder's `system/connection`
+                # establish transition, written first so the status entity
+                # can carry the path ref (mirrors the dialer's shape).
+                from entity_core.peer import liveness
+                ts = liveness.now_ms()
+                # TCP hands us a real StreamWriter with a peername; the
+                # HTTP layer hands a _CollectingWriter shim (no socket,
+                # no peer address — one POST per envelope).
+                peername = (
+                    writer.get_extra_info("peername")
+                    if hasattr(writer, "get_extra_info") else None
+                )
+                conn_state.connection_entity_hash = (
+                    liveness.write_connection_status(
+                        self.emit_pathway,
+                        remote_peer_id=conn_state.connect.remote_peer_id,
+                        remote_identity_hash=(remote_identity_hash or b""),
+                        transport="tcp" if peername else "http",
+                        address=(
+                            f"tcp://{peername[0]}:{peername[1]}"
+                            if peername else ""
+                        ),
+                        status="active",
+                        established_at=ts,
+                    )
+                )
+                liveness.write_peer_status(
+                    self.emit_pathway,
+                    local_peer_id=self.keypair.peer_id,
+                    remote_peer_id=conn_state.connect.remote_peer_id,
+                    remote_identity_hash=(remote_identity_hash or b""),
+                    status=liveness.STATUS_CONNECTED,
+                    connected_at=ts,
+                    connection_ref=(
+                        liveness.connection_path(remote_identity_hash)
+                        if conn_state.connection_entity_hash is not None
+                        and remote_identity_hash
+                        else None
+                    ),
                 )
 
                 logger.info(
@@ -2655,8 +2779,30 @@ class Peer:
         # Extract handler-relative path for dispatch
         path = extract_handler_path(canonical_path)
 
-        # Reject connect path after connect is complete
+        # Post-connect operations on the connection handler:
+        # §5.1 keepalive is an EXECUTE/EXECUTE_RESPONSE exchange on
+        # `system/protocol/connect` op `ping`. Like the handshake itself,
+        # it is special-cased ahead of capability verification — protocol-
+        # level liveness is a property of the established connection, not
+        # of any granted resource. Everything else on the connect path is
+        # rejected after connect is complete.
         if path == CONNECT_URI:
+            if operation == "ping":
+                payload = params.get("data", params) if isinstance(params, dict) else {}
+                pong = {
+                    "type": "system/network/pong",
+                    "data": {
+                        # §5.3: echo timestamp + sequence from the ping.
+                        "timestamp": int(payload.get("timestamp", 0) or 0),
+                        "sequence": int(payload.get("sequence", 0) or 0),
+                        "server_time": int(time.time() * 1000),
+                    },
+                }
+                response = ExecuteResponse.success(request_id, pong)
+                await self._send_locked(
+                    writer, conn_state, Envelope(root=response.to_entity())
+                )
+                return
             response = ExecuteResponse.conflict(
                 request_id=request_id,
                 message="Connect already complete",

@@ -41,6 +41,10 @@ from entity_handlers.subscription import (
     SubscribeRequest,
     UnsubscribeRequest,
 )
+from entity_handlers.network import (
+    NetworkExtension,
+    NETWORK_HANDLER_PATTERN,
+)
 from entity_handlers.system import system_handler
 from entity_handlers.storage import storage_handler
 from entity_handlers.handlers import (
@@ -198,6 +202,7 @@ from entity_handlers.manifest import (
     CONTINUATION_HANDLER_MANIFEST,
     INBOX_HANDLER_MANIFEST,
     SUBSCRIPTION_HANDLER_MANIFEST,
+    NETWORK_HANDLER_MANIFEST,
     REVISION_HANDLER_MANIFEST,
     CLOCK_HANDLER_MANIFEST,
     QUERY_HANDLER_MANIFEST,
@@ -243,6 +248,8 @@ __all__ = [
     "SUBSCRIPTION_HANDLER_PATTERN",
     # Subscription types and extension
     "SubscriptionExtension",
+    "NetworkExtension",
+    "NETWORK_HANDLER_PATTERN",
     "SubscriptionEntity",
     "SubscriptionLimits",
     "SubscribeRequest",
@@ -393,6 +400,7 @@ __all__ = [
     "CONTINUATION_HANDLER_MANIFEST",
     "INBOX_HANDLER_MANIFEST",
     "SUBSCRIPTION_HANDLER_MANIFEST",
+    "NETWORK_HANDLER_MANIFEST",
     "REVISION_HANDLER_MANIFEST",
     "CLOCK_HANDLER_MANIFEST",
     "QUERY_HANDLER_MANIFEST",

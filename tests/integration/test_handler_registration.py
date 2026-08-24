@@ -92,12 +92,16 @@ class TestBuiltinManifests:
         assert ops["hello"]["input_type"] == "system/protocol/connect/hello"
         assert ops["hello"]["output_type"] == "system/protocol/connect/hello"
         assert ops["authenticate"]["output_type"] == "system/capability/grant"
+        # Amendment 12 §A5 (advertise-what-you-dispatch): the §5.1
+        # keepalive op the bootstrap layer serves post-handshake.
+        assert ops["ping"]["input_type"] == "system/network/ping"
+        assert ops["ping"]["output_type"] == "system/network/pong"
 
     def test_all_manifests_count(self):
         """ALL_HANDLER_MANIFESTS contains all built-in manifests."""
         # 23 = prior 22 + capability handler (V7 §6.2 Resolution B; backs
         # the default `system/capability:request` connect grant)
-        assert len(ALL_HANDLER_MANIFESTS) == 26  # +system/relay (EXTENSION-RELAY v1.0)
+        assert len(ALL_HANDLER_MANIFESTS) == 27  # +system/network (A12 rung 3)
         names = [m.data["name"] for m in ALL_HANDLER_MANIFESTS]
         assert "system" in names
         assert "storage" in names
@@ -118,6 +122,7 @@ class TestBuiltinManifests:
         assert "registry" in names  # EXTENSION-REGISTRY v1.0
         assert "discovery" in names  # EXTENSION-DISCOVERY v1.0
         assert "relay" in names  # EXTENSION-RELAY v1.0
+        assert "network" in names  # EXTENSION-NETWORK §3.1 (A12 rung 3)
 
 
 class TestHandlerRegistration:
@@ -212,7 +217,7 @@ class TestPeerHandlerRegistration:
         # backs the default `system/capability:request` connect grant) +
         # system/registry (EXTENSION-REGISTRY v1.0). All bootstrap-registered
         # from ALL_HANDLER_MANIFESTS regardless of which handlers run.
-        assert len(patterns) == 26  # +system/relay (EXTENSION-RELAY v1.0)
+        assert len(patterns) == 27  # +system/network (A12 rung 3)
         assert "system" in patterns
         assert "*" in patterns
         assert "system/protocol/connect" in patterns
@@ -246,7 +251,7 @@ class TestPeerHandlerRegistration:
         prefix = peer.entity_tree.normalize_uri("system/handler/")
         uris = peer.entity_tree.list_prefix(prefix)
 
-        assert len(uris) == 26  # +system/relay (EXTENSION-RELAY v1.0)
+        assert len(uris) == 27  # +system/network (A12 rung 3)
         assert any("system/handler/system" in uri and "system/handler/system/" not in uri for uri in uris)
         assert any("system/handler/*" in uri for uri in uris)
         assert any("system/handler/system/protocol/connect" in uri for uri in uris)
