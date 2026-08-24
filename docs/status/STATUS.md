@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-06-30 · public: v0.8.0 (master)_
+_Updated: 2026-08-05 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -38,9 +38,51 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-Stable at the `v0.8.0` "Genesis" research-preview line; no code or protocol changes are
-in flight. Next substantive work is running the conformance + interop suites live against
-a current reference peer to confirm green at HEAD (below).
+**Symmetric origination authority + the namespace flag day (2026-08-05).** The
+`EXTENSION-SIGNALING` §6.5 (b) reciprocal grant is built **both-sided and assembled** —
+the S5 packet's gate #3 assignment for this repo. The dialer mints the acceptor's mirror
+of the §6.6 cap on a rendezvous establishment (the grant an inbound dialer would actually
+receive, advertisement-filtered — Q2/Q2a, not the flat §4.4 floor), and — the half that
+fails silently — the **dialer now serves the reach-back**: an inbound EXECUTE on a
+connection we dialed was previously dropped as an orphan response, so the acceptor's
+authority was real and reached no handler. Both halves are pinned live, and the
+reach-back vector was verified to fail (by timeout) when the serving branch is disabled.
+
+The same pass ran the re-diff the signaling handoff promised for "the day the corpus
+lands", and found this client was on the **pre-flag-day side of the `system/nat/*` →
+`system/signaling/*` rename**: the derivation hashes the literal type string, so every
+rendezvous key differed from go's and rust's and **the peers could not have met at any
+key** since 2026-08-02. The stage-bisect payload, the 18 live node tests, and the pinned
+go-agreement witness all passed throughout — the node is mode-blind and the witness
+predated the rename. Fixed; both cross-impl witnesses re-derived live from
+`entity-core-go` @ `94b6583`.
+See `HANDOFF-2026-08-05-reciprocal-grant-and-namespace-flag-day-python.md` — §4 carries
+two carriage findings routed to arch.
+
+**Signaling client (2026-07-30).** The `signaling` **client** landed on `dev` —
+§2.2 key derivation, §3.1.1 pool selection, the §3 coordination messages with §3.1 blob
+framing and the §3.2 read rules, and the three wrapped-surface operations, in
+`entity_handlers/signaling/`. Built against Rust's go/py build brief; the server role is
+deliberately out of scope (§1.2 makes it optional). **86 same-impl tests plus 24 live**
+against real Rust nodes. See `HANDOFF-2026-07-30-signaling-client-stage1-python.md`.
+
+The admission blocker that handoff filed against Rust — the shipped
+`entity-signaling-node` seeded no capability policy, so a foreign peer got `403` on every
+signaling op — is **closed** (Rust `9714f13`: `--open` / `--grant`, closed by default).
+The owner-keypair workaround is deleted and the live suite now runs **as an ordinary
+stranger**, which puts the admission model itself under test. Also landed since: go's
+byte-identical §2.2 keys and §3.1.1 selections pinned here as assertions, and
+`tests/interop/signaling_meet.py` — Python's driveable half of the cross-process go↔py
+meet, green with Python on both sides. *(Those pinned key/selection values were
+pre-flag-day on both sides and were superseded on 2026-08-05 — see above.)*
+
+Earlier on the `v0.8.0` "Genesis" research-preview line: NETWORK Amendment 12 rungs 1–2
+(the reactive liveness floor: `system/peer/status` writes + §5 keepalive) landed on
+`dev` — see `HANDOFF-2026-07-15-network-rungs-1-2-python.md` for the cohort convergence
+input. Next substantive work is the cross-impl convergence pass once a second impl
+completes the floor, plus running the conformance + interop suites live against a current
+reference peer (below). *(This section predates the 2026-07-2x continuation
+STANDING-MODEL work now on `dev`; those handoffs are the current record for it.)*
 
 ## Backlog
 
@@ -53,6 +95,20 @@ a current reference peer to confirm green at HEAD (below).
 - The cross-impl peer validator's `local_files` profile is Go-scoped; Python not passing
   that profile is an **expected scope gap**, not a defect — keep it understood as such
   rather than chasing parity there.
+- **The live go↔py meet** is the one open piece of the signaling gate: Python's side is
+  built (`tests/interop/signaling_meet.py`, driveable by any language), Go's validator
+  currently spawns both of its peers in-process.
+  `HANDOFF-2026-07-30-signaling-client-stage1-python.md` §6. It is newly *meaningful*:
+  before the 2026-08-05 rename it could not have succeeded.
+- **Re-run the signaling interop suite against a live Rust node** post-rename, before any
+  three-way-green claim — the keys moved.
+- **The §7 punch is unbuilt here** (S5 packet gate #5), and there is no WebRTC substrate.
+  §6.5 (b) is wired to `Peer.establish_via_rendezvous`, so the punch calls one existing
+  site when it lands.
+- ~~**Waiting on arch:** the signaling corpus is still uncommitted upstream~~ — **closed
+  2026-08-05.** The corpus is committed (`EXTENSION-SIGNALING.md`,
+  `PROPOSAL-CONNECTION-NODE.md`); the promised re-diff ran and found the namespace flag
+  day (above). Two carriage findings routed back in the 2026-08-05 handoff §4.
 - Open spec gaps / TODOs beyond the above: unknown / to confirm.
 
 ## Waiting on
@@ -67,6 +123,14 @@ a current reference peer to confirm green at HEAD (below).
 
 ## Done recently
 
+- **NETWORK Amendment 12 rungs 1–2 (the liveness floor)** — `system/peer/status` writes
+  (`connected` both ends on establish; `suspect`/`transport-error` at the direct-dispatch
+  seam with the behavioral no-clobber guard; `disconnected`/`keepalive-miss` from the new
+  §5 keepalive loop), `system/connection` dialer-side transitions, the §5.1 ping op, and
+  the six §3.13/NETWORK type registrations. Anchor vector reproduced (11 new integration
+  tests). Surfaced + fixed two latent defects: dead-connection dispatch waiting out the
+  full 60 s request timeout, and `Peer.stop()` deadlocking on Python 3.12+ while a remote
+  held an open connection.
 - **`v0.8.0` "Genesis" release** cut on `master`; the three published packages aligned to
   `0.8.0`; clone-fresh build verified (`make build` / `make test` green from a fresh
   clone with no sibling repos and no host toolchain beyond `make` + `podman`).

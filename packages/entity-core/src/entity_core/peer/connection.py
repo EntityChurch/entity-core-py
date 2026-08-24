@@ -19,9 +19,11 @@ Mechanism:
 
 * A background reader task per :class:`Connection` reads frames and
   dispatches each ``EXECUTE_RESPONSE`` by ``request_id`` into the matching
-  pending ``Future``. Unsolicited frames are logged and dropped (Python's
-  outbound :class:`Connection` is not currently a target for inbound
-  ``EXECUTE``; server-side framing lives in :meth:`Peer._handle_connection`).
+  pending ``Future``. An inbound ``EXECUTE`` is **not** a response — it is
+  the counterpart originating to us over the connection we dialed — and is
+  handed to :attr:`Connection.inbound_dispatcher` (V7 §6.11(b) dialer-side
+  reentry; see "Reach-back serving" below). Any other frame type is logged
+  and dropped.
 * :meth:`execute` registers a ``Future`` keyed by ``request_id`` *before*
   sending the wire bytes, acquires the per-connection write lock so frame
   bytes don't interleave under concurrent writers, releases the lock, and
@@ -34,12 +36,39 @@ Mechanism:
 The handshake itself stays serial (uses ``recv_envelope(reader)`` directly,
 not the reader task); the reader is started at the end of :meth:`connect`
 once handshake-time recv() calls are done.
+
+Reach-back serving — EXTENSION-SIGNALING §6.5 (b) `[MUST]`
+----------------------------------------------------------
+
+A dialer that only demuxes responses has built **half** of a symmetric
+establishment. After a §6.5 (b) trigger-(b) establishment the acceptor holds
+a reciprocal grant and may originate to us spontaneously; if this reader
+treats every inbound frame as "a response awaiting a local waiter" that
+origination is dropped as an orphan and *nothing reports a failure* — the
+mint succeeds, the grant verifies, and no handler is ever reached. It is
+loopback-invisible in the same way ``fire_at`` is (§11.5.1): every
+individual step succeeds. Minting authority is the visible half; serving
+the reach-back is the invisible one.
+
+So an inbound ``EXECUTE`` on a connection we dialed is dispatched through
+:attr:`inbound_dispatcher`, which :class:`~entity_core.peer.peer.Peer` wires
+to the same handler path (and the same per-peer concurrency bound) that
+serves *accepted* connections. Responses go out under the **same**
+``_write_lock`` our own outbound EXECUTEs take, so the two interleave
+safely; ``request_id`` correlates each. A :class:`Connection` built without
+a peer (a bare test client, the CLI) leaves the hook unset and keeps the
+old log-and-drop behaviour — there is no handler stack to serve with.
+
+*(Found by entity-core-go 2026-08-05 building the §8.1 vector: authority was
+real and the dispatch still timed out. Go had server-side reentry since
+always and no dialer-side; so did we.)*
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -108,6 +137,32 @@ class Connection:
     _reader_task: asyncio.Task[None] | None = None
     _write_lock: asyncio.Lock | None = None
     _closed: bool = False  # signature, granter identity, etc.
+    # V7 §6.11(b) dialer-side reentry / EXTENSION-SIGNALING §6.5 (b)
+    # "Reach-back serving" [MUST] — see the module docstring. Set by the
+    # owning Peer when it dials; ``None`` on a bare Connection, which then
+    # logs and drops an inbound EXECUTE as before (nothing to serve with).
+    inbound_dispatcher: "Callable[[Envelope], Awaitable[None]] | None" = None
+    #: In-flight reach-back handler tasks, tracked so close() can cancel
+    #: them and the GC cannot reap one mid-dispatch.
+    _inbound_tasks: set[asyncio.Task[None]] = field(default_factory=set)
+    # EXTENSION-SIGNALING §6.5 (b) "The discriminator is the rendezvous key,
+    # locally-derived, never wire-carried" [MUST]: was this establishment
+    # reached by meeting at a §3 rendezvous key? Set by whoever drove the
+    # establishment BEFORE the handshake runs; read at the handshake's tail
+    # to decide whether to mint the reciprocal grant. Never read from the
+    # wire — a field the counterpart sets is the §7.4.1 one-sided-claim
+    # failure shape. Defaults False: a dial to a resolved transport endpoint
+    # is asymmetric and mints nothing.
+    established_via_rendezvous_key: bool = False
+    #: The ``PeerConnectionState`` the owning peer serves reach-back frames
+    #: under. Set by ``Peer._attach_dialed_connection``; ``None`` on a bare
+    #: Connection. Also the slot the reciprocal grant would live in were this
+    #: side the acceptor (it is not — a dialer mints, it does not receive).
+    serving_state: Any | None = None
+    #: The remote's identity entity exactly as it authored it (the §6.6 cap's
+    #: granter identity, lifted from the authenticate response). The §6.5 (b)
+    #: mint names the grantee by ITS content hash — never the §3.2 peer-id.
+    remote_identity: dict[str, Any] | None = None
 
     async def send(self, envelope: Envelope) -> None:
         """Send an envelope.
@@ -343,11 +398,50 @@ class Connection:
             return
         if self._closed:
             raise ConnectionError("Connection is closed")
-        self._write_lock = asyncio.Lock()
+        self.get_write_lock()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name=f"connection-reader-{id(self):x}",
         )
+
+    def get_write_lock(self) -> asyncio.Lock:
+        """The one per-connection write lock, created lazily in-loop.
+
+        Shared, deliberately: the peer's reach-back serving path takes this
+        same lock when it writes a response, so a reply to the counterpart's
+        origination cannot interleave bytes with an outbound EXECUTE of our
+        own on the same wire.
+        """
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
+
+    def _dispatch_inbound_execute(self, env: Envelope) -> None:
+        """Serve one inbound EXECUTE on the connection we dialed.
+
+        V7 §6.11(b) / EXTENSION-SIGNALING §6.5 (b) "Reach-back serving".
+        Spawned rather than awaited so the reader stays free to demux our
+        own in-flight responses — a handler that itself dispatches would
+        otherwise deadlock against the reply it is waiting for. The
+        dispatcher applies the peer's inbound concurrency bound and writes
+        the response itself.
+        """
+        if self.inbound_dispatcher is None:
+            request_id = env.root.get("data", {}).get("request_id", "")
+            logger.warning(
+                "§6.11(b): inbound EXECUTE (request_id=%r) on a dialed "
+                "connection with no serving hook — dropped. The counterpart "
+                "is originating to us; a Connection built without a Peer has "
+                "no handler stack to serve it with.",
+                request_id,
+            )
+            return
+        task = asyncio.create_task(
+            self.inbound_dispatcher(env),
+            name=f"reach-back-{id(self):x}",
+        )
+        self._inbound_tasks.add(task)
+        task.add_done_callback(self._inbound_tasks.discard)
 
     async def _reader_loop(self) -> None:
         """Read frames; demux ``EXECUTE_RESPONSE`` by request_id.
@@ -360,12 +454,20 @@ class Connection:
             while True:
                 env = await recv_envelope(self.reader)
                 msg_type = env.root.get("type", "")
+                if msg_type == Execute.TYPE:
+                    # V7 §6.11(b) dialer-side reentry / EXTENSION-SIGNALING
+                    # §6.5 (b) reach-back serving [MUST]. Not every inbound
+                    # frame is a reply to something we sent: the counterpart
+                    # may ORIGINATE to us on this same wire, which is exactly
+                    # what the reciprocal grant exists to authorize. Falling
+                    # through to the response demux would drop it as an
+                    # orphan — silently, with every step reporting success.
+                    self._dispatch_inbound_execute(env)
+                    continue
                 if msg_type != ExecuteResponse.TYPE:
-                    # Python's outbound :class:`Connection` only expects
-                    # EXECUTE_RESPONSE frames; an inbound EXECUTE would be
-                    # an unexpected server-push pattern this side doesn't
-                    # implement today. Log and drop (rather than crash the
-                    # reader and orphan every pending caller).
+                    # Neither a response nor an origination. Log and drop
+                    # (rather than crash the reader and orphan every
+                    # pending caller).
                     logger.warning(
                         "F-WB28: unexpected frame type %r on outbound "
                         "connection; discarding",
@@ -429,6 +531,12 @@ class Connection:
         self._closed = True
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
+        # Reach-back handlers still running have nowhere to write their
+        # response once the writer goes; cancel rather than leave them to
+        # fail on a closed transport.
+        for inbound in list(self._inbound_tasks):
+            if not inbound.done():
+                inbound.cancel()
         # Idempotence rides the writer state, not the _closed flag: the
         # reader loop's finally also sets _closed (remote-initiated drop),
         # and close() must still release the writer in that case.
@@ -469,6 +577,8 @@ class Connection:
         keypair: Keypair,
         expected_peer_id: str | None = None,
         wait_for_capability: bool = True,
+        *,
+        established_via_rendezvous_key: bool = False,
     ) -> Connection:
         """Connect to a peer and complete EXECUTE-based connect handshake.
 
@@ -484,6 +594,11 @@ class Connection:
             keypair: This peer's keypair.
             expected_peer_id: Optional expected remote peer ID.
             wait_for_capability: Whether to expect capability in connect response.
+            established_via_rendezvous_key: EXTENSION-SIGNALING §6.5 (b) — was
+                this establishment reached by meeting at a §3 rendezvous key?
+                The caller that drove the establishment classifies; it is never
+                read from the wire. True makes this a *symmetric* establishment
+                and the handshake's tail mints the acceptor's reciprocal grant.
 
         Returns:
             An authenticated Connection.
@@ -592,6 +707,12 @@ class Connection:
             # Also extract capability chain (signature, granter identity)
             capability: dict[str, Any] | None = None
             capability_chain: list[dict[str, Any]] | None = None
+            # The acceptor authored the §6.6 cap, so the cap's granter identity
+            # IS the acceptor's identity entity in its authored form. Keeping
+            # it verbatim (§1.8, never recomputed) is what lets the §6.5 (b)
+            # mint name the grantee the way the far side's verify contract
+            # compares it — the #67 hazard is one field over.
+            remote_identity: dict[str, Any] | None = None
             if token_hash and wait_for_capability:
                 cap_dict = authenticate_response_env.find_included(token_hash)
                 if cap_dict:
@@ -611,6 +732,7 @@ class Connection:
                         granter_identity = authenticate_response_env.find_included(granter_hash)
                         if granter_identity:
                             chain_entities.append(granter_identity)
+                            remote_identity = granter_identity
                     if chain_entities:
                         capability_chain = chain_entities
 
@@ -623,6 +745,8 @@ class Connection:
             conn = cls(
                 reader, writer, session, keypair, capability, capability_chain,
                 active_hash_format=active_format,
+                established_via_rendezvous_key=established_via_rendezvous_key,
+                remote_identity=remote_identity,
             )
             # Class G / F-WB28: bring up the demuxer reader task NOW that
             # the inline handshake recv()s are done. From this point on,

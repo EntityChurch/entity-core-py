@@ -38,6 +38,7 @@ from entity_core.handlers.connect import (
 )
 from entity_core.handlers.context import ExecuteResult, HandlerContext
 from entity_core.handlers.registry import HandlerRegistry
+from entity_core.peer.reciprocal import is_reentry_grant
 from entity_core.peer.session import Session
 from entity_core.peer.session_entity import (
     read_minted_capability,
@@ -247,6 +248,48 @@ class PeerConnectionState:
     # no-clobber token (a re-handshake's fresh `active` write must not be
     # flipped `closed` by a stale handler's teardown).
     connection_entity_hash: bytes | None = None
+    # EXTENSION-SIGNALING §6.5 (b) "Where the grant lives" [MUST] — the
+    # connection-scoped originating authority. A reciprocal grant minted by
+    # the counterpart for a rendezvous establishment lives HERE and nowhere
+    # else: it is establishment-scoped and drop-on-disconnect, deliberately
+    # NOT written to `system/peer/session/{peer}` (EXTENSION-NETWORK §6.6
+    # records only the durable handshake cap). Not persisting IS the
+    # security property — a stale grant reused on reconnect, without
+    # re-meeting at the key, would authorize outside the establishment that
+    # justified it. Distinct slot from the durable `held_capability`
+    # (dialer-side reconnect-skip authority); where both exist, THIS one
+    # wins, because a durable cap can predate the live establishment and
+    # MUST NOT shadow it.
+    originating_capability: dict[str, Any] | None = None
+    #: Entities the far side needs to walk that cap's chain (its granter
+    #: identity and the cap signature) — absent from either handshake,
+    #: because the counterpart authored them after it.
+    originating_included: list[dict[str, Any]] | None = None
+    #: Set when a grant is installed, so an origination that races the
+    #: ≈1-round-trip delivery window waits instead of dispatching under
+    #: authority it does not yet hold.
+    originating_ready: asyncio.Event | None = None
+    # §6.5 (b) discriminator, acceptor side. Locally classified, never
+    # wire-carried. Only a rendezvous-established acceptor expects a grant
+    # and pays the bounded wait; a dial-by-address acceptor is asymmetric
+    # and must not.
+    established_via_rendezvous_key: bool = False
+
+    def get_originating_ready(self) -> asyncio.Event:
+        """Lazy in-loop accessor for the grant-received signal."""
+        if self.originating_ready is None:
+            self.originating_ready = asyncio.Event()
+        return self.originating_ready
+
+    def install_originating_capability(
+        self,
+        capability: dict[str, Any],
+        supporting: list[dict[str, Any]] | None,
+    ) -> None:
+        """Install this connection's reciprocal grant (§6.5 (b))."""
+        self.originating_capability = capability
+        self.originating_included = list(supporting) if supporting else None
+        self.get_originating_ready().set()
 
     @property
     def is_connected(self) -> bool:
@@ -329,14 +372,28 @@ class ReentryChannel:
         ``capability`` authorizes the EXECUTE (its grantee is this peer —
         the caller minted it for us); ``capability_chain`` (granter identity,
         cap signature) is bundled into the envelope ``included`` so the
-        caller's verifier can resolve it. The reentry direction has no
-        connection cap of its own — we never dialed the caller — so a
-        capability MUST be supplied explicitly.
+        caller's verifier can resolve it.
+
+        When the caller supplies none, the connection-scoped **reciprocal
+        grant** is used (EXTENSION-SIGNALING §6.5 (b) "Where the grant
+        lives"): on a symmetric rendezvous establishment the dialer minted
+        exactly this authority for us and it is held with the live
+        connection. It **wins** over any durable `held_capability` for the
+        same peer — a durable cap can predate this establishment and MUST
+        NOT shadow it. Absent both, there is no authority on the inbound
+        direction (we never dialed the caller) and origination fails closed
+        rather than dispatching something guaranteed to `401`.
         """
         if capability is None:
+            capability = self.conn_state.originating_capability
+            if capability is not None and capability_chain is None:
+                capability_chain = self.conn_state.originating_included
+        if capability is None:
             raise RuntimeError(
-                "reentry EXECUTE requires an explicit capability — there is "
-                "no connection cap on the inbound (accepted) direction"
+                "reentry EXECUTE requires a capability — no §6.5 (b) "
+                "reciprocal grant is installed on this connection and the "
+                "inbound (accepted) direction carries no connection cap of "
+                "its own"
             )
 
         from entity_core.protocol.auth import create_authenticated_request
@@ -463,6 +520,18 @@ class Peer:
             emit_pathway=peer.emit_pathway,
             keepalive_config=state.keepalive_config,
         )
+        # EXTENSION-SIGNALING §6.5 (b) reach-back serving [MUST] + the
+        # reciprocal mint: every connection this peer DIALS gets a serving
+        # path for inbound EXECUTE and, on a symmetric establishment, mints
+        # the acceptor's grant. Wired as a hook so the pool keeps no
+        # back-reference to the peer.
+        peer._remote_pool.on_dialed = peer._attach_dialed_connection
+        # §6.5 (b) discriminator, acceptor side: peer-ids whose establishment
+        # this peer classified as "met at a §3 rendezvous key". Local, never
+        # wire-read — see `mark_rendezvous_establishment`.
+        peer._rendezvous_peers: set[str] = set()
+        # V7 §6.11(b) origination seams: accepted connections, by peer-id.
+        peer._inbound_reentry: dict[str, ReentryChannel] = {}
 
         # R3a (granter idempotency) — R6 (PROPOSAL §7.1 #1):
         # the held cap for a remote peer lives in the entity tree at
@@ -1520,11 +1589,33 @@ class Peer:
             # EXECUTE back over that same wire — it is the only channel to a
             # caller that dialed us and has no listener (the conformance
             # validator's B-no-listener case).
+            # The seam is either the inbound connection this dispatch
+            # descends from (the conformance B-no-listener case) or — for a
+            # §6.5 (b) acceptor originating spontaneously under its
+            # reciprocal grant — any live accepted connection from the
+            # target peer.
+            if reentry is None or peer_id != reentry.remote_peer_id:
+                reentry = self._inbound_for_reentry(peer_id)
             if reentry is not None and peer_id == reentry.remote_peer_id:
                 logger.debug(
                     "[dispatch:reentry] no outbound route to %s; "
                     "originating over inbound connection", peer_id[:16],
                 )
+                # EXTENSION-SIGNALING §6.5 (b) "Delivery + timing": on a
+                # symmetric rendezvous establishment our originating
+                # authority IS the reciprocal grant, and it lands ≈1 round
+                # trip after the channel opens. Originating inside that
+                # window would dispatch under the cap we minted for THEM —
+                # `grantee != author`, a guaranteed 401. So gate on
+                # grant-received, bounded: on expiry we fall through and let
+                # the dispatch fail closed rather than block. A counterpart
+                # that never adopts the grant therefore degrades to
+                # one-directional, not to a hang.
+                #
+                # Only on a rendezvous establishment: a dial-by-address
+                # acceptor is asymmetric, expects no grant, and must not pay
+                # the wait.
+                await self._await_reciprocal_grant(reentry.conn_state, peer_id)
                 try:
                     response = await reentry.execute(
                         uri, operation, params,
@@ -1989,6 +2080,32 @@ class Peer:
                             await self._handle_connect(
                                 envelope, conn_state, writer
                             )
+                        elif (
+                            conn_state.is_connected
+                            and is_reentry_grant(envelope)
+                        ):
+                            # EXTENSION-SIGNALING §6.5 (b): the dialer's
+                            # reciprocal grant — the capability it minted FOR
+                            # US, which is what lets this acceptor originate
+                            # back over this same channel.
+                            #
+                            # Intercepted here rather than dispatched because
+                            # the frame carries no author, capability or
+                            # signature of its own. It CANNOT: it arrives
+                            # before any authority relationship exists that
+                            # would cover a deposit handler, and §4.4's
+                            # default connection grants reach none. It
+                            # self-verifies through the granter signature
+                            # enclosed in the frame. (A departure from the
+                            # folded carriage sentence, matching both shipped
+                            # impls — see peer/reciprocal.py.)
+                            #
+                            # Best-effort by design: a malformed or
+                            # mis-granted frame is logged and dropped,
+                            # leaving us without originating authority — the
+                            # pre-adoption state — and never breaks the
+                            # connection. Fire-and-forget: no response.
+                            self._accept_reciprocal_grant(envelope, conn_state)
                         elif not conn_state.is_connected:
                             # Not connected yet - reject (inline; nothing
                             # in flight, write is safe without the lock
@@ -2107,6 +2224,9 @@ class Peer:
                         )
                     )
             conn_state.pending_reentry.clear()
+            # The §6.11(b) seam and the §6.5 (b) connection-scoped grant it
+            # carries both die with the connection.
+            self._unregister_inbound_reentry(conn_state)
             # Drain pending handler tasks before tearing down the writer.
             # If a peer disconnects mid-dispatch we let the handler finish
             # (it may have already produced its result; the write will
@@ -2299,8 +2419,10 @@ class Peer:
                 remote_identity_hash = _grantee_identity_hash(
                     envelope, params, conn_state.connect.remote_peer_id,
                 )
-                # Determine grants based on peer identity
-                grants = self._get_grants_for_peer(
+                # Determine grants based on peer identity. The §4.4 assembly
+                # (floor ∪ policy, advertisement-filtered) — the SAME one the
+                # §6.5 (b) reciprocal mint runs, keyed on its counterpart.
+                grants = self.assemble_inbound_grants(
                     conn_state.connect.remote_peer_id,
                     remote_identity_hash,
                 )
@@ -2426,6 +2548,22 @@ class Peer:
                     remote_peer_id=conn_state.connect.remote_peer_id,
                     remote_public_key=conn_state.connect.remote_public_key_bytes,
                 )
+                # EXTENSION-SIGNALING §6.5 (b): our own local classification
+                # of this establishment (see `mark_rendezvous_establishment`).
+                # Read from what WE know about how we met this peer — never
+                # from the wire. Only a rendezvous-established acceptor
+                # expects a reciprocal grant and pays the bounded wait.
+                conn_state.established_via_rendezvous_key = (
+                    conn_state.connect.remote_peer_id in self._rendezvous_peers
+                )
+                # V7 §6.11(b): register this accepted connection as an
+                # origination seam for its peer. Until now reentry only
+                # existed for a dispatch DESCENDING from an inbound request
+                # (the conformance validator's B-no-listener case); a §6.5 (b)
+                # acceptor originates SPONTANEOUSLY under the reciprocal
+                # grant, with no inbound request to descend from, so the
+                # seam has to be findable by peer-id.
+                self._register_inbound_reentry(conn_state, writer)
 
                 # Amendment 12 §A3: `connected` on establish — the
                 # responder end of the handshake (the dialer end writes
@@ -2497,6 +2635,191 @@ class Peer:
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
 
+    async def establish_via_rendezvous(self, peer_id: str) -> Any:
+        """Establish with ``peer_id`` as a §3-rendezvous-met counterpart.
+
+        The EXTENSION-SIGNALING §6.5 (b) trigger-(b) entry point: both
+        peers agreed a rendezvous key out of band, met at it, and *that*
+        mutual bringing of the key is the authorization act — so after the
+        channel opens either peer may originate, and this dial mints the
+        acceptor's half of that authority.
+
+        Classifies **both** roles locally, because either side may end up
+        the dialer: the dial carries the discriminator (which fires the
+        mint), and `mark_rendezvous_establishment` records the peer so a
+        connection *they* open is classified the same way. Nothing about
+        the classification is exchanged.
+
+        Callers: the signaling meet driver today; the §7 punch at the same
+        site when it lands.
+        """
+        self.mark_rendezvous_establishment(peer_id)
+        return await self._remote_pool.get_connection(
+            peer_id, established_via_rendezvous_key=True,
+        )
+
+    def _register_inbound_reentry(
+        self,
+        conn_state: PeerConnectionState,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Record an accepted connection as an origination seam (§6.11(b))."""
+        session = conn_state.session
+        if session is None or not session.remote_peer_id:
+            return
+        self._inbound_reentry[session.remote_peer_id] = ReentryChannel(
+            remote_peer_id=session.remote_peer_id,
+            writer=writer,
+            conn_state=conn_state,
+            keypair=self.keypair,
+            active_hash_format=conn_state.connect.active_hash_format,
+        )
+
+    def _unregister_inbound_reentry(
+        self,
+        conn_state: PeerConnectionState,
+    ) -> None:
+        """Drop the seam when its connection ends.
+
+        The connection-scoped reciprocal grant dies with it, by
+        construction — nothing wrote it anywhere else, which is the §6.5 (b)
+        security property, not an omission.
+        """
+        session = conn_state.session
+        if session is None:
+            return
+        existing = self._inbound_reentry.get(session.remote_peer_id)
+        if existing is not None and existing.conn_state is conn_state:
+            self._inbound_reentry.pop(session.remote_peer_id, None)
+
+    def _inbound_for_reentry(self, peer_id: str) -> "ReentryChannel | None":
+        """The accepted connection from ``peer_id``, if one is live."""
+        channel = self._inbound_reentry.get(peer_id)
+        if channel is None:
+            return None
+        if channel.conn_state.session is None:
+            return None
+        return channel
+
+    def mark_rendezvous_establishment(self, peer_id: str) -> None:
+        """Classify establishments with ``peer_id`` as §3-rendezvous-met.
+
+        EXTENSION-SIGNALING §6.5 (b) "The discriminator is the rendezvous
+        key, locally-derived, never wire-carried" `[MUST]`. The test is
+        **positive and on the key** — was a §3 rendezvous key mutually
+        brought? — not "rendezvous-driven vs profile-driven" (not exclusive)
+        and not on substrate: a §7 punch derives its `pair_key` from the two
+        peer-ids and therefore mints; only a direct dial to a resolved
+        transport endpoint does not.
+
+        Whoever drives the establishment calls this — today the signaling
+        meet driver, and the punch when it lands, at the same site. It is
+        deliberately **not** a wire field the counterpart sets: that is the
+        §7.4.1 one-sided-claim failure shape. It need not be, because
+        meeting proves both peers brought the same key, so each classifies
+        independently and they agree by construction.
+
+        This is the acceptor half (an accepted connection reads it at
+        authenticate-complete). The dialer half is
+        ``Connection.connect(..., established_via_rendezvous_key=True)``,
+        which is what actually fires the mint.
+        """
+        self._rendezvous_peers.add(peer_id)
+
+    async def _await_reciprocal_grant(
+        self,
+        conn_state: PeerConnectionState,
+        peer_id: str,
+    ) -> bool:
+        """Bounded wait for the §6.5 (b) grant. Never blocks indefinitely.
+
+        Returns whether a grant is in hand. A rendezvous-established
+        acceptor waits up to the implementation-local bound; anything else
+        returns immediately, since only a symmetric establishment mints.
+        """
+        from entity_core.peer.reciprocal import RECIPROCAL_GRANT_WAIT_SECONDS
+
+        if conn_state.originating_capability is not None:
+            return True
+        if not conn_state.established_via_rendezvous_key:
+            return False
+        try:
+            await asyncio.wait_for(
+                conn_state.get_originating_ready().wait(),
+                timeout=RECIPROCAL_GRANT_WAIT_SECONDS,
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[§6.5] reciprocal grant from %s not in hand within %ss — "
+                "originating fails closed",
+                peer_id[:16], RECIPROCAL_GRANT_WAIT_SECONDS,
+            )
+            return False
+
+    async def _attach_dialed_connection(self, endpoint: Any) -> None:
+        """Give a freshly dialed connection its serving half.
+
+        EXTENSION-SIGNALING §6.5 (b) **reach-back serving** `[MUST]` /
+        V7 §6.11(b) dialer-side reentry. A peer that serves inbound EXECUTE
+        only on connections it *accepted* has built exactly half of a
+        symmetric establishment: the counterpart's origination arrives on
+        the wire we opened, finds no serving path, and is dropped as an
+        orphan response — silently, with every step reporting success
+        (`§11.5.1` loopback-invisible, the `fire_at` failure shape).
+
+        So the dialed connection gets the same handler path an accepted one
+        gets: the same per-peer inbound semaphore, the same included-entity
+        storage and signature binding, and — critically — the **same write
+        lock**, so a reach-back response cannot interleave bytes with an
+        outbound EXECUTE of our own on that wire.
+
+        On a §6.5 (b) *symmetric* establishment this is also where the
+        reciprocal grant is minted and delivered (dialer → acceptor), at the
+        handshake's tail, because the grantee we must name is the acceptor's
+        authored identity hash and the authenticate-response is where we
+        learn it.
+        """
+        from entity_core.peer.connection import Connection
+
+        if not isinstance(endpoint, Connection):
+            # HTTP / http-poll endpoints are request-response substrates:
+            # there is no persistent inbound frame path to serve on, and no
+            # §6.5 (b) establishment rides them.
+            return
+        if endpoint.session is None:
+            return
+
+        conn_state = PeerConnectionState()
+        conn_state.session = endpoint.session
+        conn_state.connect.phase = "complete"
+        conn_state.connect.remote_peer_id = endpoint.session.remote_peer_id
+        conn_state.connect.remote_public_key_bytes = (
+            endpoint.session.remote_public_key
+        )
+        conn_state.connect.active_hash_format = endpoint.active_hash_format
+        # ONE lock per wire, shared with Connection.execute (see
+        # Connection.get_write_lock) — two locks over one writer is a
+        # byte-interleaving bug that only shows under concurrency.
+        conn_state.write_lock = endpoint.get_write_lock()
+        endpoint.serving_state = conn_state
+
+        writer = endpoint.writer
+
+        async def _serve(envelope: Envelope) -> None:
+            # Same pre-dispatch processing the accepted path runs: an
+            # origination carries its own authority chain in `included`,
+            # and the verifier resolves it from the store (§1.5 provenance,
+            # EXTENSION-IDENTITY §6.2 signature binding).
+            self._store_included_entities(envelope)
+            self._bind_envelope_signatures(envelope)
+            await self._run_handler_task(envelope, conn_state, writer)
+
+        endpoint.inbound_dispatcher = _serve
+
+        if endpoint.established_via_rendezvous_key:
+            await self._send_reciprocal_grant(endpoint)
+
     def _get_grants_for_peer(
         self,
         remote_peer_id: str,
@@ -2546,6 +2869,195 @@ class Peer:
         if policy_grants:
             return floor + policy_grants
         return floor
+
+    async def _send_reciprocal_grant(self, conn: Any) -> None:
+        """Mint the §6.5 (b) reciprocal capability and put it on the wire.
+
+        Dialer side only, at the handshake's tail: the grantee we must name
+        is the acceptor's authored identity hash, and the
+        authenticate-response is where we learn it — so the grant cannot
+        ride the handshake's own `auth_included`.
+
+        Every failure here is a log, never an error. The grant is an
+        authority the counterpart does not yet have, so failing to send it
+        leaves them exactly where a non-adopting peer sits — one-directional
+        and fail-closed. Breaking a working connection over it would trade a
+        degradation for an outage.
+        """
+        from entity_core.peer.reciprocal import (
+            ReentryGrantError,
+            build_reentry_grant_envelope,
+        )
+
+        who = conn.session.remote_peer_id
+        try:
+            if conn.remote_identity is None:
+                # We never saw the acceptor's authored identity entity (it
+                # granted us no cap, or the chain was absent). We cannot
+                # name the grantee the way verify compares it, and naming it
+                # any other way mints a cap that fails `grantee_mismatch`.
+                logger.debug(
+                    "[§6.5] reciprocal grant skipped for %s: no authored "
+                    "grantee identity on this connection", who[:16],
+                )
+                return
+            grantee_identity, _ = Entity.from_wire_dict(conn.remote_identity)
+            grantee_hash = grantee_identity.compute_hash()
+            # The contents are the grant we would issue this peer as an
+            # INBOUND dialer — the same assembly, keyed on the counterpart,
+            # not the flat §4.4 floor (Q2). Running the assembly rather than
+            # copying our own §6.6 cap is the point: the mirror is symmetric
+            # construction, and this peer's policy table governs what it
+            # hands out in both directions.
+            grants = self.assemble_inbound_grants(who, grantee_hash) or []
+            envelope = build_reentry_grant_envelope(
+                self.keypair, grantee_identity, grants, conn.active_hash_format,
+            )
+            # Keep what we authored. The ruled Wielding shape (§6.5 (b)
+            # Carriage phase 2) has the acceptor cite the cap / granter /
+            # signature by REFERENCE and the dialer resolve all three "from
+            # its own content store, because it authored them" — which is
+            # only true if we actually kept them. Costs three entities and
+            # makes a reference-only origination verifiable here whether or
+            # not the counterpart also inlines them.
+            for entity_dict in envelope.included:
+                stored, _ = Entity.from_wire_dict(entity_dict)
+                self.content_store.put(stored)
+            async with conn.get_write_lock():
+                await send_envelope(conn.writer, envelope)
+            logger.debug(
+                "[§6.5] sent reciprocal reentry grant — %s may now "
+                "originate to us", who[:16],
+            )
+        except ReentryGrantError as exc:
+            logger.debug(
+                "[§6.5] reciprocal grant not minted for %s: %s", who[:16], exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort by design
+            logger.debug(
+                "[§6.5] reciprocal grant not sent to %s: %s", who[:16], exc,
+            )
+
+    def _accept_reciprocal_grant(
+        self,
+        envelope: Envelope,
+        conn_state: PeerConnectionState,
+    ) -> None:
+        """Validate an inbound §6.5 (b) grant and install it. Acceptor side.
+
+        The granter is checked against the peer we **authenticated** on this
+        connection, not against anything the frame claims: a grant from any
+        other granter is both useless (the far side roots the chain at its
+        own identity) and dishonest to store.
+        """
+        from entity_core.peer.reciprocal import (
+            ReentryGrantError,
+            accept_reentry_grant,
+        )
+
+        session = conn_state.session
+        if session is None or not session.remote_identity_hash:
+            logger.debug(
+                "[§6.5] reentry-grant before authentication — dropped",
+            )
+            return
+        try:
+            capability, supporting = accept_reentry_grant(
+                envelope, session.remote_identity_hash,
+            )
+        except ReentryGrantError as exc:
+            logger.debug("[§6.5] reentry-grant dropped: %s", exc)
+            return
+        conn_state.install_originating_capability(capability, supporting)
+        logger.debug(
+            "[§6.5] accepted reciprocal reentry grant — we may now "
+            "originate to %s", session.remote_peer_id[:16],
+        )
+
+    def assemble_inbound_grants(
+        self,
+        remote_peer_id: str,
+        remote_identity_hash: bytes | None = None,
+    ) -> list[Grant] | None:
+        """The grant set this peer issues a peer that dials IN.
+
+        The §4.4 assembly — floor (or resolver/admin/debug override) ∪ that
+        peer's policy-table entry — then **advertisement-filtered** (V7 §3;
+        `entity_core.capability.advertisement`).
+
+        It has exactly two callers, deliberately:
+
+        * :meth:`_handle_connect` — the §6.6 handshake mint, acceptor →
+          dialer;
+        * :meth:`_send_reciprocal_grant` — the EXTENSION-SIGNALING §6.5 (b)
+          mint, dialer → acceptor, on a symmetric rendezvous establishment.
+
+        One assembly with two callers is the Q2 ruling itself. "The mirror
+        of what an inbound dialer receives" names the grant an inbound
+        dialer *actually* receives — this assembled set — not the flat §4.4
+        floor. Minting the bare floor while an inbound dialer gets the
+        assembled set gives the establishment *whose justification is
+        symmetry* asymmetric authority: the reciprocal direction `403`s on
+        anything out-of-floor (measured by `entity-core-go`, 2026-08-05 —
+        both shipped impls had exactly that defect). A second copy of the
+        assembly is how the two directions drifted apart in the first place.
+
+        The mirror is symmetric **construction**, not identical grant sets:
+        each peer runs its own assembly against the counterpart, so A→B and
+        B→A differ exactly as A's and B's policy tables differ. That is
+        correct — authority is target-owned.
+        """
+        grants = self._get_grants_for_peer(remote_peer_id, remote_identity_hash)
+        if not grants:
+            return grants
+        from entity_core.capability.advertisement import filter_advertised_grants
+
+        return filter_advertised_grants(
+            grants, self.advertised_served_scope(), self.peer_id,
+        )
+
+    def advertised_served_scope(self) -> list[Grant]:
+        """What this peer advertises it SERVES, as grant entries.
+
+        One entry per registered handler: the handler's pattern, its
+        interface's declared operations (`system/handler/interface`), and
+        resources `*` — a handler advertises its whole namespace and is
+        narrowed by resources at grant time, not here.
+
+        A handler whose interface is not resolvable (registered without a
+        manifest, or before the tree is seeded) advertises `operations: *`:
+        it is registered, so it serves *something*, and inventing a narrower
+        set would drop grants for operations it does in fact serve. A
+        handler that declares an interface with **no** operations advertises
+        none — it names nothing callable, and keeping an `operations: *`
+        entry there would re-open the axis this ruling closed.
+        """
+        from entity_core.types.registry import get_handler_interface
+
+        scope: list[Grant] = []
+        for registered in self.handlers.list_handlers():
+            pattern = registered.pattern
+            operations: list[str] = ["*"]
+            try:
+                interface = get_handler_interface(
+                    pattern.rstrip("/*") if pattern.endswith("/*") else pattern,
+                    self.content_store,
+                    self.entity_tree,
+                )
+            except Exception:  # noqa: BLE001 — a lookup failure is "unknown"
+                interface = None
+            if interface is not None:
+                declared = interface.data.get("operations")
+                if isinstance(declared, dict):
+                    operations = sorted(declared.keys())
+            scope.append(
+                Grant.create(
+                    handlers=[pattern],
+                    resources=["*"],
+                    operations=operations,
+                )
+            )
+        return scope
 
     def _read_policy_grants_for(
         self,

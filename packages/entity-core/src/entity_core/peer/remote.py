@@ -44,6 +44,8 @@ from entity_core.protocol.bounds import Bounds
 from entity_core.protocol.messages import ExecuteResponse
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from entity_core.crypto.identity import Keypair
     from entity_core.peer.liveness import KeepaliveConfig
     from entity_core.storage.content_store import ContentStore
@@ -157,14 +159,35 @@ class RemoteConnectionPool:
         # transition"). Peer-level fact, deliberately not popped on
         # eviction: the demotion write happens after the binding is gone.
         self._last_heard_ms: dict[str, int] = {}
+        # EXTENSION-SIGNALING §6.5 (b): called once per freshly dialed
+        # endpoint, before it is handed to the caller. The owning Peer
+        # installs the reach-back serving path here (and, on a symmetric
+        # establishment, mints the reciprocal grant). A pool built without
+        # a peer — the plain transport case — leaves it unset.
+        self.on_dialed: (
+            "Callable[[RemoteEndpoint], Awaitable[None]] | None"
+        ) = None
 
-    async def get_connection(self, peer_id: str) -> RemoteEndpoint:
+    async def get_connection(
+        self,
+        peer_id: str,
+        *,
+        established_via_rendezvous_key: bool = False,
+    ) -> RemoteEndpoint:
         """Get or create a connection to a remote peer.
 
         Walks profile candidates in D1 order (primary first, then lex)
         across both `tcp` and `http` transport types; dials the first
         that connects. Returns a `RemoteEndpoint` (TCP `Connection` or
         `HttpConnection`) — callers do not branch on transport.
+
+        ``established_via_rendezvous_key`` is the EXTENSION-SIGNALING
+        §6.5 (b) discriminator, passed down to the dial: it says this
+        establishment was reached by meeting at a §3 rendezvous key, which
+        is what makes it symmetric and mints the acceptor's reciprocal
+        grant. A cached connection keeps the classification it was dialed
+        under — the classification is a property of the establishment, not
+        of the request that reuses it.
         """
         if peer_id in self._connections:
             return self._connections[peer_id]
@@ -196,7 +219,10 @@ class RemoteConnectionPool:
                     if transport_type == "tcp":
                         host, port = _parse_tcp_endpoint_url(url)
                         endpoint: RemoteEndpoint = await Connection.connect(
-                            host, port, self._keypair, expected_peer_id=peer_id
+                            host, port, self._keypair, expected_peer_id=peer_id,
+                            established_via_rendezvous_key=(
+                                established_via_rendezvous_key
+                            ),
                         )
                     elif transport_type == "http":
                         endpoint = await HttpConnection.connect(
@@ -210,6 +236,9 @@ class RemoteConnectionPool:
                 except Exception as e:
                     failures.append(f"{profile_id}({transport_type} {url}): {e}")
                     continue
+
+                if self.on_dialed is not None:
+                    await self.on_dialed(endpoint)
 
                 self._connections[peer_id] = endpoint
                 logger.debug(
