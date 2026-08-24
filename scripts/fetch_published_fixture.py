@@ -66,8 +66,30 @@ PINNED_KEY_TYPE = "ed25519"
 PINNED_IDENTITY_HASH = (
     "356a7a81d4eaa197ad2d2a2fb131246a824e50665ea75dce0c1b11ddd0a10e38"
 )
+# Filled 2026-08-22. This slot shipped as the literal byte ladder 0xc0..0xdf —
+# a placeholder nobody ever replaced, so the headline cross-impl row had never
+# passed in visible history. It read green anyway, because the row `skipif`s
+# without the Go toolchain and almost no runner has it.
+#
+# **Why pinning the measured value here is not the tautology `AGENTS.md` warns
+# about.** That warning is about pinning *your own* output. This value is not
+# ours to produce: `fetch_verified_root()` returns the `root_hash` carried
+# **inside Go's `system/peer/published-root` entity**, after verifying its
+# Ed25519 signature against the pubkey derived from PINNED_PEER_ID above. A
+# wrong value cannot round-trip — it would have to be signed by the publisher's
+# key. Python computes nothing here; it reads and verifies.
+#
+# Provenance: measured three times across separate fixture publications (two
+# sessions, 2026-08-21 and 2026-08-22), byte-identical each time.
+#
+# It is pinned *here and nowhere else in the cohort*: go's own consumer
+# (`cmd/fetch-published-fixture/main.go`) verifies the signature and then only
+# **prints** the root (`root=%s`), so there is no upstream §1 table row to
+# mirror — which is exactly why the slot was left stubbed. Ours is the stricter
+# check of the two, and it is the one that would notice Go's tree-root
+# computation moving under a fixture whose content did not change.
 PINNED_ROOT_HASH = (
-    "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+    "af1c9f6bb378ef614942e60864e3ba3f3e3ac4972c8c43580055fa2234cdd9ab"
 )
 
 

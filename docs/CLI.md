@@ -47,9 +47,33 @@ entity-core start [--listen ADDR] [-i NAME] [--admin NAME ...] [--debug]
 | `--serve-namespace`, `--serve-closure-root`, `--serve-scope-whole-store`, `--publish-root` | Serving-mode scope selection (see GUIDE-SERVING-MODE). |
 | `--http-addr`, `--http-path`, `--http-base-url`, `--http-poll-addr`, `--http-poll-prefix` | HTTP / HTTP-poll transport endpoints. |
 | `--discovery-announce`, `--discovery-profile` | mDNS discovery announcement. |
+| `--max-lifetime SECONDS` | Stop the peer after SECONDS and exit cleanly (`0` = run until signalled). Defaults to `$ENTITY_PEER_MAX_LIFETIME`. |
 
 No flags = peers can connect but receive no capabilities; `--admin` grants only
 the named peers; `--debug` grants everyone (testing).
+
+### Stopping a peer
+
+`start` runs until stopped. Three things stop it, and all three run the same
+shutdown path — extensions down, connections closed, listening socket released:
+
+- **SIGINT** (Ctrl+C) or **SIGTERM** (`podman stop`, systemd, a test harness's
+  `terminate()`). Exit status `0`.
+- **`--max-lifetime SECONDS`**, after which the peer stops itself.
+
+**Always give a peer you start by hand a `--max-lifetime`.** A peer with no
+bound outlives the shell that started it and holds its port indefinitely; the
+conformance harness binds *fixed* ports (`9000`, `9401`, `9451`, `9452`), so a
+leaked peer surfaces later as someone else's mysterious bind failure or — worse
+— as a stale peer answering a probe aimed at a fresh one. Export the default
+once and every peer on the box is bounded whether or not you remember the flag:
+
+```bash
+export ENTITY_PEER_MAX_LIFETIME=3600   # a malformed value is refused, not ignored
+```
+
+Long-lived peers stay expressible: an explicit `--max-lifetime 0` overrides the
+environment default, which is what the validator's own peers use.
 
 ### Inspect the entity tree
 

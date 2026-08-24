@@ -40,7 +40,6 @@ import os
 import pytest
 
 from entity_core.crypto.identity import Keypair
-from entity_core.peer.connection import Connection
 from entity_handlers.signaling.data import advertisement_from_result
 
 #: The Go node started WITH `--reflection-endpoint`.
@@ -64,18 +63,14 @@ async def _advertise(port: int):
     the deployment posture, and what makes the node's admission model part of
     what is under test rather than something the harness routes around.
     """
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", port), timeout=1.0,
-        )
-        writer.close()
-        await writer.wait_closed()
-    except (TimeoutError, OSError):
-        pytest.skip(f"no Go signaling node reachable at 127.0.0.1:{port}")
+    # Handshake, not socket — see `peer_liveness`. The probe IS the connection
+    # the test then uses, so a foreign listener costs one bounded timeout
+    # instead of an unbounded hang inside `Connection.connect`.
+    from tests.interop import peer_liveness
 
-    conn = await Connection.connect(
-        "127.0.0.1", port, Keypair.generate(), wait_for_capability=True,
-    )
+    conn = await peer_liveness.open_peer("127.0.0.1", port, Keypair.generate())
+    if conn is None:
+        pytest.skip(peer_liveness.skip_reason("127.0.0.1", port))
     try:
         response = await conn.execute(
             uri=f"entity://{conn.session.remote_peer_id}/system/signaling",

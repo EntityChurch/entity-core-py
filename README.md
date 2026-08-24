@@ -42,7 +42,7 @@ uv run entity-core list-identities
 - **`uv sync` verifies SHA256 hashes** from `uv.lock` for every downloaded package. If hashes don't match, the install will fail — this is expected and is a supply chain safety check. Do not bypass it.
 - **`uv.lock` must be committed.** It pins exact versions and SHA256 hashes for every dependency. Do not add it to `.gitignore`.
 - **Identity files must exist before starting a peer.** The CLI reads Ed25519 keys from `~/.entity/identities/` (see [Identity Management](#identity-management) below). Running `entity-core start` without an identity will fail.
-- **The workspace has internal dependencies.** The three packages depend on each other (`entity-cli` -> `entity-handlers` -> `entity-core`), and `uv sync` installs them all in editable mode. Do not install them individually with pip.
+- **The workspace has internal dependencies.** The four packages sit in a strict tier order — `entity-core` (0) -> `entity-handlers` (1) -> `entity-sdk` (2) -> `entity-cli` (presentation) — and imports only ever point downward, enforced by `tests/unit/test_package_layering.py`. The declared edges are narrower than the tiers: `entity-sdk` depends on `entity-core` **alone** (it reaches handlers by dispatching to pattern strings, never by importing them), while `entity-cli` depends on all three. `uv sync` installs them all in editable mode. Do not install them individually with pip.
 
 ## Usage
 
@@ -115,7 +115,7 @@ The generated files in `~/.entity/identities/` are then usable by both implement
 
 ## Project Structure
 
-This project is a uv workspace with three packages:
+This project is a uv workspace with four packages:
 
 ```
 entity-core-py/
@@ -139,7 +139,11 @@ entity-core-py/
 │   ├── entity-handlers/        # Standard handlers (tree, system, storage, query)
 │   │   └── src/entity_handlers/
 │   │
-│   └── entity-cli/             # CLI application
+│   ├── entity-sdk/             # L1 operations + L3 extension wrappers
+│   │   └── src/entity_sdk/     #   client, paths, events, store, query,
+│   │                           #   subscription, registry, revision, handlers
+│   │
+│   └── entity-cli/             # CLI application (presentation tier)
 │       └── src/entity_cli/
 │
 ├── tests/

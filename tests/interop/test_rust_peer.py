@@ -12,6 +12,7 @@ import pytest
 
 from entity_core.crypto.identity_file import load_identity
 from entity_core.peer.connection import Connection
+from tests.interop import peer_liveness
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.messages import Execute, ExecuteResponse
 
@@ -31,26 +32,22 @@ def framework_admin_keypair():
 
 
 async def check_rust_peer_available() -> bool:
-    """Check if Rust peer is running."""
-    import asyncio
+    """Is a real entity peer answering at PEER_PORT?
 
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", PEER_PORT),
-            timeout=1.0,
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except (OSError, asyncio.TimeoutError):
-        return False
+    Handshake, not socket — see `peer_liveness`. The socket version of this
+    function hung the whole suite on 2026-08-22: an unrelated Selenium
+    container publishes 9000, the probe saw a listener, the skip did not fire,
+    and `Connection.connect` blocked forever against a server that will never
+    speak this protocol.
+    """
+    return await peer_liveness.peer_available("127.0.0.1", PEER_PORT)
 
 
 @pytest.fixture
 async def rust_peer_available():
     """Skip test if Rust peer not available."""
     if not await check_rust_peer_available():
-        pytest.skip(f"Rust peer not available at 127.0.0.1:{PEER_PORT}")
+        pytest.skip(peer_liveness.skip_reason("127.0.0.1", PEER_PORT))
 
 
 @pytest.mark.asyncio

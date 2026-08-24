@@ -21,7 +21,6 @@ To target a different peer (e.g., Go on 9002):
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 
@@ -52,17 +51,14 @@ PEER_HOST = os.environ.get("PEER_HOST", "127.0.0.1")
 
 
 async def _peer_available() -> bool:
-    """True if an external peer answers TCP at PEER_HOST:PEER_PORT."""
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(PEER_HOST, PEER_PORT),
-            timeout=1.0,
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except (OSError, asyncio.TimeoutError):
-        return False
+    """True if a real entity peer completes a handshake at PEER_HOST:PEER_PORT.
+
+    Handshake, not socket — see `peer_liveness`. Answering TCP is not being a
+    peer, and the difference is a foreign container turning your own diff red.
+    """
+    from tests.interop import peer_liveness
+
+    return await peer_liveness.peer_available(PEER_HOST, PEER_PORT)
 
 
 # ---------------------------------------------------------------------------

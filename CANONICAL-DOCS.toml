@@ -13,7 +13,7 @@ directly from the specification, and exists primarily to validate that the spec
 is clear and complete enough to build interoperable peers. It depends on the
 protocol specification (entity-core-architecture); nothing else in the batch
 depends on it (the three cores do not cross-depend). Confidence: solid and
-cross-impl-converged (2700+ tests, validate-peer green), at the v0.8 research-
+cross-impl-converged (4000+ tests, validate-peer green), at the v0.8 research-
 preview maturity level — not a 1.0 API commitment.
 """
 

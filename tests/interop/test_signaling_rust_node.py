@@ -48,7 +48,6 @@ cross-process meet — a go peer and a py peer at one node — which is what
 
 from __future__ import annotations
 
-import asyncio
 import os
 
 import pytest
@@ -90,15 +89,15 @@ SRFLX = Candidate("srflx", "tcp", "203.0.113.7:41234", 0)
 
 
 async def _reachable(port: int) -> bool:
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection("127.0.0.1", port), timeout=1.0
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except (TimeoutError, OSError):
-        return False
+    """Handshake, not socket — see `peer_liveness`.
+
+    A signaling node is a peer first; a listener that cannot complete the
+    handshake is a foreign process, and probing for the socket alone reports it
+    as a node that is merely misconfigured.
+    """
+    from tests.interop import peer_liveness
+
+    return await peer_liveness.peer_available("127.0.0.1", port)
 
 
 async def _authority_blocker(port: int) -> str | None:

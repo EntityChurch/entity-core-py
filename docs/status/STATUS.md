@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-21 · public: v0.8.0 (master)_
+_Updated: 2026-08-22 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -10,8 +10,12 @@ other implementations — so its real job is to prove the spec is clear and comp
 enough to build a compatible peer from scratch, and to act as an interoperability peer
 for the Rust and Go implementations.
 
-The codebase is a `uv` workspace of three packages with a strict
-`entity-cli → entity-handlers → entity-core` dependency direction:
+The codebase is a `uv` workspace of four packages in a strict tier order —
+`entity-core` (0) → `entity-handlers` (1) → `entity-sdk` (2) → `entity-cli`
+(presentation) — with imports only ever pointing downward, enforced by
+`tests/unit/test_package_layering.py`. The declared edges are narrower than the
+tiers: `entity-sdk` depends on `entity-core` alone, reaching handlers by
+dispatching to pattern strings rather than importing them.
 
 - **entity-core** — the minimal, stable protocol library: `crypto/` (Ed25519/Ed448
   identity, signing, hashing), `protocol/` (Entity, Envelope, messages, framing),
@@ -25,18 +29,136 @@ The codebase is a `uv` workspace of three packages with a strict
   (incl. mDNS), registry (incl. peer-issued), type (handler/constraint/narrowing/
   analysis), and the `content/`, `encryption/`, `local_files/`, and `substitute/`
   sub-packages.
+- **entity-sdk** — the L1 operation surface (`EntityClient`: get/put/put_cas/list/remove/
+  has/watch/unwatch + `execute`), the §12 error hierarchy, path resolution, change events,
+  the Level-0 `store` surface, and the L3 extension wrappers (`subscription`, `query`,
+  `registry`, `revision`, `handlers`).
 - **entity-cli** — the user-facing CLI (`entity-core start` / `connect` /
-  `list-identities`).
+  `list-identities`), holding no protocol knowledge of its own.
 
-Maturity: reasonably mature for a research preview. A broad suite — roughly 2,600+ test
-functions across ~130 files (unit, integration, interop, and conformance directories) —
-backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release,
+Maturity: reasonably mature for a research preview. A broad suite — 3,611 test functions
+across 196 files (unit, integration, interop, and conformance directories), 4,061 passing
+with 0 failures — backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release,
 with package versions aligned to `0.8.0` alongside the parallel Rust/Go cores. This is
 **not a 1.0 API commitment.** The canonical build/test path needs only `make` + `podman`
 on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev uses
 Python 3.11–3.13 and `uv`.
 
 ## Where we left off
+
+**The leaked peers were ours, and the fix was never "be more careful" (2026-08-22).**
+Five entries in `AGENTS.md` describe tripping over a leftover peer on a fixed port; every
+one of them ends in a *detection* rule, because from the tripping side the leftover is
+someone else's artifact. Measured from the creating side, `cmd_start` ended in a bare
+`await peer.serve_forever()` and installed **no signal handlers at all**, so (a) a peer
+started by hand ran until something signalled it, and an agent on this host cannot signal
+anything, and (b) `ENTRYPOINT ["entity-core"]` makes the peer **PID 1**, where the kernel
+discards an unhandled SIGTERM rather than applying its default disposition — `podman stop`
+paid its full timeout and SIGKILLed, every time. The `except KeyboardInterrupt` arm that
+looked like the shutdown path never ran either (measured pre-fix exit was `-2`, not `0`).
+Landed: `--max-lifetime` defaulted from `$ENTITY_PEER_MAX_LIFETIME` (`d1bf909`), SIGTERM/
+SIGINT handling (`e98d270`), and — from a flaw in that same change — a `serve_forever()`
+crash is re-raised rather than parked by `asyncio.wait` and silently exited 0 (`3d09f02`).
+Five mutations, each RED on exactly the predicted rows.
+
+**The interop suite did not fail, it hung — and had for as long as a foreign container held
+9000.** `AGENTS.md` records "a liveness probe that tests for a socket rather than for a peer"
+as a ratified lesson, but only one module was ever written to it; five others each carried
+their own socket probe. With an unrelated Selenium container on 9000 the probe saw a
+listener, the skip did not fire, and pytest blocked in `ep_poll` **forever** against a server
+that will never speak this protocol. One shared `tests/interop/peer_liveness.py`, all five
+converted (`a56008a`): handshake and remote peer id, bounded by a timeout. `tests/interop/`
+now finishes in 30s.
+
+**The headline cross-impl row had never passed in visible history** (`85c75be`).
+`PINNED_ROOT_HASH` shipped as the byte ladder `0xc0..0xdf` — a stub nobody filled — and read
+green everywhere because it `skipif`s without the Go toolchain. It is now filled with the
+signature-verified value Go's published root carries (`af1c9f6b…`, measured identical across
+three separate fixture publications). This reverses yesterday's "not derivable, route it"
+call on evidence: the value is not ours to produce — `fetch_verified_root()` reads it from
+inside Go's signed `published-root` entity, so a wrong value would have to be signed by the
+publisher's key. go's own consumer pins nothing here and only prints the root, so ours is
+the stricter check. The placeholder detector lives in `tests/unit/` with **no** `skipif`,
+because needing Go is precisely what hid this.
+
+**Release gate green, and the first measurement of it was void.** Run 1 reported 301 failures
+with the peer dying mid `t2_1_sustained_load`; a full **rust** `validate-complete.sh` was
+running concurrently on the same box, which our own rule says makes neither result citable.
+Re-measured on a quiet host: `1611 · 1596 P · 15 W · 0 F · 0 S @ core-go 0709688`, all six
+passes exit 0, `t2_1` PASS at 40.9s. The numbers are recorded across both runs rather than
+the verdict of the one that was green.
+
+**The eval-limit ruling said py already complied, and py did not (2026-08-22).** Arch ruled the
+§8 carve-out (`PROPOSAL-COMPUTE-CLOSURE-RESULT-POSITIONS` §§8–10, routed as `ROUTING-2026-08-21-h`)
+and its opening premise names what each seat does: *"rust and py … **contain** `depth_exceeded`."*
+§5.3 concludes *"Nothing owed"*, and core-go relayed it as *"C-14 — you were right."* **We
+short-circuited all three limit codes** (`_EVAL_LIMIT_CODES` at `f09ae70`), and our own SA-PY-25 says
+so in its second paragraph — arch read that filing's argument about the *discriminator* as a position
+on the *outcome*. Landed at `cca75fd`: the set is `{budget_exhausted, cascade_limit}` — the two
+counters §5.1 does **not** restore on unwind — and `depth_exceeded` contains like any other error,
+because `depth` *is* restored and is therefore element-local. Five rows, each mutation-verified RED
+beforehand, plus the one that would have caught this unaided: **assert the property the ruling
+reasons from** (`depth` restored on unwind), on the budget object, driven bare so it is orthogonal to
+the carve-out it is not about.
+
+**A wrong premise in the *flattering* direction produces no task at all** — that is why this sat
+green at three seats. The other shapes of this law (wrong about our architecture, our coverage, our
+version) all fail loudly the moment you open the tree. Ratcheted into `AGENTS.md`.
+
+**D8 is landed and had a second site nobody named.** §7.1's `walk` is now recursive **by rule**
+(`b3a595d`) rather than correct by enumeration of today's grammar. Arch measured `_walk_deps`;
+`_audit_walk` carried a hand-rolled copy of the same four cases, and there the consequence is worse —
+a `compute/apply` nested past the enumerated shapes is never reached, so its **install-time
+capability/resource check and the F5 structural error never run** and the subgraph installs clean.
+Both walkers now share one traversal. Rows (a)/(b) — go's two wire checks — passed here *before* the
+fix, which is the point: the discriminating rows are the ones at nesting the grammar cannot express,
+and no boundary-hash vector can see them.
+
+**Writing clause 3's grep found two defects in clause 3 (SA-PY-27).** `compute/construct.fields` is a
+**third** `{map_of: system/hash}` reference container the enumeration of two omits; and
+`compute/let.bindings` is declared `{array_of: primitive/any}`, so the grep **cannot match the one
+shape D8 exists because of.** Our conformance does not depend on either half — clause 1's prose
+`[MUST]` is implemented as a real recursive traversal — and the blind spot is pinned as a row rather
+than worked around.
+
+**The compute cross-bless is LOCKED, 362/362 byte-identical go↔py**, wire corpus
+`333de571b27c513c` at go `e777412`, both peers driven over the wire this session (C-18 discharged).
+**Our first run reported one divergence and it was our comparison, not the peers:** py's *wire*
+emission against go's *in-process* one. `peeremit.go` sends a scalar operations budget and **there is
+no wire field for `depth`**, so CV-9a — whose answer is a function of depth — answers `[1, E, 1]` on
+route A and `[1, 60, 1]` on route B. Localized by measurement: py in-process at the vector's real
+budget produces `00289092…2017f`, go's in-process boundary byte for byte, now pinned in-tree as an
+oracle constant. **The half worth flagging past the green:** over the wire CV-9a raises no error at
+all, so on the route both siblings use to cross-bless, *the vector authored for the depth ruling
+locks green while exercising nothing about it.* Routed to core-go as a harness fix; nothing owed at
+py or rust.
+
+**D3's window is closed.** py landed it first and carried the deliberate `1F`; go landed at
+`0e1f604`; **rust landed at `69998ac`**, which is arch §9 clause 4 satisfied. `type_system` measures
+**436 P · 10 W · 0 F** against py this session — the transient FAIL is gone.
+
+**C-12** needed nothing: `store`'s `path` is absent from `_CONTAINED_ARGS`, so it short-circuits at
+the arg loop, and `TestStorePathIsConsumed` has checked it since `0b2d946` with a `type_mismatch`
+control.
+
+**The citable number is `1611 · 1597 P · 14 W · 0 F · 0 S @ core-go `e777412`` (2026-08-22)** —
+`validate-complete.sh python` **exit 0, all six passes**, from the committed tree. The total rose
+1609 → 1611 with go's two D8 wire checks, and **the `1 F` is gone**: it was the D3 transition, and
+rust closed the window. `make test` / the full suite is **4035 pass · 2 fail**, both of them the
+`PINNED_ROOT_HASH` placeholder routed to core-go 2026-08-21 and still unfilled at `e777412`.
+
+**Two measurement notes, because a number is only as good as what it did not run.**
+*(i)* The **first** `validate-complete.sh` run this session was `1591 P · 6 F`, and all six were
+`peer_issued` reporting `bind: address already in use` on **`127.0.0.1:9401` — a peer this session
+started itself**, which the fixture registry binds by default. Re-measured with `PI_PORT=9411`
+rather than attributed: 0 F. Fourth instance of *a validator failure on a fixed port is a leftover
+peer until proven otherwise*, and the first where the leftover was ours **and still running** — the
+harness blocks agents from killing processes, so the fix was the environment override, not a kill.
+*(ii)* **`tests/interop/` did not run**: `127.0.0.1:9000` is held by an unrelated Selenium container
+on this host, so `rust_peer_available` sees a listener, does not skip, and the suite hangs
+mid-handshake. That is the documented third instance, and the suite is reported **unrun**, not green.
+
+---
 
 **C-8's closure-result positions are landed, and `fold` went the other way at core-go
 (2026-08-21).** Arch ruled `map`/`filter`/`fold`'s closure-result positions (`172589e`), replacing

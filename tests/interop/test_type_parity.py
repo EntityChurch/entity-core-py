@@ -8,7 +8,6 @@ Run with: uv run pytest tests/interop/test_type_parity.py -v
 Requires: Peer running on 127.0.0.1:9000 (or set INTEROP_PEER_HOST/PORT)
 """
 
-import asyncio
 import os
 
 import pytest
@@ -31,24 +30,22 @@ PEER_PORT = int(os.environ.get("INTEROP_PEER_PORT", "9000"))
 
 
 async def check_peer_available() -> bool:
-    """Check if remote peer is available."""
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(PEER_HOST, PEER_PORT),
-            timeout=2.0,
-        )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except (OSError, asyncio.TimeoutError):
-        return False
+    """Is a real entity peer answering at PEER_HOST:PEER_PORT?
+
+    Handshake, not socket — see `peer_liveness`.
+    """
+    from tests.interop import peer_liveness
+
+    return await peer_liveness.peer_available(PEER_HOST, PEER_PORT)
 
 
 @pytest.fixture
 async def peer_connection():
     """Connect to remote peer for testing."""
+    from tests.interop import peer_liveness
+
     if not await check_peer_available():
-        pytest.skip(f"Peer not available at {PEER_HOST}:{PEER_PORT}")
+        pytest.skip(peer_liveness.skip_reason(PEER_HOST, PEER_PORT))
 
     keypair = Keypair.generate()
     conn = await Connection.connect(PEER_HOST, PEER_PORT, keypair)

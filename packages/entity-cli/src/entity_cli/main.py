@@ -31,6 +31,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -721,6 +722,39 @@ def cmd_list_identities() -> None:
             print(f"  {name}: (error loading: {e})")
 
 
+ENV_MAX_LIFETIME = "ENTITY_PEER_MAX_LIFETIME"
+
+
+def _env_max_lifetime() -> float:
+    """Read the ``$ENTITY_PEER_MAX_LIFETIME`` default for ``--max-lifetime``.
+
+    This is the enforcement point for "a peer reaps itself": a dev box exports
+    the variable once and no hand-started peer on it can outlive the shell that
+    started it, whether or not whoever typed the command remembered the flag.
+
+    A malformed value is a **hard error**, not a fallback to unlimited. Setting
+    the variable is a statement that a bound is wanted; silently ignoring a typo
+    would hand back the unbounded peer the variable exists to prevent, at the
+    one moment nobody is looking for it.
+    """
+    raw = os.environ.get(ENV_MAX_LIFETIME)
+    if raw is None or raw.strip() == "":
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        raise SystemExit(
+            f"Error: ${ENV_MAX_LIFETIME}={raw!r} is not a number. "
+            "Set it to a positive number of seconds, or unset it."
+        ) from None
+    if value < 0:
+        raise SystemExit(
+            f"Error: ${ENV_MAX_LIFETIME}={raw!r} is negative. "
+            "Use 0 for 'run until signalled'."
+        )
+    return value
+
+
 def _keepalive_config_from_args(args: argparse.Namespace) -> dict[str, int] | None:
     """Map the ``--keepalive-*`` start flags to ``with_keepalive_config`` kwargs.
 
@@ -1173,13 +1207,83 @@ async def cmd_start(args: argparse.Namespace) -> None:
             except Exception as exc:
                 print(f"WARNING: mDNS announce failed: {exc}")
 
-    print("Press Ctrl+C to stop")
+    max_lifetime = float(getattr(args, "max_lifetime", 0.0) or 0.0)
+    if max_lifetime > 0:
+        print(f"Max lifetime: {max_lifetime:g}s — the peer will stop itself")
 
+    # SIGTERM is how every supervisor asks a peer to stop — `podman stop`,
+    # systemd, a CI harness reaping its fixtures. The Dockerfile's ENTRYPOINT
+    # makes this process **PID 1**, and the kernel does not apply a signal's
+    # default disposition to PID 1: a SIGTERM with no *installed handler* is
+    # discarded outright. So without this the peer ignores every stop request,
+    # `podman stop` blocks for its full timeout and then SIGKILLs — which is a
+    # shutdown that never runs `stop()`, never closes connections, and taught
+    # everyone that reaping a peer means escalating to a kill.
+    loop = asyncio.get_running_loop()
+    stop_requested = asyncio.Event()
+    signalled: list[str] = []
+    installed: list[signal.Signals] = []
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+
+        def _request_stop(signame: str = name) -> None:
+            if not stop_requested.is_set():
+                signalled.append(signame)
+                stop_requested.set()
+
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            # Non-Unix, or not the main thread. The KeyboardInterrupt arm
+            # below stays as the fallback for SIGINT.
+            continue
+        installed.append(sig)
+
+    print("Press Ctrl+C to stop" + (" (SIGTERM honored)" if installed else ""))
+
+    serve_task = asyncio.ensure_future(peer.serve_forever())
+    stop_task = asyncio.ensure_future(stop_requested.wait())
     try:
-        await peer.serve_forever()
+        # Whichever comes first: the server ending, a stop signal, or the
+        # lifetime bound. All three fall through to `stop()`, which is what
+        # releases the listening socket.
+        done, _ = await asyncio.wait(
+            {serve_task, stop_task},
+            timeout=max_lifetime if max_lifetime > 0 else None,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            print(f"\nMax lifetime {max_lifetime:g}s reached; shutting down...")
+        elif stop_task in done:
+            print(f"\nReceived {signalled[0] if signalled else 'stop'}; "
+                  "shutting down...")
+        elif serve_task in done and not serve_task.cancelled():
+            # The server ended on its own. If it ended by RAISING, that
+            # exception is the only account of why this peer stopped serving —
+            # and `asyncio.wait` does not propagate it, it parks it on the task.
+            # Re-raise so the process dies loudly with a traceback and a
+            # non-zero status. Swallowing it here would turn a crash under load
+            # into a silent exit 0, which reads downstream as an orderly
+            # shutdown and leaves a conformance run reporting "connection
+            # refused" with no cause anywhere.
+            serve_exc = serve_task.exception()
+            if serve_exc is not None:
+                print(f"\nServer stopped with an error: {serve_exc!r}")
+                raise serve_exc
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError):
+                pass
+        for task in (serve_task, stop_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(serve_task, stop_task, return_exceptions=True)
         await peer.stop()
 
 
@@ -1404,6 +1508,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--identity", "-i",
         default="default",
         help="Identity name from ~/.entity/identities/ (default: 'default')",
+    )
+    start_parser.add_argument(
+        "--max-lifetime",
+        dest="max_lifetime",
+        type=float,
+        default=_env_max_lifetime(),
+        metavar="SECONDS",
+        help="Stop the peer after SECONDS and exit cleanly (0 = run until "
+             "signalled, the default). Defaults to $ENTITY_PEER_MAX_LIFETIME "
+             "when set. A peer started for debugging MUST carry this: the "
+             "shutdown path releases the listening port, so the peer reaps "
+             "itself rather than depending on someone holding a PID.",
     )
     start_parser.add_argument(
         "--key-type",
