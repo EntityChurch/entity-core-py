@@ -264,8 +264,99 @@ def _materialize_bare(value: Any, ctx: EvalContext) -> Any:
 
 
 def is_error(v: Any) -> bool:
-    """Check if value is a compute/error."""
+    """Is ``v`` a `compute/error`? §4.1's predicate, and it is **kind-based,
+    not outcome-based** `[MUST]` (v3.23).
+
+    True iff the value's kind is `compute/error`. It does **not** mean
+    "evaluation failed": a `compute/error` **value** that evaluated
+    *successfully* — a stored literal, or a `compute/lookup/hash` resolving to
+    one, each returned unchanged by SA-1 — is an error for every purpose in
+    §4.1, and every consumer short-circuits to it (§7.2 names construct,
+    apply, field, arithmetic, compare, logic, and `if`'s condition).
+
+    Arch ruled this in v3.23 against the outcome-based reading, under which an
+    error reached during evaluation would instead be embedded and materialized
+    into the consuming expression. Both readings are self-consistent, so
+    neither is visible to same-impl testing — they split at the cross-peer
+    seam, where the same input yielded an entity-kind boundary in one peer and
+    an error-kind outcome in another, observed three ways with no two alike.
+
+    Note both representations answer here: :func:`make_error` mints a **dict**,
+    while a stored error literal resolves to an **`Entity`**. That split is
+    invisible to this predicate and was *not* invisible at the wire boundary —
+    see :func:`error_to_wire`.
+    """
     return _entity_type(v) == "compute/error"
+
+
+def error_data(v: Any) -> dict[str, Any]:
+    """The `data` map of a `compute/error` in either representation.
+
+    Python carries a `compute/error` two ways and they are equally valid:
+    :func:`make_error` returns a plain ``{"type", "data"}`` dict, and a
+    `compute/error` **literal** resolved from the content store is an
+    :class:`Entity`. Every *evaluator-internal* consumer goes through
+    :func:`is_error`, which handles both — so the split stayed invisible right
+    up to the boundary where a value stops being compute-internal.
+    """
+    if isinstance(v, Entity):
+        data = v.data
+    elif isinstance(v, dict):
+        data = v.get("data", v)
+    else:  # pragma: no cover — is_error() gates every caller
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def error_to_wire(v: Any) -> dict[str, Any]:
+    """A `compute/error` in **wire form** — a plain ``{type, data}`` dict —
+    from either representation.
+
+    Use at every compute→non-compute crossing that returns an error. The
+    `Entity` form is the one that bites: it is not a dict, so the protocol's
+    ``_as_entity`` shim wraps it as `primitive/any` with an `Entity` as the
+    payload, and the CBOR encoder raises `CBOREncodeTypeError: cannot
+    serialize type Entity` — killing the inbound handler task. The peer then
+    answers *nothing*, so the caller sees an i/o timeout rather than a
+    diagnostic, which is the worst shape a failure can take: it looks like a
+    network problem and is a serialization one.
+
+    That was a real cross-impl finding (`entity-core-go` 2026-08-15-d), and it
+    was invisible to this repo's own suite because every pre-existing
+    error-propagation test triggers errors with *unresolvable hashes* — which
+    mint the dict form and never exercise the `Entity` one.
+
+    **Not the same boundary as** :func:`error_materialized`: this is the
+    *in-flight / dispatch* form (§2.4 permits the diagnostics here), that one is
+    the *content-addressed* form (`code` alone).
+    """
+    return {"type": "compute/error", "data": error_data(v)}
+
+
+def error_materialized(v: Any) -> Entity:
+    """A `compute/error` in **materialized** form — content over `code` alone
+    `[MUST]` (§2.4), from either representation.
+
+    Use at every site where an error is **written**: the §7.2 `result_path`
+    (including the frozen-subgraph write) and the SA-9 `store` builtin. §2.4
+    calls those the only surfaces its code-only content-hash rule governs.
+
+    `message`, `at`, and `expression` are diagnostic-only and MUST NOT enter the
+    bytes V7 content-addresses: `message` is unpinned prose, `at` is an
+    impl-dependent attribution point, and `expression` is whichever
+    sub-expression an impl chose to blame — so if any of the three entered the
+    hash, two conformant peers writing the *same* error to the *same* path would
+    produce *different* entity hashes, breaking AE-1 materialized-boundary
+    equivalence, content dedup, sync, and any reactive consumer keyed on the
+    result hash. Two errors with the same `code` **are** the same materialized
+    entity.
+
+    Distinct from :func:`error_to_wire`, which is the *in-flight* crossing (the
+    F10 status-200 error-as-value return) where the diagnostics MAY appear. One
+    value, two boundaries, two answers — and the call site picks by asking
+    whether the bytes get content-addressed.
+    """
+    return Entity(type="compute/error", data={"code": error_data(v).get("code", "")})
 
 
 def make_error(
@@ -828,6 +919,40 @@ def _eval_apply_handler(
             "compute/apply handler mode requires operation",
         )
 
+    # §2.1 Q23 `[MUST]` — ruled 2026-08-16 (arch `7fdeea7`,
+    # ROUTING-2026-08-16-i; all three seats changed). **A builtin-path apply
+    # carrying `capability` or `resource` is `invalid_expression`.** Both fields
+    # are defined *only* as parameters of the dispatched EXECUTE, and a
+    # `system/compute/builtins/*` path evaluates inline (§3.5) dispatching no
+    # EXECUTE — so neither has a referent here.
+    #
+    # **Reject, never ignore**, and the direction is the point: the dual-check
+    # can only ever NARROW, so a caller supplying a capability is asking for
+    # *less* than ambient authority. Dropping it silently runs the operation
+    # WIDER than asked — on `store`, the one impure builtin (§6.2), writing to a
+    # caller-specified path. Nothing legitimate is lost: §6.2 fixes store's
+    # authority at `check_write_permission`/the installation grant, never at a
+    # field on the expression.
+    #
+    # **Placed EARLY — before the fields are evaluated — deliberately.** §4.1's
+    # pseudocode puts this block *after* resource evaluation, so a builtin apply
+    # with an error-valued `resource` would return that error instead of
+    # `invalid_expression`. All three per-seat actions in ROUTING-i reject
+    # early, and go landed it early (`ext/compute/eval_apply.go`,
+    # `evalApplyHandler`); go filed the ordering as spec-issue 2026-08-16-d.
+    # This is structural-check-before-runtime, and it is what keeps the three
+    # byte-identical — do not "correct" it toward the pseudocode.
+    #
+    # Subsumes F5 on the builtin path: a capability-only builtin apply lands
+    # here with the same `invalid_expression`, so no separate F5 fix is owed.
+    if path.startswith(BUILTIN_PREFIX) and (
+        data.get("capability") is not None or data.get("resource") is not None
+    ):
+        return make_error(
+            ERR_INVALID_EXPRESSION,
+            "compute/apply on a builtin path MUST NOT carry capability or resource",
+        )
+
     args = data.get("args") or {}
 
     # Inline-equivalent builtin aliases (§3.5, SA-COMPUTE-V314-2): synthesize the
@@ -838,16 +963,41 @@ def _eval_apply_handler(
     if path in _INLINE_ALIAS_BUILTINS:
         return _eval_inline_alias(path, args, scope, budget, ctx)
 
+    # §2131 error short-circuit, and its one boundary `[MUST]` — ruled
+    # 2026-08-16 (arch `662e409`, ROUTING-2026-08-16-f; go was correct, py and
+    # rust changed). **An apply short-circuits on the operands it *consumes*:
+    # `resource`, `capability`, and closure args bound to params. A builtin's
+    # WRITE PAYLOAD is not a consumed operand.** SA-9 `store`'s `value` is
+    # handed opaquely to the write site and materialized there under §2.4 — its
+    # fields are never *read*, which is the hazard the short-circuit rule exists
+    # to prevent, so the rule does not reach it. Two narrower things still
+    # short-circuit and are deliberately outside this exemption:
+    #   - `store`'s `path`, which IS consumed (read as a string);
+    #   - an unresolvable `value` hash, which is a resolution failure rather
+    #     than an error *value* the caller asked to store (matches go's
+    #     `resolveOrError` propagating before `Evaluate`).
+    write_payload = ("value",) if path == BUILTIN_STORE else ()
+
     # Evaluate args in canonical order
     resolved_args: dict[str, Any] = {}
     for name, h in canonical_sorted(args):
         if not isinstance(h, bytes):
             return make_error(ERR_INVALID_EXPRESSION, f"Arg {name} is not a hash reference")
-        target = ctx.resolve_or_error(h, f"arg {name}")
-        if is_error(target):
+        is_write_payload = name in write_payload
+        # `resolve_or_error` folds two outcomes into one `is_error`: a
+        # resolution FAILURE (a minted not_found) and a successfully resolved
+        # `compute/error` LITERAL. For a consumed operand those are the same
+        # thing — both short-circuit — which is why the conflation was
+        # invisible. For the write payload they are opposites, so resolve
+        # directly and keep them apart: `None` is the failure, anything else is
+        # a value the caller asked to store.
+        target = ctx.resolve(h)
+        if target is None:
+            return make_error(ERR_NOT_FOUND, f"Cannot resolve hash for arg {name}")
+        if is_error(target) and not is_write_payload:
             return target
         value = evaluate(target, scope, budget, ctx)
-        if is_error(value):
+        if is_error(value) and not is_write_payload:
             return value
         resolved_args[name] = value
 
@@ -1190,17 +1340,34 @@ def _eval_builtin_store(args: dict[str, Any], ctx: EvalContext) -> Any:
     wrapped in a `primitive/any` entity (the wire shape primitives use); an
     entity-typed value is written as-is. When no dispatcher is wired (e.g. a
     bare eval context in a unit test), falls back to a direct, capability-gated
-    tree write.
+    tree write — which returns the same `system/tree/put-result` shape the
+    dispatch does, so store has **one** return shape rather than one per path.
+
+    **A `compute/error` `value` is written, code-only, and the store succeeds**
+    `[MUST]` (§2131's SA-9 worked example, ruled 2026-08-16). It is not
+    propagated: see the short-circuit note in `_eval_apply_handler` for why the
+    write payload sits outside that rule, and :func:`error_materialized` for why
+    only `code` reaches the bytes.
     """
     path_val = args.get("path")
     value = args.get("value")
     if not isinstance(path_val, str):
         return make_error(ERR_TYPE_MISMATCH, "store path must be a string")
 
-    # v3.19c α: a tree write is a compute→non-compute crossing — materialize
-    # the value to its bare wire form first (identity for an already-bare entity
-    # or a primitive), so what lands in the tree is a normal bare entity.
-    value = _materialize_bare(value, ctx)
+    if is_error(value):
+        # The SA-9 half of §2.4's materialization surface — the imperative
+        # analog of the §7.2 `result_path` write. `is_error` is kind-based, so
+        # **both** in-language representations land here identically: a minted
+        # dict from `make_error`, and an `Entity` from an SA-1 literal or a
+        # lookup onto a stored error. That split is exactly what went uncovered
+        # at the wire crossing (see `error_to_wire`) — one answer, both forms.
+        value = error_materialized(value)
+    else:
+        # v3.19c α: a tree write is a compute→non-compute crossing — materialize
+        # the value to its bare wire form first (identity for an already-bare
+        # entity or a primitive), so what lands in the tree is a normal bare
+        # entity.
+        value = _materialize_bare(value, ctx)
 
     # Coerce the value to an entity {type, data}. Entity-typed values pass
     # through; bare primitives are wrapped in primitive/any.
@@ -1224,11 +1391,19 @@ def _eval_builtin_store(args: dict[str, Any], ctx: EvalContext) -> Any:
     entity = Entity(type=ent_dict["type"], data=ent_dict["data"])
     if ctx.emit_pathway is not None:
         from entity_core.storage.emit import EmitContext
-        ctx.emit_pathway.emit(path_val, entity, EmitContext(source="handler"))
+        emit_result = ctx.emit_pathway.emit(path_val, entity, EmitContext(source="handler"))
+        written_hash = emit_result.hash
     else:
-        h = ctx.content_store.put(entity)
-        ctx.entity_tree.set(path_val, h)
-    return value
+        written_hash = ctx.content_store.put(entity)
+        ctx.entity_tree.set(path_val, written_hash)
+    # Same shape the dispatch path returns (`system/tree:put`'s put-result), so
+    # a successful store never evaluates to an error just because the value it
+    # wrote was one — the divergence that a per-path return shape would smuggle
+    # back in on the very rule this function implements.
+    return {
+        "type": "system/tree/put-result",
+        "data": {"path": path_val, "hash": written_hash},
+    }
 
 
 def _eval_inline_alias(
@@ -2121,6 +2296,41 @@ def _audit_walk(
         apply_path = entity.data["path"]
 
         if apply_path.startswith(BUILTIN_PREFIX):
+            # §2.1 Q23 install-time `[MUST]` — ruled 2026-08-16 (arch
+            # `67708b1`, ROUTING-2026-08-16-j) on go spec-issue 2026-08-16-e.
+            # A builtin-path apply carrying `capability`/`resource` is
+            # `invalid_expression` (see the eval-time rejection in
+            # `_eval_apply_handler`), and where `path` is a **static literal**
+            # under the builtin prefix — which it is here, the walker reads it
+            # straight off the entity — the whole condition is decidable
+            # without evaluating anything. So the audit MUST reject it, on the
+            # same conservative-static/dynamic-runtime split §2.1 already
+            # applies to `store` builtin paths. A dynamic path is not knowable
+            # until evaluation and the runtime rejection is its whole
+            # enforcement.
+            #
+            # SHAPE check: `path` plus the PRESENCE of the fields, never their
+            # values — nothing is resolved here, deliberately.
+            #
+            # It runs BEFORE the write_path collection below and subsumes F5 on
+            # this branch, exactly as the eval-time rejection subsumes F5 at
+            # runtime: capability-only was the one shape F5 would have caught,
+            # while capability+resource and resource-only installed clean —
+            # the gap the ruling closes. An audit that fail-fasts F5 while
+            # installing this shape clean is internally inconsistent.
+            if (
+                entity.data.get("capability") is not None
+                or entity.data.get("resource") is not None
+            ):
+                result.static_errors.append({
+                    "code": ERR_INVALID_EXPRESSION,
+                    "message": (
+                        "compute/apply on a builtin path MUST NOT carry "
+                        "capability or resource"
+                    ),
+                })
+                return
+
             # SA-11 (§3.3): pure builtins (map/filter/fold + the inline-equivalent
             # arithmetic/compare/logic/field/construct) make no tree or capability
             # access, so they need NO install-time handler-target authorization.
@@ -2390,10 +2600,11 @@ def _unwrap_entity_native_result(result: Any) -> dict[str, Any]:
       - anything else    → return unchanged (lists, plain dicts; the wire-side
                             ``_as_entity`` shim normalizes these on egress)
     """
-    if isinstance(result, dict) and result.get("type") == "compute/error":
-        return {"status": 200, "result": result}
-    if isinstance(result, Entity) and result.type == "compute/error":
-        return {"status": 200, "result": result.to_dict()}
+    # One shape for an error leaving compute, whichever crossing it leaves by
+    # and whichever representation it arrived in (this path already handled
+    # both; `error_to_wire` is now the single answer the other two share).
+    if is_error(result):
+        return {"status": 200, "result": error_to_wire(result)}
 
     if isinstance(result, dict) and result.get("type") == "compute/result":
         result = result.get("data", {}).get("value")
@@ -2532,7 +2743,10 @@ async def _handle_eval(
     # is reserved for failures of the dispatch itself — not-found, malformed,
     # not-a-compute-expression, ambiguous resource (all handled above).
     if is_error(result):
-        return {"status": 200, "result": result}
+        # Wire form for BOTH representations — a stored `compute/error` literal
+        # arrives here as an `Entity`, and returning it raw is what raised
+        # CBOREncodeTypeError at the encoder and dropped the connection.
+        return {"status": 200, "result": error_to_wire(result)}
 
     if isinstance(result, Entity):
         return {"status": 200, "result": result.to_dict()}
@@ -3031,8 +3245,16 @@ def _re_evaluate(
     result_path = subgraph.data.get("result_path", f"{expression_uri}/result")
 
     if is_error(result):
-        error_data = result.get("data", result) if isinstance(result, dict) else result
-        error_entity = Entity(type="compute/error", data=error_data)
+        # §7.2: an error materializes where it is WRITTEN — this is the
+        # `result_path` write, one of the two sites where that happens (SA-9
+        # `store` is the other). `error_materialized` unwraps both
+        # representations (the `Entity` form previously fell through as the
+        # whole entity and became `data`, so compute_hash() hit the same encoder
+        # failure as the eval return path) **and** strips to `code` alone: this
+        # is a content-addressed write, and `message`/`at` are impl-private
+        # prose that would fork the result hash between two conformant peers
+        # writing the same error (§2.4).
+        error_entity = error_materialized(result)
         error_hash = error_entity.compute_hash()
         old_error_hash = ep.entity_tree.get(result_path)
         if old_error_hash != error_hash:
@@ -3075,9 +3297,14 @@ def _freeze_subgraph(
     from entity_core.storage.emit import EmitContext
 
     result_path = subgraph.data.get("result_path", f"{expression_uri}/result")
-    error_entity = Entity(
-        type="compute/error",
-        data={"code": error_code, "message": error_message, "at": expression_uri},
+    # §2.4: the frozen-subgraph error goes to the `result_path` — a materialized
+    # write, so code-only. `message` and `at` (the expression URI, which is
+    # peer-local) are diagnostics; carrying them here would give two peers
+    # freezing on the same cause two different result hashes.
+    error_entity = error_materialized(
+        {"type": "compute/error", "data": {
+            "code": error_code, "message": error_message, "at": expression_uri,
+        }},
     )
     ep.emit(result_path, error_entity, EmitContext(source="handler"))
 
