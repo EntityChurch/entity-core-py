@@ -51,6 +51,7 @@ from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.auth import create_identity_entity, create_signature_entity
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
+from entity_core.utils.ecf import ecf_encode
 from entity_handlers.registry_peerissued import make_reader
 from entity_handlers._common import (
     error_response as _error,
@@ -220,11 +221,20 @@ NAME_TRANSMITTING_KINDS = frozenset({
 #: Last surfaced resolver-config hash, per peer — see `_surface_config_diagnostic`.
 _last_surfaced_config: dict[str, bytes | None] = {}
 
-# An **unscoped name** is a bare name carrying no explicit authority marker —
-# `alice`, as opposed to `alice@example.com`, `alice.eth` or `did:web:alice`.
-# These three bytes are the markers the spec's own §4.1a rows key on (`*@*.*`
-# → DNS-style handles, `*.eth` → ENS, `did:web:*` → did:web).
-_AUTHORITY_MARKERS = frozenset(".@:")
+# An **unscoped (bare) name** carries none of the three scope markers
+# `guides/GUIDE-RESOLUTION.md` §6.2 defines — an `@authority`, a `scheme:`
+# prefix, or an **enumerated** typed suffix. `alice` is bare;
+# `alice@example.com`, `did:web:alice` and `alice.eth` are scoped.
+
+#: §4.1b.1 `[v1.19]` — the typed suffixes that make a pattern narrow under
+#: classifier rule (d). **Deliberately short, and grows ONLY by spec revision
+#: `[MUST]`**: admitting a suffix declares that every name a user types ending
+#: in it may be handed to a third party, so it is not implementation-defined,
+#: not operator-extensible, and not inferable from the pattern's shape. An
+#: unrecognized suffix leaves the pattern **broad**, which is the fail-safe
+#: direction — the cost of a false positive is a rule the operator rewrites,
+#: against the cost of silently disclosing a namespace nobody reviewed.
+ENUMERATED_TYPED_SUFFIXES = (".eth",)  # ENS → consensus-anchored
 
 # trust_anchor variants (§2.4 — underscore enum form).
 TA_SELF_CERTIFYING = "self_certifying"
@@ -276,6 +286,32 @@ _OP_GET_POLICY = "get-issuer-policy"
 _OP_SET_RESOLVER_CONFIG = "set-resolver-config"
 _OP_GET_RESOLVER_CONFIG = "get-resolver-config"
 
+# §4.3 `[MUST, v1.19]` — the cap-check discriminator for
+# `system/capability/registry-pin`. **Not a dispatchable operation**: nothing
+# routes to it, and `registry_handler` does not answer it. It exists only as
+# the operation a pin-authority grant carries, and which `set-resolver-config`
+# checks the caller's capability against when the submitted `pinned_bindings`
+# differ from the stored ones.
+#
+# **Why the operation axis and not a resource path.** §5 names `registry-pin`
+# descriptively and fixes no encoding, so each seat must choose one — and
+# `pinned_bindings` is a *field inside* an entity `registry-configure` already
+# grants whole-entity authority over, so a resource-path split
+# (`…/resolver-config/pinned_bindings`) is covered by configure's own
+# `system/registry/*` and discriminates nothing. The operation axis is the one
+# that separates them, and it is the axis this handler already uses for the
+# same shape of split (`registry-issue-binding` → `approve-request` /
+# `deny-request`, §6a.9.3).
+#
+# **Matched to `entity-core-go` `cee6c55` deliberately, and it is not a
+# convergence claim.** The encoding is unspecified — go routed exactly that as
+# spec-issue `2026-08-20-a`, and the cost of a third encoding is that
+# `REG-DISPATCH-CONFIG-REFUSED-1` row 8 can never go on the wire: a shared
+# harness minting one seat's cap would answer `403 not_entitled` to a
+# **conformant** peer that checks another. Two seats agreeing is not a ruling;
+# it is two seats not making the vector worse while the ruling is pending.
+_OP_PIN_BINDINGS = "pin-bindings"
+
 SET_RESOLVER_CONFIG_REQUEST_TYPE = "system/registry/set-resolver-config-request"
 
 
@@ -323,55 +359,77 @@ def _load_local_name_config(ctx: HandlerContext) -> dict[str, Any]:
 
 
 def _pattern_reaches_unscoped_name(pattern: Any) -> bool:
-    """Can this dispatch pattern match a name the user typed **bare** — with no
-    authority they chose to disclose it to?
+    """§4.1b `[MUST, v1.19]` — is this dispatch pattern **BROAD**, i.e. can it
+    match at least one **bare** name (one the user typed with no authority
+    named)? A broad pattern naming a name-transmitting kind hands every bare
+    handle and every typo to a third party, which is what §4.1 step 2 forbids.
 
-    A pattern is **scoped (narrow)** only when it requires one of the three
-    shapes `§4.1a` ships as its non-catch-all rows, i.e. the shapes in which an
-    authority is actually pinned:
+    **Until v1.19 this predicate had no grammar**, and the four seats that
+    implemented it reached three answers. The ruled form is four conditions —
+    a pattern is **NARROW** if and only if at least one holds:
 
-    * an ``@``-authority anywhere — ``*@*``, ``*@*.*`` (rows 4-5): the *user*
-      names the authority inside the name;
-    * a ``:`` scheme prefix — ``did:web:*``, ``did:key:*`` (rows 1-2);
-    * a dotted **literal** suffix — ``*.eth`` (row 3): the *rule* names the
-      authority (ENS), and the star may not reach into it.
+    ===  =====================================================================
+    (a)  the pattern contains **no** ``*`` — it matches exactly one name, an
+         explicit routing decision the operator wrote out (``a.b``, ``alice``)
+    (b)  the pattern contains a literal ``@`` — every match carries an
+         ``@authority`` the user named (``*@*``, ``*@*.*``)
+    (c)  the literal head **before the first** ``*`` ends in ``:`` — every
+         match carries a ``scheme:`` prefix (``did:web:*``, ``did:key:*``)
+    (d)  the pattern ends in an **enumerated** typed suffix
+         (`ENUMERATED_TYPED_SUFFIXES`, §4.1b.1) with no ``*`` after it — every
+         match is in a naming system the user opted into by typing it
+         (``*.eth``)
+    ===  =====================================================================
 
-    Everything else is broad: the catch-all ``*``, a bare prefix ``a*``, a bare
-    literal, and — the row worth stating — ``*.*``, whose suffix is a star and
-    therefore pins no authority at all. This classifies §4.1a rows 1-5 narrow
-    and row 6 broad, which is the fixture that matters: **the recommended
-    default list contains the MUST, so a classifier that made row 3 broad would
-    make the list this spec SHOULD-ships violate its own rule.**
+    Otherwise BROAD. Worked against §4.1a's own rows — the check any
+    implementation should run first: ``did:web:*`` (c) · ``did:key:*`` (c) ·
+    ``*.eth`` (d) · ``*@*.*`` (b) · ``*@*`` (b) · ``*`` **broad**. The default
+    list this spec SHOULD-ships therefore satisfies the MUST that lives inside
+    it, which is the fixture that has to hold.
+
+    **Two of this peer's answers moved at the ruling, and they moved in
+    opposite directions — SA-PY-23 and SA-PY-24's neighbour.**
+
+    * ``a.b`` and ``alice`` were **broad** here and are **narrow** by (a). We
+      had no rule (a) at all: an exact literal was classified by the same
+      marker scan as a wildcard, so a pattern that can only ever match the one
+      name the operator typed was refused as a disclosure risk.
+    * ``*.lab`` was **narrow** here and is **BROAD** by (d), because ``.lab``
+      is not enumerated. This is the security-relevant half and the one the
+      ruling argues hardest: *"any literal at all"* is explicitly **not** the
+      line — ``.`` narrows almost nothing, since dotted bare names
+      (``billslab.com``) are ordinary local names under §6a. The line is
+      *"does the literal identify an authority or a naming system"*, which is
+      why the suffix set is enumerated rather than inferred.
+
+    ``*.*`` and ``*.e*`` stay broad, which is where SA-PY-23 landed: we had
+    already moved to the larger broad-set on §4.1's asymmetry argument before
+    the grammar existed, and the ruling agrees for its own reason (``.`` is
+    not a typed suffix; a trailing ``*`` means no fixed suffix).
 
     **Fail broad on anything unclassifiable** — `entity-browser-rust`'s
-    `is_broad` argument, which the cohort has adopted: *"a pattern we cannot
-    confidently classify is treated as broad, because calling a broad pattern
-    narrow is what leaks."*
-
-    **This is deliberately the conservative half of a live cross-impl
-    divergence — see SA-PY-23.** Until 2026-08-19 this peer classified on a
-    different and genuinely defensible argument: under the closed grammar every
-    name a pattern matches carries all of the pattern's literal bytes, so a
-    literal ``.``/``@``/``:`` anywhere means *every* match carries an authority
-    marker, making ``*.*`` and ``a.b`` scoped. `entity-core-go` classifies both
-    **broad**. §4.1a's default list cannot tell the two readings apart — every
-    row it carries is classified identically by both — so the divergence is
-    invisible to the one fixture the spec provides. We moved to the strictly
-    larger broad-set, on §4.1's own asymmetry argument: the false positive is a
-    visible edit with a documented override, and the false negative is
-    ``my.private.handle`` and every dotted typo going to a third party.
+    `is_broad` argument, adopted cohort-wide: *"a pattern we cannot confidently
+    classify is treated as broad, because calling a broad pattern narrow is
+    what leaks."* A non-string pattern is unclassifiable, so it is broad.
     """
     if not isinstance(pattern, str):
         return True
-    # An `@`-authority or a `:` scheme prefix: the name states where it goes.
-    if "@" in pattern or ":" in pattern:
+    # (a) no `*` — the pattern matches exactly one name.
+    if "*" not in pattern:
         return False
-    # `*.<literal>` — one leading star, then a dotted literal suffix the star
-    # cannot reach into. `*.*` does NOT qualify: its suffix is a star.
-    if pattern.startswith("*."):
-        rest = pattern[len("*."):]
-        if rest and "*" not in rest:
-            return False
+    # (b) a literal `@` — the user names the authority inside the name.
+    if "@" in pattern:
+        return False
+    # (c) the literal head before the first `*` ends in `:` — a scheme prefix.
+    # Scoped to the head on purpose: a `:` that only appears *after* a star is
+    # not a prefix the matching name is guaranteed to carry in scheme position.
+    if pattern[: pattern.index("*")].endswith(":"):
+        return False
+    # (d) ends in an ENUMERATED typed suffix, with nothing after it. `endswith`
+    # already carries the "no `*` after it" clause. An unenumerated suffix
+    # (`.lab`, `.com`) does NOT narrow — that is the whole point of §4.1b.1.
+    if pattern.endswith(ENUMERATED_TYPED_SUFFIXES):
+        return False
     return True
 
 
@@ -445,6 +503,39 @@ def _disclosure_violations(config: dict[str, Any]) -> list[str]:
                     f"(§4.1 step 2, door A)"
                 )
     return out
+
+
+def _pinned_bindings_differ(prior: Any, submitted: Any) -> bool:
+    """§4.3 `[v1.19]` — is the submitted `pinned_bindings` list **not**
+    byte-identical to the stored one?
+
+    The spec keys pin authority on *"a write that leaves the pin list
+    byte-identical needs only `registry-configure`"*, so the comparison is
+    **byte** equality under the same deterministic encoder that fixes the
+    config entity's own content hash — not a set comparison, not a
+    field-by-field diff. A reordering moves the hash, so a reordering is a
+    change; deciding otherwise would put this check's notion of "the same pins"
+    at odds with the identity of the bytes it is guarding.
+
+    Absent and empty are the same state (*no pins*) and neither needs pin
+    authority to remain so.
+
+    **An unencodable list is treated as changed**, which is the fail-safe
+    direction: we cannot prove it equal, and demanding pin authority for a
+    write we cannot classify costs an operator one grant while the other
+    direction hands the most privileged row in the file to the weaker
+    capability.
+    """
+    prior_list = prior if isinstance(prior, list) else []
+    submitted_list = submitted if isinstance(submitted, list) else []
+    if not prior_list and not submitted_list:
+        return False
+    if len(prior_list) != len(submitted_list):
+        return True
+    try:
+        return ecf_encode(prior_list) != ecf_encode(submitted_list)
+    except Exception:
+        return True
 
 
 def _surface_config_diagnostic(
@@ -2267,8 +2358,22 @@ async def _handle_set_resolver_config(
     conformance-driven at all. Identical hole to `registry-manage-issuer-policy`
     before §6a.9.2, one entity over.
 
-    Three MUSTs, and each has a row in the vector:
+    Four MUSTs, and each has a row in the vector:
 
+    * **A write that CHANGES `pinned_bindings` additionally requires
+      `system/capability/registry-pin`** `[MUST, v1.19]` — else `403
+      not_entitled`, nothing written. A byte-identical pin list needs only
+      `registry-configure`. **This is the enforcement point §5's capability
+      split never had:** both caps were declared as bare tree-writes against
+      one content-addressed entity, and an entity is written whole, so no layer
+      could tell *"edits pins"* from *"edits config"*. It matters because a pin
+      is the most privileged row in the file — §4.1 **step 1** returns it
+      *before* the step-2 disclosure filter and *before* the §6a.9.1 resolver
+      ceiling — so letting the less specific grant write it inverts the model.
+      We filed this as SA-PY-24 the day §4.3 landed and deliberately shipped no
+      local fix, because inventing the check would have refused a client
+      `entity-core-go` accepted; it is ruled at v1.19 and the check is now the
+      conformant behaviour rather than a local invention.
     * **Validate the WHOLE config before storing**, not the delta — §4.1 step 2
       against every rule and every chain entry.
     * **No partial application.** On refusal nothing is written and a following
@@ -2317,6 +2422,30 @@ async def _handle_set_resolver_config(
             "config.content_hash does not match ECF({type, data}) — refusing "
             "to store bytes under a hash the caller asserted (§1.8)",
         )
+
+    # §4.3 pin-delta `[MUST, v1.19]`, checked BEFORE the disclosure filter
+    # because it is an **authorization** verdict and that one is a policy
+    # verdict: a caller who may not touch the pins should be told so whether or
+    # not the rest of the config would also have been refused.
+    stored = _get_entity(ctx, RESOLVER_CONFIG_PATH)
+    prior_pins = (
+        stored.data.get("pinned_bindings")
+        if stored is not None and stored.type == RESOLVER_CONFIG_TYPE
+        else None
+    )
+    if _pinned_bindings_differ(prior_pins, config_data.get("pinned_bindings")):
+        cap = ctx.caller_capability if isinstance(ctx.caller_capability, dict) else {}
+        cap_data = cap.get("data") if isinstance(cap.get("data"), dict) else cap
+        if not check_handler_scope(
+            cap_data, REGISTRY_HANDLER_PATTERN, _OP_PIN_BINDINGS, ctx.local_peer_id,
+        ):
+            return _error(
+                403, "not_entitled",
+                "this set-resolver-config changes pinned_bindings, which "
+                "additionally requires system/capability/registry-pin (§4.3 "
+                "[MUST, v1.19]) — the presented capability carries "
+                "registry-configure but not pin authority; nothing was written",
+            )
 
     violations = _disclosure_violations(config_data)
     acknowledged = data.get("acknowledge_name_disclosure") is True

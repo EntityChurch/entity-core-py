@@ -33,18 +33,21 @@ named an act the corpus never defined.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import pytest
 
 from entity_core.crypto.identity import Keypair
 from entity_core.protocol.entity import Entity
 from entity_handlers.registry import (
+    ENUMERATED_TYPED_SUFFIXES,
     NAME_TRANSMITTING_KINDS,
     _pattern_reaches_unscoped_name,
 )
 
 from tests.integration.test_registry import (  # reuse the pinned harness
     _call,
+    _ctx,
     _emit_resolver_config,
     _emit_signed_binding,
     _peerissued_config,
@@ -97,45 +100,93 @@ async def _get_config(peer):  # noqa: F811
 
 
 class TestUnscopedReach:
-    """A pattern is **narrow** only when it pins an authority: an `@` the user
-    typed, a `:` scheme prefix, or a dotted **literal** suffix the star cannot
-    reach into. Everything else is broad."""
+    """§4.1b's classifier `[MUST, v1.19]` — **NARROW iff** (a) no `*`, (b) a
+    literal `@`, (c) the literal head before the first `*` ends in `:`, or (d)
+    the pattern ends in an **enumerated** typed suffix (§4.1b.1). Otherwise
+    BROAD, i.e. it can match at least one bare name."""
 
     @pytest.mark.parametrize("pattern,reaches", [
         ("*", True),                    # the catch-all, the usual door
-        ("", True),                     # matches only the empty name, still bare
-        ("alice", True),                # a literal bare name is still a bare name
         ("a*e", True),                  # stars take the empty run: `ae`
-        ("*.eth", False),               # §4.1a row 3: ENS — the rule pins ENS
-        ("*@*.*", False),               # §4.1a rows 4-5: the user pins the authority
-        ("did:web:*", False),           # §4.1a rows 1-2: scheme prefix
         ("*lab*", True),                # no marker anywhere ⇒ `lab` matches
+        ("*.eth", False),               # (d) §4.1a row 3: ENS, enumerated
+        ("*@*.*", False),               # (b) §4.1a rows 4-5: the user names it
+        ("*@*", False),                 # (b) §4.1a row 5
+        ("did:web:*", False),           # (c) §4.1a rows 1-2: scheme prefix
+        ("did:key:*", False),           # (c)
     ])
     def test_the_rows(self, pattern, reaches):
         assert _pattern_reaches_unscoped_name(pattern) is reaches
 
-    @pytest.mark.parametrize("pattern", ["*.*", "*.e*", "a.b", "alice.eth"])
-    def test_the_rows_where_this_peer_moved_and_a_sibling_did_not(self, pattern):
-        """**SA-PY-23 — the live cross-impl divergence, pinned as rows so it is
-        visible rather than latent.**
+    @pytest.mark.parametrize("pattern", ["did:web:*", "did:key:*", "*.eth",
+                                         "*@*.*", "*@*"])
+    def test_every_non_catch_all_row_of_the_shipped_default_is_narrow(self, pattern):
+        """**The fixture that has to hold, and the one to run first.** §4.1a is
+        a list this spec SHOULD-ships *and* the MUST lives inside it — so a
+        classifier that called any of rows 1-5 broad would make the recommended
+        default violate its own rule, and one that called row 6 narrow would
+        delete the rule. Row 6 is asserted broad in `test_the_rows`."""
+        assert _pattern_reaches_unscoped_name(pattern) is False
 
-        Until 2026-08-19 this peer classified on a different argument, and a
-        sound one: under the closed grammar every name a pattern matches
-        carries all of the pattern's literal bytes, so a literal `.` anywhere
-        means *every* match is dotted — making `*.*` and `a.b` scoped.
-        `entity-core-go` calls both **broad**. §4.1a's default list classifies
-        identically under both readings, so **the one fixture the spec ships
-        cannot tell them apart** — the shape this repo has now met four times.
+    @pytest.mark.parametrize("pattern,broad", [
+        ("*.*", True),      # `.` is not a typed suffix — `billslab.com` is bare
+        ("*.e*", True),     # trailing `*` ⇒ no fixed suffix
+        ("*.lab", True),    # `.lab` is NOT enumerated — MOVED, see below
+        ("a.b", False),     # (a) exactly one name — MOVED, see below
+        ("alice.eth", False),  # (a), and also (d)
+        ("alice", False),   # (a) — MOVED, see below
+        ("", False),        # (a) — no `*`, so exactly one name (the empty one)
+    ])
+    def test_the_rows_the_v1_19_ruling_moved(self, pattern, broad):
+        """**SA-PY-23 ruled — `EXTENSION-REGISTRY` §4.1b, v1.19.** The predicate
+        this file turns on had **no grammar** until then, and the seats reached
+        three answers from one sentence. Two of ours moved, in opposite
+        directions, and both are worth naming because the direction is the
+        interesting part:
 
-        We moved to the strictly larger broad-set on §4.1's own asymmetry
-        argument: a false positive is a visible edit with a documented override
-        (`acknowledge_name_disclosure`), and a false negative sends
-        `my.private.handle` and every dotted typo to a third party. `*.*` pins
-        no authority at all — its suffix is a star — which is the substantive
-        half; `a.b` is the residue, and it is the row we would still argue
-        about.
+        * **`a.b` / `alice` / `""` were BROAD here and are NARROW by (a).** We
+          had no rule (a): an exact literal went through the same marker scan as
+          a wildcard, so a pattern that can only ever match the single name the
+          operator typed out was refused as a disclosure risk. A false positive,
+          and the cheap direction to be wrong in — which is exactly why it
+          survived.
+        * **`*.lab` was NARROW here and is BROAD by (d)**, because `.lab` is not
+          in §4.1b.1's enumerated list. This is the security-relevant half. Our
+          reading was *"a dotted literal suffix the star cannot reach into pins
+          an authority"* — and the ruling argues the opposite at length:
+          *"any literal at all"* is **not** the line, because `.` narrows almost
+          nothing when `billslab.com` is a legal bare local name (§6a). The line
+          is *does the literal identify an authority or a naming system*, which
+          is why the suffix list is enumerated, MUST grow only by spec revision,
+          and makes an unrecognized suffix broad.
+
+        `*.*` and `*.e*` stay broad and are the rows we got right ahead of the
+        grammar — moved on §4.1's asymmetry argument (a false positive is a
+        visible edit with a documented override; a false negative is
+        `my.private.handle` going to a third party), which the ruling reaches by
+        its own route. **Being right about the answer is not being right about
+        the rule**, and it is the rule that decides `*.lab`.
         """
-        assert _pattern_reaches_unscoped_name(pattern) is True
+        assert _pattern_reaches_unscoped_name(pattern) is broad
+
+    def test_the_enumerated_suffix_list_is_exactly_what_the_spec_enumerates(self):
+        """§4.1b.1 `[MUST]` — one row, `.eth`. **Pinned as a row of its own
+        because growing this tuple is a privacy decision, not a config
+        change**: each entry declares that every name a user types ending in it
+        may be handed to a third party. Not implementation-defined, not
+        operator-extensible, not inferable. A seat that "helpfully" adds
+        `.sol` / `.crypto` fails here, which is the point."""
+        assert ENUMERATED_TYPED_SUFFIXES == (".eth",)
+
+    def test_a_scheme_colon_only_counts_in_the_head(self):
+        """Rule (c) is *"the literal head **before the first `*`** ends in
+        `:`"*, not *"a `:` appears somewhere"* — which is what this peer
+        checked before v1.19. The difference is only visible on a pattern
+        whose `:` sits behind a star, where the matching name carries no
+        guaranteed scheme position at all."""
+        assert _pattern_reaches_unscoped_name("*:x") is True
+        assert _pattern_reaches_unscoped_name("*.foo:bar") is True
+        assert _pattern_reaches_unscoped_name("did:web:*") is False
 
     def test_an_unclassifiable_pattern_fails_broad(self):
         """`entity-browser-rust`'s argument, now the cohort's: *"a pattern we
@@ -311,65 +362,312 @@ class TestSetResolverConfigRefusesDisclosure:
 
 
 # ===========================================================================
-# SA-PY-24 — the new operation writes a field §5 gives its own capability
+# Row 7 — the §4.1b classifier, driven through the write surface
 # ===========================================================================
 
 
-class TestSetResolverConfigAlsoWritesThePins:
-    """**A known gap, pinned as behaviour rather than left as prose** —
-    SA-PY-24, filed against §4.3 the day it landed.
+class TestTheClassifierOnTheWriteSurface:
+    """`REG-DISPATCH-CONFIG-REFUSED-1` **row 7** `[v1.19]`, the same five
+    patterns `entity-core-go`'s `v15` drives.
 
-    §5's capability table gives `pinned_bindings` **its own capability**
-    (`system/capability/registry-pin`, *"who may add or remove pins"*), separate
-    from `registry-configure`. §4.3's `set-resolver-config` is gated by
-    `registry-configure` alone and writes the **whole config**, pins included.
-    So the holder of the weaker capability can now mint pins.
-
-    **And pins are the stronger thing by a distance:** §4.1 step 1 returns a
-    synthesized pin *before* the step-2 dispatch filter and before any chain
-    entry, so a pin bypasses the name-disclosure control this whole file is
-    about **and** the §6a.9.1 resolver ceiling. The rows below demonstrate it
-    on one peer: under a config whose filter admits nothing, a bare name is
-    `chain_exhausted` and the pinned name resolves anyway.
-
-    **The separation was never enforceable, which is the more useful half.**
-    Before §4.3 both caps were declared as bare tree-writes against the *same*
-    content-addressed entity — and an entity is written whole, so no layer
-    could ever have distinguished "edits pins" from "edits config". §4.3 is the
-    first surface where the distinction could be made real (an authorization
-    check on the `pinned_bindings` delta) or honestly withdrawn. This peer does
-    neither on purpose: inventing the check locally would refuse a client
-    `entity-core-go` `5655494` accepts, which is a cross-impl divergence
-    manufactured out of a spec gap.
+    Every row here names `did-web` **with a `did-web` chain entry present**, so
+    the chain is constant and the *only* thing deciding accept-versus-refuse is
+    §4.1b's classification of the pattern. That is deliberate: the unit rows in
+    `TestUnscopedReach` prove the predicate, and these prove the predicate is
+    the one the **write path** actually consults. A peer can hold a correct
+    classifier and call it from nowhere — this repo's own fourth
+    validator-versus-consumer instance — and rows a-f above cannot see it,
+    because they all use `*`, which every candidate reading calls broad.
     """
 
     @pytest.mark.asyncio
-    async def test_a_configure_holder_can_write_pins_today(self, peer):  # noqa: F811
-        target = Keypair.generate().peer_id
-        cfg = _config(_chain("local-name"), [{"pattern": "nomatch", "backend_kinds": []}])
-        cfg.data["pinned_bindings"] = [{"name": "alice", "target_peer_id": target}]
+    @pytest.mark.parametrize("pattern,refused", [
+        ("*.*", True),
+        ("*.e*", True),
+        ("*.lab", True),     # the row that moved: `.lab` is not enumerated
+        ("*.eth", False),
+        ("a.b", False),      # the row that moved: no `*` ⇒ exactly one name
+    ])
+    async def test_row_7(self, peer, pattern, refused):  # noqa: F811
+        cfg = _config(
+            _chain("local-name", "did-web"),
+            [{"pattern": pattern, "backend_kinds": ["did-web"]}],
+        )
+        r = await _set_config(peer, cfg)
+        if refused:
+            assert r["status"] == 403, (
+                f"a BROAD pattern {pattern!r} naming did-web was accepted — it "
+                f"discloses every bare name matching it (§4.1b)"
+            )
+            assert r["result"]["data"]["code"] == "policy_rejected"
+        else:
+            assert r["status"] == 200, (
+                f"a NARROW pattern {pattern!r} was refused — it discloses "
+                f"nothing and §4.1b says it MUST be accepted"
+            )
 
-        assert (await _set_config(peer, cfg))["status"] == 200
+
+# ===========================================================================
+# Row 8 — SA-PY-24 ruled: the pin delta needs pin authority
+# ===========================================================================
+
+
+def _cap(*, pin: bool):
+    """A caller capability over this handler. `pin=False` is the
+    **configure-only** operator: everything §4.3 needs and no pin authority."""
+    ops: dict[str, Any] = {"include": ["*"]}
+    if not pin:
+        ops["exclude"] = ["pin-bindings"]
+    return {"grants": [{
+        "handlers": {"include": ["*"]},
+        "resources": {"include": ["*"]},
+        "operations": ops,
+    }]}
+
+
+async def _set_config_as(peer, config, cap, *, acknowledge=None):  # noqa: F811
+    """`set-resolver-config` under a specific caller capability — the seam the
+    blanket-`*` `_call` harness cannot reach."""
+    params: dict[str, Any] = {"config": config.to_dict(include_hash=False)}
+    if acknowledge is not None:
+        params["acknowledge_name_disclosure"] = acknowledge
+    h = peer.handlers.find_handler("system/registry")
+    ctx = _ctx(peer, remote="an-operator")
+    ctx.caller_capability = cap
+    return await h("system/registry", "set-resolver-config", {"data": params}, ctx)
+
+
+class TestSetResolverConfigPinDeltaRequiresPinCap:
+    """**SA-PY-24 — RULED, `EXTENSION-REGISTRY` §4.3 `[MUST, v1.19]`.**
+
+    We filed it the day §4.3 landed: §5 gives `pinned_bindings` its own
+    capability (`registry-pin`, *"who may add or remove pins"*), §4.3 gated the
+    whole-entity write on `registry-configure` alone, and an entity is written
+    whole — so the weaker grant minted pins. **And a pin is the strongest row in
+    the file:** §4.1 **step 1** returns it *before* the step-2 disclosure filter
+    and *before* the §6a.9.1 resolver ceiling, so it answers a name while
+    bypassing both of this extension's controls. A split that lets the less
+    specific grant write the more privileged row inverts the model.
+
+    **We shipped no local fix on purpose, and that was the right call.** The
+    filing pinned the gap as *behaviour* — one peer, one config, a bare name
+    `chain_exhausted` and the pinned name resolving anyway — and inventing the
+    delta check locally would have refused a client `entity-core-go` accepted,
+    manufacturing a cross-impl divergence out of a spec gap. It is ruled now, so
+    the check is conformance rather than invention, and the class flips from
+    *"here is the hole"* to *"here is the gate."*
+
+    **What is still unruled is the ENCODING**, and it is why row 8 is here and
+    not on the wire. §5 names `registry-pin` descriptively; no rule says how a
+    capability *expresses* pin authority. go models it as authority over the
+    operation `pin-bindings` and so do we — matching rather than converging,
+    because a shared harness minting one seat's encoding would answer `403` to a
+    **conformant** peer that checks another, which is a false red on the vector
+    rather than a finding. Routed by go as spec-issue `2026-08-20-a`; until it
+    rules, this behaviour is teeth-pinned in-tree by these rows.
+    """
+
+    @staticmethod
+    def _pinned(target, *, pattern="nomatch"):
+        cfg = _config(_chain("local-name"), [{"pattern": pattern, "backend_kinds": []}])
+        cfg.data["pinned_bindings"] = [{"name": "alice", "target_peer_id": target}]
+        return cfg
+
+    @pytest.mark.asyncio
+    async def test_a_configure_only_caller_cannot_add_a_pin(self, peer):  # noqa: F811
+        target = Keypair.generate().peer_id
+        r = await _set_config_as(peer, self._pinned(target), _cap(pin=False))
+        assert r["status"] == 403
+        assert r["result"]["data"]["code"] == "not_entitled"
+
+    @pytest.mark.asyncio
+    async def test_and_the_refusal_writes_nothing(self, peer):  # noqa: F811
+        """*"Refuse `403 not_entitled` and write nothing"* — the second half of
+        the MUST, and the half a check that only reads the status code cannot
+        see. A peer that refuses *after* storing has satisfied the code and
+        none of the property."""
+        target = Keypair.generate().peer_id
+        assert (await _get_config(peer))["status"] == 404
+        await _set_config_as(peer, self._pinned(target), _cap(pin=False))
+        assert (await _get_config(peer))["status"] == 404, (
+            "the refused write landed anyway — nothing means nothing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_caller_holding_both_may_write_the_pin(self, peer):  # noqa: F811
+        """The teeth control. Without it a peer that refuses *every*
+        `set-resolver-config` carrying pins passes the row above, and the
+        refusal would be attributable to the pins existing rather than to the
+        capability missing."""
+        target = Keypair.generate().peer_id
+        r = await _set_config_as(peer, self._pinned(target), _cap(pin=True))
+        assert r["status"] == 200, r
         assert (await _get_config(peer))["result"]["data"]["pinned_bindings"] == [
             {"name": "alice", "target_peer_id": target},
         ]
 
     @pytest.mark.asyncio
-    async def test_and_a_pin_short_circuits_every_control_in_this_file(self, peer):  # noqa: F811
-        """The teeth: same peer, same config, two names. The filter admits no
-        backend for either, so `chain_exhausted` is the honest answer — and the
-        pinned name resolves regardless, which is what makes the merged
-        capability a privilege escalation rather than a tidiness question."""
+    async def test_a_byte_identical_pin_list_needs_only_configure(self, peer):  # noqa: F811
+        """*"A write that leaves the pin list byte-identical needs only
+        `registry-configure`."* The discriminator is the **delta**, not the
+        presence of pins — a configure-only operator editing the chain of a
+        config that already carries pins must not be locked out of their own
+        config."""
         target = Keypair.generate().peer_id
-        cfg = _config(_chain("local-name"), [{"pattern": "nomatch", "backend_kinds": []}])
-        cfg.data["pinned_bindings"] = [{"name": "alice", "target_peer_id": target}]
-        assert (await _set_config(peer, cfg))["status"] == 200
+        assert (await _set_config_as(peer, self._pinned(target), _cap(pin=True)))["status"] == 200
+
+        # Same pins, a different dispatch list: configure alone suffices.
+        again = self._pinned(target, pattern="also-nomatch")
+        r = await _set_config_as(peer, again, _cap(pin=False))
+        assert r["status"] == 200, r
+        assert (await _get_config(peer))["result"]["data"][
+            "name_format_dispatch"
+        ] == [{"pattern": "also-nomatch", "backend_kinds": []}]
+
+    @pytest.mark.asyncio
+    async def test_removing_a_pin_is_a_change_too(self, peer):  # noqa: F811
+        """§5's `registry-pin` is *"who may add **or remove** pins"*. A check
+        written as *"are there pins in the submitted config"* passes every row
+        above and lets a configure-only caller **delete** the operator's pins —
+        which is the direction that reads as harmless and is not: a pin is what
+        an operator asserts *against* the resolver chain."""
+        target = Keypair.generate().peer_id
+        assert (await _set_config_as(peer, self._pinned(target), _cap(pin=True)))["status"] == 200
+
+        bare = _config(_chain("local-name"), [{"pattern": "nomatch", "backend_kinds": []}])
+        r = await _set_config_as(peer, bare, _cap(pin=False))
+        assert r["status"] == 403
+        assert r["result"]["data"]["code"] == "not_entitled"
+        assert (await _get_config(peer))["result"]["data"]["pinned_bindings"] == [
+            {"name": "alice", "target_peer_id": target},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_the_pin_still_short_circuits_every_control_in_this_file(self, peer):  # noqa: F811
+        """**Why the capability split is a privilege question and not a tidiness
+        one** — carried over verbatim from the filing, because the ruling did
+        not change this and it is the reason the gate exists. Same peer, same
+        config, two names: the filter admits no backend for either, so
+        `chain_exhausted` is the honest answer — and the pinned name resolves
+        regardless."""
+        target = Keypair.generate().peer_id
+        assert (await _set_config_as(peer, self._pinned(target), _cap(pin=True)))["status"] == 200
 
         pinned = (await _call(peer, "resolve", {"name": "alice"}))["result"]["data"]
         other = (await _call(peer, "resolve", {"name": "bob"}))["result"]["data"]
         assert other["status"] == "chain_exhausted"
         assert pinned["status"] == "resolved"
         assert pinned["peer_id"] == target
+
+    @pytest.mark.asyncio
+    async def test_the_pin_check_runs_before_the_disclosure_check(self, peer):  # noqa: F811
+        """**R-27 clause 4 `[MUST]` — the clause arch flagged as the open
+        question at this seat**, and we answer it here: authorize, then validate.
+
+        A config that violates **both** — an unauthorized pin delta *and* a broad
+        `did-web` row — answers `not_entitled`, never `policy_rejected`. We
+        shipped this ordering on our own argument (the two verdicts are different
+        kinds: one says *you may not*, the other says *this config may not*, and
+        telling an unauthorized caller to set `acknowledge_name_disclosure`
+        invites a retry no acknowledgement can authorize).
+
+        **The ruling's second reason is one we did not have, and it is the
+        load-bearing one:** §4.3's violation response is deliberately verbose —
+        *"every violation, not the first"* — so validating first hands a
+        **config-shaped disclosure to a caller who lacks the authority to change
+        anything**. The refusal leaks the shape of the stored configuration to
+        someone the peer is in the act of refusing. Ordering that was tidiness
+        under our argument is an information-disclosure control under theirs.
+        """
+        target = Keypair.generate().peer_id
+        cfg = self._pinned(target)
+        cfg.data["name_format_dispatch"] = [{"pattern": "*", "backend_kinds": ["did-web"]}]
+        r = await _set_config_as(peer, cfg, _cap(pin=False))
+        assert r["status"] == 403
+        assert r["result"]["data"]["code"] == "not_entitled"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_leaks_no_violation_list_to_an_unauthorized_caller(
+        self, peer,  # noqa: F811
+    ):
+        """The teeth for clause 4's *reason*, which the status code alone does
+        not carry. A peer could answer `not_entitled` and still attach the
+        violation list it computed — same code, same ordering as far as any
+        status assertion can see, and the disclosure happens anyway."""
+        target = Keypair.generate().peer_id
+        cfg = self._pinned(target)
+        cfg.data["name_format_dispatch"] = [{"pattern": "*", "backend_kinds": ["did-web"]}]
+        body = (await _set_config_as(peer, cfg, _cap(pin=False)))["result"]["data"]
+        assert "violations" not in body, (
+            "the authz refusal carried the config-shaped violation list — the "
+            "leak clause 4 exists to prevent"
+        )
+        assert "did-web" not in str(body.get("message", ""))
+
+    @pytest.mark.asyncio
+    async def test_pin_bindings_is_not_dispatchable(self, peer):  # noqa: F811
+        """**R-27 clause 2 `[MUST]`** — `pin-bindings` is a capability-check
+        discriminator and **MUST NOT** be an EXECUTE operation. Nothing routes to
+        it and it appears in no operation table.
+
+        Arch pinned this because *"it is the one place a seat could diverge into
+        a new wire surface"*: an operation name that is **checkable but not
+        callable** is unusual enough that a seat could reasonably wire it up, and
+        doing so adds an undeclared operation to the registry handler. We satisfy
+        it today by falling through to `404 unknown_operation` — which is
+        **correct by accident**, since nothing stops a later refactor from adding
+        a route beside the two §4.3 operations it sits next to. That is exactly
+        the shape this row exists to catch.
+        """
+        r = await _call(peer, "pin-bindings", {})
+        assert r["status"] == 404
+        assert r["result"]["data"]["code"] == "unknown_operation"
+
+    @pytest.mark.asyncio
+    async def test_the_delta_survives_an_unmodelled_key_on_a_pin(self, peer):  # noqa: F811
+        """**§4.3 says *byte-identical*, not *structurally equal* — and the
+        difference is a fail-open on the most privileged row in the file.**
+
+        `entity-core-rust` found this in `entity-core-go` (2026-08-20, fixed at go
+        `f44ed4d`): go's compare decoded `pinned_bindings` into a typed struct and
+        re-encoded it, which **silently drops any §4.2 forward-compat key a pin
+        carries** — so a config that adds or strips one reads as *"no change"* and
+        rewrites the pins under `registry-configure` alone.
+
+        **Arch's proposal §5 records that py "decodes to a native mapping and had
+        no field-drop". That is a claim about our repo, so it is checked here
+        rather than accepted** — a sibling reading our tree from outside can be
+        right about the defect and wrong about our shape, and this is the cheap
+        direction to verify. Python's decode is into `dict`, so unknown keys
+        survive and reach `ecf_encode`; the row proves it against the handler
+        instead of arguing it from the language.
+
+        Note what our comparison actually is: **the canonical encoding of the
+        decoded pins**, which is the same encoder that fixes the stored entity's
+        content hash. So *"equal"* means *"the stored pins' bytes would not
+        move"*, which is the property §4.3 is protecting.
+        """
+        target = Keypair.generate().peer_id
+        # Seed a stored pin carrying a key no schema models (§4.2 forward-compat).
+        seeded = self._pinned(target)
+        seeded.data["pinned_bindings"] = [
+            {"name": "alice", "target_peer_id": target, "future_key": "v2-only"},
+        ]
+        assert (await _set_config_as(peer, seeded, _cap(pin=True)))["status"] == 200
+
+        # Submit the SAME pin with the unmodelled key stripped, configure-only.
+        # A field-dropping compare sees "no change" and lets this through.
+        stripped = self._pinned(target)
+        r = await _set_config_as(peer, stripped, _cap(pin=False))
+        assert r["status"] == 403, (
+            "stripping an unmodelled key off a pin read as 'no change' — the "
+            "decode-round-trip fail-open rust found in go (§4.3 says "
+            "byte-identical, not structurally equal)"
+        )
+        assert r["result"]["data"]["code"] == "not_entitled"
+        assert (await _get_config(peer))["result"]["data"]["pinned_bindings"] == [
+            {"name": "alice", "target_peer_id": target, "future_key": "v2-only"},
+        ], "the unmodelled key did not survive storage, so the row above proves nothing"
 
 
 # ===========================================================================

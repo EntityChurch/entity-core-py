@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-19 (c) · public: v0.8.0 (master)_
+_Updated: 2026-08-20 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -37,6 +37,40 @@ on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev u
 Python 3.11–3.13 and `uv`.
 
 ## Where we left off
+
+**REGISTRY v1.19 is landed, and the conjunction we took was still an under-refusal (2026-08-20).**
+Arch ruled both of our routed registry items at **v1.19** (arch `9cffb14`/`b254845`), and
+`COHORT-OPEN-ITEMS` §0a makes them two of the five rows that close the **registry v1 release line**.
+Landed at `1d0f20c`: **R-15** — §4.1b's broad classifier rewritten to the ruled four-rule form
+(NARROW iff no `*` · a literal `@` · the literal head before the first `*` ends in `:` · it ends in
+an **enumerated** typed suffix, §4.1b.1 = exactly `.eth`); and **R-16** — `set-resolver-config` now
+diffs `pinned_bindings` and requires `system/capability/registry-pin` on a change, `403
+not_entitled` and nothing written otherwise, checked **before** the disclosure filter because an
+authorization verdict and a policy verdict are different kinds. R-11 row 7's five classifier
+patterns are driven on the write surface here; **row 8 stays off the wire**, concurring with go's
+spec-issue `2026-08-20-a` — §5 names `registry-pin` descriptively and fixes no *encoding*, so a
+shared harness minting one seat's cap would answer `403` to a **conformant** peer, a false red
+manufactured by the vector. We match go's `pin-bindings` operation-axis encoding, which is
+**matching, not converging**.
+
+**SA-PY-23 closes, and closes against us — the part worth reading.** We filed it claiming *"this one
+has no bug in it"*: two sound classifiers, enumerate the rows they disagree on, take the
+**conjunction**, file the ambiguity. Every step was right and **the conclusion was still an
+under-refusal**, because both seats shared a clause the ruling refuses — *"any literal at all" is
+not the line*, so `*.lab` handed every dotted bare name a user typed to a third party while reading
+as scoped. *A conjunction bounds the disagreement, not the error; the rows the readings agree on are
+exactly the rows nobody re-examines.* **SA-PY-24 closes in our shape** (option 1, verbatim) — the
+filing's no-local-fix call held for one day and was right, and its escalation row survives into the
+gate class unchanged. Four mutations, all caught. Full detail:
+`ROUTING-2026-08-20-registry-v1-19-is-landed-…`.
+
+**No citable conformance number this session, and that is a measurement, not an omission.** Another
+session on this host held a concurrent `validate-complete.sh` run (fixed ports), so a run started
+against it would collide and neither result would be citable. Local: `3931 passed · 31 skipped ·
+1 F`, the one failure being `tests/interop/test_connect_to_rust_peer` dialing a fixed
+`127.0.0.1:9000` held by unrelated Selenium containers — the fixed-port anti-pattern's fourth
+occurrence, not this diff. The previous number (`@ core-go 5655494`) **predates go's `v15` row 7**
+and therefore says nothing about R-15 either way; a fresh armed run from `1d0f20c` is owed.
 
 **§4.3 is built, the load-time normalizer is gone, and the new operation absorbed a capability
 nobody meant it to (2026-08-19 c).** Arch ruled SA-PY-21 Q1/Q2 and SA-PY-22 as one model (REGISTRY
