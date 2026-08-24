@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-05 · public: v0.8.0 (master)_
+_Updated: 2026-08-18 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -38,13 +38,130 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
+**The consolidated core-peer worklist is closed (2026-08-18 e).** `ROUTING-2026-08-18-o` §4 as
+amended by `-q` §3 — six rows, all landed and mutation-checked: REGISTRY **v1.13** direct (the
+renew cascade + terminal `403`, `max_ttl` REQUIRED on a live policy, register/renew clamp, and
+the resolver-side ceiling that is the half protecting the consumer) at `c65bfe2`;
+`REG-DISPATCH-GRAMMAR-1`'s closed name matcher at `c65bfe2`; **TYPE §4.6** onto core §5.4 at
+`1b8224a`; **REVISION**'s four-key specificity total order + §4.4.18 **V7** at `7e56047`;
+**HISTORY §6.2** key 3 at `af50d55`; and §4.1a rows 2/6, a no-op because we ship no default
+dispatch list. Both SAs filed yesterday came back **ruled in our favour** (SA-PY-12 at arch
+`86d6b20`, SA-PY-13 as the whole renew-cascade arc).
+
+**The citable number is `1596 · 1582 P · 14 W · 0 F · 0 S @ core-go `7747602``** — the real
+`validate-complete.sh`, all six passes exit 0, pass 2 `55/55` and pass 3 `31/31` (up from 28;
+core-go's three new TTL vectors pass on their first run against this peer).
+
+**The finding worth reading is SA-PY-17.** core-go's new `registry.v15_dispatch_grammar` failed
+against a 3828-test-green tree, and the failing row was not about the grammar: §4.1 step 2's
+dispatch filter narrows **per name** (union of the matching entries' kinds) and we implemented
+**per backend** (a kind named in no entry is always consulted), which is what step 2's own
+clarifying sentence says. The two agree on every configuration where the narrowed backend is in
+the chain — every fixture here. Ours made §4.1a's catch-all **MUST** inert: a name-transmitting
+backend simply left *out* of the list was consulted for every name, a larger disclosure than
+the one the MUST forbids. Adopted per-name on that argument. Four SAs filed today (SA-PY-14
+`name_constraints`' undefined glob · SA-PY-15 the resolver ceiling's missing site · SA-PY-16
+HISTORY §6.2's unreachable worked pair · SA-PY-17). Full detail:
+`HANDOFF-2026-08-18-c-…`; the acknowledge and the matcher census are in
+`ROUTING-2026-08-18-f-…`.
+
+The delta against go is **14 W to their 0 W**. Nine are the type-definition cluster, unchanged
+and ours to close. The tenth is new and points the other way: `registry/issuer-policy` differs
+because go declares `max_ttl` as `primitive/uint?` and we read §6a.9.1's schema block literally
+as required — routed for a same-day convergence.
+
+### Superseded — the four owed items landed (2026-08-18 d)
+**All four owed items are landed and py is back at the release bar.**
+`ROUTING-2026-08-18-i` §3's list is closed: §2.4's four glob forms + §4.4.17 **V6**
+(`1bedce3`), registry **D11 + D12** (`224ef5e` — py was the last seat), `log.since` →
+`log.start_at` (`1bedce3`), and D1–D5's filtered root verified with D5's missing vector added.
+Each is mutation-checked; all three oracle checks that named py now **PASS**.
+
+**The citable number is `1595 · 1582 P · 13 W · 0 F · 0 S @ core-go `18e24c3``** — the real
+`validate-complete.sh`, all six passes exit 0, superseding the stale `1594 @ 41ecf0b` below.
+go's bar is *zero failures **and** zero skips on passes 1, 2 and 3*; py meets it on all three
+(pass 2 `55/55`, pass 3 `28/28`). core-go's fixture blocker is fixed on their side.
+
+The remaining delta against go is **13 W to their 0 W**, and nine of those are one cluster:
+py's type definitions diverge from the spec's declared shape (`system/bounds.chain_depth`,
+`continuation/join.completion_deadline_ms`, `network/backoff-config.max_attempts`, …), plus
+`registry/revoke-request` carrying two fields nothing else declares. `open-type-tolerable`,
+hence WARN — but a type definition is content-addressed, so each is a type-hash divergence.
+**That cluster is the next work item.** The other four warnings are LOCAL-FILES (a Go-only
+extension, an expected scope gap), one SHOULD, and one observed-and-advancing probe.
+
+Two new SAs filed: **SA-PY-12** (§2.3 invokes `glob_match` on merge-config patterns while §2.4
+scopes it away from that call site — and we were evaluating it with `fnmatch`, non-conformant
+under both readings) and **SA-PY-13** (`renew-request` can still mint the null-ttl binding D11
+and D12 forbid; `entity-core-go` has it in the same shape, so left unfixed deliberately).
+Full detail: `HANDOFF-2026-08-18-b-…`.
+
+### Superseded — core-go's fixture generator blocked the complete suite (2026-08-18 c)
+`validate-complete.sh` aborts at step one, before any peer starts: their `d948b4f` added the
+CAP registry F2/D3 refusal of null-ttl peer-issued bindings, and their own `RESOLVE-1`
+happy-path fixture still mints one, so the generator's self-verify refuses its own output.
+Same shape arch just filed against workbench-go — a new gate landed without the fixture that
+feeds it being re-derived. Routed (`ROUTING-2026-08-18-d`). Fallback measurement via
+`validate-peers.sh` at core-py `dc8c308` / core-go `8623c76`: **1552 ran · 1504 P · 20 W ·
+0 F · 28 S — PARTIAL, 7 surfaces unexercised**, which their own banner says must not be cited
+as a conformance number; it supports only the narrow claim that the §2.4 exclude change
+regressed nothing. **The citable number stays `1594 · 1579 P · 15 W · 0 F · 0 S @ core-go
+41ecf0b`**, pinned and stale by arch's own rule. Good news in the same run:
+`continuations.join_target_received` is **PASS** again — we found the granter-frame divergence,
+arch ruled it our way, core-go fixed the fixture (`8623c76`), and it is green with both peers
+doing the stricter thing.
+
+**Arch ruled all four open questions; two are now code (2026-08-18 b).** `ROUTING-2026-08-18-c`:
+**SA-PY-9 yes** (§5.2's check binds every dispatch carrying a resource target — and our
+framing was wrong: §5.2 tests the *field*, not the door, so core-go's gap is a **dropped
+field**, not a reading split); **SA-PY-10 granter-framed**, our reading adopted whole, so the
+WARN against core-go's join fixture is ratified as correct and §5.5a already names the losing
+side non-conformant — the proximate cause is `EXTENSION-CONTINUATION` §3.5's worked example,
+which taught the fixture the wrong shape; **SA-PY-8 confirmed and larger** — §6.1 contradicts
+itself independently of any implementation, and a version's `root` MUST be the
+exclude-filtered trie on every path that emits one. **Adopted at `cc73a60`:**
+`compute_versioned_bindings` at `commit` (four call sites) *and* the filtered trie as the
+auto-version root, O(1) fast path kept — the half that mattered most, because suppressing the
+version *entry* for an excluded write never suppressed that path's contribution to the tracked
+root, so the exclude did not work at all, one write late. **SA-PY-7 answered back to arch with
+evidence:** the two `since` fields are a **behavioral** divergence, not prose —
+`fetch(since=v2)` returns `[v3]` and `log(since=v2)` returns `[v2, v1]`, disjoint sets, so it
+is a determinism pin. New: **SA-PY-11** — §2.4 names `glob_match` and never defines it, and
+the matcher is hash-determining (Go's `path.Match` `*` does not cross `/`; Python's `fnmatch`
+does), so the obvious tool in each language produces divergent version roots with no error.
+Suite 3686 / 34 skipped. See
+`ROUTING-2026-08-18-c-sa-py-7-answered-and-the-glob-is-wire-contract-to-arch.md`.
+
+**The in-process dispatch path is authorized on resources for the first time (2026-08-18).**
+§5.2 makes the dispatch-level resource check primary and the handler's own check secondary;
+`handle_execute` ran it and `_dispatch_local_execute` never did, so on a sub-dispatch the
+primary check was absent and the secondary one exists in **8 of the 70** non-`__init__`
+modules in `entity-handlers`. §6.2 assigns `system/handler:register`'s install-path
+authorization to exactly the missing check. **`entity-core-go` has the same gap**
+(`makeLocalExecute`, `core/protocol/local.go` — `Resource` nil in the `CheckPermission`
+literal); rust unverified. Fixed at `00b2c05`; the candidate rule *"a second dispatch path is
+a second boundary"* is **ratified**. Running the check then exposed a §5.5a granter-frame
+question on continuation `dispatch_capability`s that no peer had an opinion on because no
+peer was checking — filed as **SA-PY-10** and deliberately not tuned away, at the cost of one
+WARN against core-go's join fixture. Against core-go's `validate-complete.sh python`
+**@ core-go `41ecf0b`**: pass 1 `1594 · 1579 P · 15 W · 0 F · 0 S`, pass 1b (`--profile core`)
+`745 · 631 P · 11 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `27/27`, substitute `8/8` — every
+pass PASS, and core-go's new `subscriptions.events_vocabulary_filter` passes on its first run
+against this peer. Also corrected: the cohort record's **CAP-6a ingest ✅ for py at
+`70493c9`** was earned by the narrower probe, not by the peer — py was fail-open there and the
+refusal lands at `55016d9`; core-go's "~20s stall" was that fail-open's shadow, not a separate
+availability surface. See
+`HANDOFF-2026-08-18-the-in-process-dispatch-path-was-never-authorized.md`.
+
 **Both core-tier fail-opens closed; the full surface is green again (2026-08-17 h).**
 CAP-6a **ingest** (a received capability whose `expires_at` / `not_before` / `created_at`
 does not fit `uint64` was honored — under Python a bignum compares cleanly instead of
 failing to decode) and the V7 §5.2 **`peers` dimension** (parsed since V6.0, read by
 nothing, so every grant we issued authorized dispatch into any peer's namespace). Against
-core-go's `validate-complete.sh python`, live at this tree: **pass 1
-`1594 · 1580 P · 14 W · 0 F · 0 S` — PASS (with warnings)**. The peers fix took two
+core-go's `validate-complete.sh python`, live at this tree from a clean environment:
+**pass 1 `1594 · 1581 P · 13 W · 0 F · 0 S`, pass 1b (`--profile core`)
+`745 · 631 P · 11 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `27/27`, substitute `8/8` — every
+pass PASS.** The peers fix took two
 attempts; the first read the target peer after the dispatcher had stripped the peer segment
 and passed our tests while changing nothing, which is recorded in `AGENTS.md`. See
 `HANDOFF-2026-08-17-h-the-two-core-tier-fail-opens-are-closed.md`. Its §4.1 is worth

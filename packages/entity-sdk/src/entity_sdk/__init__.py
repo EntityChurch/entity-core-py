@@ -45,6 +45,11 @@ from entity_sdk.events import (
     TreeChangeStream,
     validate_watch_pattern,
 )
+from entity_sdk.handlers import (
+    HandlerRegistration,
+    HandlerSpec,
+    OperationSpec,
+)
 from entity_sdk.store import LocalStore
 from entity_sdk.subscription import (
     SUBSCRIPTION_PATTERN,
@@ -134,6 +139,9 @@ __all__ = [
     "validate_watch_pattern",
     # Level 0 surface (§6.5 — the naming carries the boundary)
     "LocalStore",
+    "HandlerSpec",
+    "OperationSpec",
+    "HandlerRegistration",
     # Connection (§7)
     "connect",
     "client_for_connection",

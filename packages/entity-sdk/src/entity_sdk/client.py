@@ -39,6 +39,12 @@ from typing import TYPE_CHECKING, Any
 from entity_core.sdk import Dispatcher, ExecuteRequest
 
 from entity_sdk.errors import raise_for_status
+from entity_sdk.handlers import (
+    HandlerBody,
+    HandlerRegistration,
+    HandlerSpec,
+    register_handler,
+)
 from entity_sdk.events import ChangeStream, validate_watch_pattern
 from entity_sdk.paths import ResolvedPath, resolve
 from entity_sdk.store import LocalStore
@@ -108,6 +114,7 @@ class EntityClient:
         local_peer_id: str,
         *,
         emit_pathway: Any | None = None,
+        peer: Any | None = None,
     ) -> None:
         if not local_peer_id:
             raise ValueError(
@@ -121,6 +128,12 @@ class EntityClient:
             if emit_pathway is not None
             else None
         )
+        # Held privately and never exposed. §11.6: "Direct access to the
+        # underlying handler dispatch index MUST NOT be part of the SDK's
+        # public API surface" — `register_handler` is the only mutation path
+        # and the handle it returns is the only way back out, so there is no
+        # `client.peer` accessor to reach `peer.handlers` through.
+        self._peer = peer
 
     @classmethod
     def for_peer(cls, peer: Any, dispatcher: Dispatcher) -> EntityClient:
@@ -129,6 +142,7 @@ class EntityClient:
             dispatcher,
             peer.keypair.peer_id,
             emit_pathway=peer.emit_pathway,
+            peer=peer,
         )
 
     @property
@@ -160,6 +174,41 @@ class EntityClient:
     def has_local_store(self) -> bool:
         """Whether :attr:`store` is available, without provoking the raise."""
         return self._store is not None
+
+    # -- §11.6 dynamic handler registration ----------------------------------
+
+    async def register_handler(
+        self, spec: HandlerSpec, body: HandlerBody,
+    ) -> HandlerRegistration:
+        """Register a language-native handler — §11.6, §16.1's last MUST row.
+
+        Couples the tree declaration (interface + handler + optional self-grant)
+        with the in-memory dispatch binding, in that order, with §11.6.4
+        compensation if any step fails. The returned handle's ``close()``
+        unregisters both sides and is idempotent; it is also an async context
+        manager, which is the idiom §11.6.2 asks Python for.
+
+        Local-only, and by construction rather than by policy — same shape as
+        :attr:`store`. §11.6's V1.0 level is L0 direct writes whose *"caller is
+        peer-owner code"*, and a client built over a ``Connection`` has no peer
+        to write to. The name will not change when V2.0 moves the declarative
+        half onto `system/handler:register`: §6.5's naming mandate is about one
+        operation existing at two levels simultaneously, which this never does.
+
+        Raises:
+            BadRequest: 400 ``invalid_handler_spec``.
+            Conflict: 409 ``pattern_collision``.
+            InternalError: 500 ``partial_registration_failure``.
+            RuntimeError: if this client has no local peer.
+        """
+        if self._peer is None:
+            raise RuntimeError(
+                "no local peer: this client was built over a connection, and "
+                "§11.6 registration writes tree entities and binds a "
+                "language-native callable — neither crosses a wire. Register "
+                "on the peer that will run the body."
+            )
+        return await register_handler(self._peer, spec, body)
 
     def resolve(self, path: str) -> ResolvedPath:
         """Resolve ``path`` against this client's local peer (§2.5)."""

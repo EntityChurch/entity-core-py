@@ -169,7 +169,7 @@ CONFLICT_MERGE_STATUSES = frozenset({"merged_with_conflicts", "would_conflict"})
 
 #: Spellings §4 carries that this boundary absorbs, per parameter. Named so the
 #: absorption is greppable when the ruling lands and it has to be retired.
-_ABSORBED_LOG_PARAMS = {"count": "limit", "cursor": "since"}
+_ABSORBED_LOG_PARAMS = {"count": "limit", "cursor": "start_at"}
 _ABSORBED_MERGE_PARAMS = {"theirs": "remote_version"}
 _ABSORBED_CONFIG_FIELDS = {"exclude_patterns": "exclude"}
 
@@ -645,28 +645,42 @@ class RevisionClient:
     async def log(
         self,
         limit: int | None = None,
-        since: bytes | None = None,
+        start_at: bytes | None = None,
         **absorbed: Any,
     ) -> LogPage:
-        """Walk the version DAG from HEAD, newest first.
+        """Walk the version DAG, newest first, from ``start_at`` or HEAD.
 
         Args:
             limit: Page size. §4 calls this ``count``; that spelling is
                 absorbed here, and passing it to a peer directly returns the
                 **whole DAG** rather than raising (SA-PY-5).
-            since: Where the walk relates to. **Read SA-PY-7 before paging on
-                this**: §4.4.2 documents it as "start after this version" while
-                §4.4.6 documents ``fetch``'s identically-named field as a stop
-                marker, and the two implementations split the same way — this
-                peer starts the walk *at* ``since`` (so it reappears as the
-                page's first element), `entity-core-go` walks from HEAD and
-                skips it. Use ``has_more`` plus the last hash you saw, and
-                expect to drop a duplicate.
+            start_at: **Inclusive** anchor — the walk begins AT this version
+                and proceeds toward older ones, so the anchor is the page's
+                first element. Page by passing the last hash you saw and
+                dropping the duplicate, or by ``has_more``.
+
+                This was ``since`` until SA-PY-7 was ruled. The field is not
+                renamed for taste: ``fetch`` still takes ``since`` and means
+                the opposite — an *exclusive* watermark walking toward *newer*
+                versions. Over one DAG the two returned **disjoint** sets, so
+                the collision was removed rather than adjudicated. Passing
+                ``since`` here raises rather than paging from somewhere else.
         """
+        if "since" in absorbed:
+            raise BadRequest(
+                400, "invalid_params",
+                "log() takes `start_at`, not `since` (SA-PY-7). `start_at` is "
+                "an inclusive anchor walking toward OLDER versions; `since` is "
+                "`fetch`'s exclusive watermark walking toward NEWER ones. One "
+                "name meant both and they returned disjoint sets — so the "
+                "spelling that survived on `log` is `start_at`.",
+            )
         kwargs = _absorb(
-            {"limit": limit, "since": since, **absorbed}, _ABSORBED_LOG_PARAMS, operation="log"
+            {"limit": limit, "start_at": start_at, **absorbed},
+            _ABSORBED_LOG_PARAMS,
+            operation="log",
         )
-        unknown = set(kwargs) - {"limit", "since"}
+        unknown = set(kwargs) - {"limit", "start_at"}
         if unknown:
             raise BadRequest(
                 400, "invalid_params", f"log() got unexpected arguments: {sorted(unknown)}"
@@ -674,8 +688,8 @@ class RevisionClient:
         data: dict[str, Any] = {"prefix": self._prefix}
         if kwargs.get("limit") is not None:
             data["limit"] = kwargs["limit"]
-        if kwargs.get("since") is not None:
-            data["since"] = kwargs["since"]
+        if kwargs.get("start_at") is not None:
+            data["start_at"] = kwargs["start_at"]
         body, included = _unwrap(await self._execute("log", _LOG_PARAMS, data))
         return LogPage(
             prefix=body.get("prefix", self._prefix),

@@ -4625,6 +4625,38 @@ class Peer:
         handler_pattern = resolved.pattern
         logger.debug("[dispatch:internal] handler matched: pattern=%s name=%s", handler_pattern, resolved.name)
 
+        # Step 2.2: §5.2 resource dimension. The wire path has run this since
+        # V7; this path accepted `resource_targets`, forwarded them into the
+        # child context, and consulted `grant.resources` nowhere — so on an
+        # internal sub-dispatch the check §5.2 calls *primary* was absent and
+        # the only thing left was the handler's own optional secondary check,
+        # which 7 of 76 handler modules implement. `system/handler:register` is
+        # the sharp end: §6.2 assigns the authorization of the install path to
+        # this check and the handler performs none, so a sub-dispatch could
+        # install a handler at any pattern its own grant did not name.
+        if resource_targets:
+            from entity_core.capability.checking import (
+                check_resource_scope,
+                granter_frame_peer_id,
+            )
+
+            if not check_resource_scope(
+                caller_capability, handler_pattern, operation, resource_targets,
+                None, self.peer_id,
+                granter_peer_id=granter_frame_peer_id(
+                    caller_capability, self.peer_id, self._resolve_identity_entity,
+                ),
+                target_peer=target_peer,
+            ):
+                msg = (
+                    f"Capability doesn't grant {operation} on resource targets"
+                )
+                logger.warning(
+                    "[dispatch:internal] resource scope denied: targets=%s",
+                    resource_targets,
+                )
+                return ExecuteResult(status=403, error=msg)
+
         # Step 2.5: resolve + validate the target handler's grant (shared).
         authorized = self._authorize_handler_grant(handler_pattern)
         if isinstance(authorized, _DispatchDenied):

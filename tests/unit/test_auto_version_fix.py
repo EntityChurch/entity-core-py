@@ -341,7 +341,7 @@ class TestValidateRevisionConfig:
         errors = validate_revision_config({
             "prefix": "/",
             "auto_version": True,
-            "exclude": ["system/**"],
+            "exclude": ["system/*"],
         })
         assert errors == []
 
@@ -350,11 +350,11 @@ class TestValidateRevisionConfig:
             "prefix": "/",
             "auto_version": True,
             "exclude": [
-                "system/revision/**",
-                "system/tree/root/**",
-                "system/tree/tracking-config/**",
-                "system/history/**",
-                "system/clock/**",
+                "system/revision/*",
+                "system/tree/root/*",
+                "system/tree/tracking-config/*",
+                "system/history/*",
+                "system/clock/*",
             ],
         })
         assert errors == []
@@ -364,10 +364,10 @@ class TestValidateRevisionConfig:
             "prefix": "/",
             "auto_version": True,
             "exclude": [
-                "system/revision/**",
-                "system/tree/tracking-config/**",
-                "system/history/**",
-                "system/clock/**",
+                "system/revision/*",
+                "system/tree/tracking-config/*",
+                "system/history/*",
+                "system/clock/*",
                 # omit system/tree/root/**
             ],
         })

@@ -42,6 +42,7 @@ from entity_handlers.history import (
     _prune_history,
     canonicalize_pattern,
     pattern_specificity,
+    _config_order_key,
 )
 
 
@@ -127,6 +128,98 @@ class TestPatternSpecificity:
 
     def test_exact_path_is_most_specific(self):
         assert pattern_specificity("/peer/docs/readme") > pattern_specificity("/peer/docs/*")
+
+    def test_the_worked_pair_that_separates_the_two_readings(self):
+        """§6.2 `[MUST, v1.7]` — `a/b/c/d` (4 literal, depth 4) beats
+        `a/*/c/*/e` (3 literal, depth 5).
+
+        The spec calls this pair out because an implementation gets it wrong
+        *silently*: under any "2 points per literal segment, 1 per wildcard"
+        scalar both score 8, and the winner is whichever the store listed
+        first. Key 1 decides it, and key 1 only decides it if the comparison
+        is a tuple.
+        """
+        assert (pattern_specificity("/p/a/b/c/d")
+                > pattern_specificity("/p/a/*/c/*/e"))
+
+    def test_key_3_breaks_a_tie_keys_1_and_2_cannot(self):
+        """`/*/a` and `/local/*` are each 1 literal segment at depth 2 — keys 1
+        and 2 tie exactly, and before key 3 the winner was whatever the store
+        yielded. **Lower bytes win**, and `*` is 0x2A against `l`, so `/*/a`
+        takes it.
+
+        Key 3 is a determinism tiebreak, not a third specificity heuristic. The
+        winner is not the "more specific-looking" pattern, and reading it as one
+        is how an implementation talks itself into reversing it.
+
+        **This is not §6.2's own worked pair, and that is a finding.** The
+        section offers `a/*/c` against `a/b/*` — but the matcher is core §5.4,
+        which has no mid-segment wildcard, so `a/*/c` is an *exact* pattern
+        matching the literal string `a/*/c` and nothing else. The two tie on
+        keys 1-2 and can never both match one path, so the pair that
+        illustrates the key cannot exercise it. Filed as SA-PY-16.
+        """
+        peer_wild, local_sub = "/*/a", "/local/*"
+        assert (pattern_specificity(peer_wild)[:2]
+                == pattern_specificity(local_sub)[:2])
+        assert _config_order_key(peer_wild) < _config_order_key(local_sub)
+
+    def test_the_specs_worked_pair_cannot_co_match(self):
+        """The control for the claim above: under §5.4, `a/*/c` matches only
+        its own literal spelling."""
+        from entity_core.capability.checking import matches_pattern
+
+        assert matches_pattern("/p/a/*/c", "/p/a/b/c") is False
+        assert matches_pattern("/p/a/*/c", "/p/a/*/c") is True
+
+    def test_the_key_is_a_function_of_the_pattern_alone(self):
+        """No clock, no store order, no local id — which is what makes two
+        peers select the same config."""
+        assert _config_order_key("/p/a/b/*") == _config_order_key("/p/a/b/*")
+
+
+class TestHistConfigSpecificity1:
+    """`HIST-CONFIG-SPECIFICITY-1` (REQUIRED) — the vector, driven through the
+    index rather than through the key function.
+
+    **Written in both insertion orders**, because a peer that ties resolves by
+    enumeration and will pass one order by luck. That instruction is in the
+    vector itself and it is the only part of it with teeth.
+    """
+
+    @staticmethod
+    def _index(local, *configs):
+        idx = _ConfigIndex(local)
+        for name, pattern, depth in configs:
+            idx.update(name, HistoryConfig(pattern=pattern, enabled=True,
+                                           max_depth=depth))
+        return idx
+
+    @pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+    def test_the_worked_pair_selects_the_same_config_in_either_order(self, order):
+        configs = [
+            ("literal", "a/b/c/d", 111),
+            ("deep", "a/*/c/*/e", 222),
+        ]
+        idx = self._index("p", *[configs[i] for i in order])
+        got = idx.find_config("/p/a/b/c/d")
+        assert got is not None and got.max_depth == 111
+
+    @pytest.mark.parametrize("order", [(0, 1), (1, 0)])
+    def test_the_key_3_tie_selects_the_same_config_in_either_order(self, order):
+        """The reachable key-3 tie: `*/a` (peer-wildcard, exact tail) and `*`
+        (local subtree) are each 1 literal segment at depth 2 once
+        canonicalized, and both match `/{local}/a`."""
+        configs = [
+            ("peer-wild", "*/a", 111),
+            ("local-all", "*", 222),
+        ]
+        idx = self._index("local", *[configs[i] for i in order])
+        got = idx.find_config("/local/a")
+        # `/*/a` vs `/local/*`: `*` (0x2A) sorts below `l`, so peer-wild wins.
+        assert got is not None and got.max_depth == 111, (
+            "keys 1 and 2 tie here — the winner came from enumeration order"
+        )
 
 
 # ============================================================================

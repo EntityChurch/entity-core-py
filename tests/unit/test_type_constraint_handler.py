@@ -449,19 +449,82 @@ class TestTypePattern:
         assert r["valid"] is True
         assert "unresolved" in r["reason"]
 
-    def test_double_star_glob(self):
-        ctx = _make_ctx()
-        entity = Entity(type="app/widgets/buttons/large", data={})
-        ctx.pathway.emit("app/things/foo", entity, EmitContext.bootstrap())
+    def test_the_subtree_form_crosses_slashes_at_any_depth(self):
+        """§4.6 `[ruled 2026-08-18]` — `prefix/*` is core §5.4's **subtree**
+        match, so one form reaches every depth.
 
-        # `app/widgets/**` matches both single-segment and multi-segment tails.
+        This test asserted a `**` before the ruling, and the pair below is why
+        that mattered: the old segment-scoped `*` matched `app/widgets/large`
+        and **not** `app/widgets/buttons/large`, so an author covering a
+        namespace had to reach for a token the corpus reserves nowhere — and
+        got two implementations' worth of disagreement about what it meant.
+        """
+        ctx = _make_ctx()
+        for path, type_name in (
+            ("app/things/shallow", "app/widgets/large"),
+            ("app/things/deep", "app/widgets/buttons/large"),
+        ):
+            ctx.pathway.emit(path, Entity(type=type_name, data={}),
+                             EmitContext.bootstrap())
+            r = _invoke(
+                "system/type/constraint/type-pattern", path,
+                {"pattern": "app/widgets/*"}, ctx=ctx.handler,
+            )
+            assert r["valid"] is True, f"{type_name} was not matched at depth"
+
+    def test_the_retained_slash_blocks_the_sibling_prefix(self):
+        """§5.4 keeps the `/` when it strips the `*`, which is what stops
+        `app/widget/*` matching `app/widgetry/x` — a subtree match, not a
+        string-prefix one."""
+        ctx = _make_ctx()
+        ctx.pathway.emit("app/things/sib", Entity(type="app/widgetry/x", data={}),
+                         EmitContext.bootstrap())
         r = _invoke(
-            "system/type/constraint/type-pattern",
-            "app/things/foo",
-            {"pattern": "app/widgets/**"},
-            ctx=ctx.handler,
+            "system/type/constraint/type-pattern", "app/things/sib",
+            {"pattern": "app/widget/*"}, ctx=ctx.handler,
+        )
+        assert r["valid"] is False
+
+    def test_double_star_is_not_a_token_and_matches_literally(self):
+        """`**` is reserved nowhere in this corpus. §5.4's vocabulary is exact
+        / subtree / match-all, so `app/widgets/**` is an *exact* pattern that
+        matches the type literally named `app/widgets/**` and nothing else.
+
+        Kept as a control row rather than deleted: the wrong reading is what
+        this peer shipped, and a test that fails loudly if it comes back is
+        worth more than its absence.
+        """
+        ctx = _make_ctx()
+        ctx.pathway.emit("app/things/foo",
+                         Entity(type="app/widgets/buttons/large", data={}),
+                         EmitContext.bootstrap())
+        r = _invoke(
+            "system/type/constraint/type-pattern", "app/things/foo",
+            {"pattern": "app/widgets/**"}, ctx=ctx.handler,
+        )
+        assert r["valid"] is False
+
+    def test_bare_star_matches_any_type(self):
+        ctx = _make_ctx()
+        ctx.pathway.emit("app/things/any", Entity(type="whatever/at/all", data={}),
+                         EmitContext.bootstrap())
+        r = _invoke(
+            "system/type/constraint/type-pattern", "app/things/any",
+            {"pattern": "*"}, ctx=ctx.handler,
         )
         assert r["valid"] is True
+
+    def test_a_bare_literal_is_exact_not_a_prefix(self):
+        """`anything else is an exact match` — `app/widgets` does not cover
+        `app/widgets/large`. An author wanting the subtree writes the `/*`."""
+        ctx = _make_ctx()
+        ctx.pathway.emit("app/things/x", Entity(type="app/widgets/large", data={}),
+                         EmitContext.bootstrap())
+        r = _invoke(
+            "system/type/constraint/type-pattern", "app/things/x",
+            {"pattern": "app/widgets"}, ctx=ctx.handler,
+        )
+        assert r["valid"] is False
 
 
 # ---------------------------------------------------------------------------

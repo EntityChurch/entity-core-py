@@ -22,7 +22,6 @@ Cross-impl interop notes:
 from __future__ import annotations
 
 import datetime as _dt
-import fnmatch as _fnmatch
 import logging
 import uuid as _uuid
 from typing import TYPE_CHECKING, Any
@@ -30,6 +29,7 @@ from urllib.parse import urlparse as _urlparse
 
 import re2 as _re2
 
+from entity_core.capability.checking import matches_pattern as _matches_pattern
 from entity_core.crypto.identity_file import base58_decode as _b58decode
 from entity_core.utils.ecf import ecf_encode as _ecf_encode
 from entity_handlers._common import error_response as _error
@@ -412,32 +412,6 @@ _FORMAT_CHECKERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def _glob_to_re2(pattern: str) -> str:
-    """Translate a `*`/`**` segment glob to an anchored RE2 regex.
-
-    Per §4.6: ``*`` matches one path segment, ``**`` matches zero or
-    more segments. Segments are separated by ``/``.
-    """
-    # Walk the pattern, expanding ** before * to avoid greedy ambiguity.
-    out: list[str] = []
-    i = 0
-    while i < len(pattern):
-        ch = pattern[i]
-        if ch == "*" and i + 1 < len(pattern) and pattern[i + 1] == "*":
-            # `**` — zero or more segments, including separators.
-            out.append("(?:[^/]+(?:/[^/]+)*)?")
-            i += 2
-            # Eat a trailing `/` so `**/foo` doesn't leave a stray `/`.
-            if i < len(pattern) and pattern[i] == "/":
-                out.append("(?:/)?")
-                i += 1
-        elif ch == "*":
-            out.append("[^/]+")
-            i += 1
-        else:
-            out.append(_re2.escape(ch))
-            i += 1
-    return "".join(out)
 
 
 def _validate_type_pattern(
@@ -462,13 +436,25 @@ def _validate_type_pattern(
             "reason": f"type_pattern: reference unresolved (pattern: {pattern})",
         }
 
-    # Glob → RE2 full-match.
-    regex = _glob_to_re2(pattern)
-    try:
-        compiled = _re2.compile(regex)
-    except _re2.error as exc:  # pragma: no cover
-        return {"valid": False, "reason": f"type_pattern: invalid pattern: {exc}"}
-    matched = compiled.fullmatch(referenced_type) is not None
+    # §4.6 `[ruled 2026-08-18]` — the matcher is `matches_pattern`
+    # (`ENTITY-CORE-PROTOCOL` §5.4), the protocol's single pattern rule, applied
+    # to the entity's TYPE NAME rather than to a tree path. Three forms and no
+    # others: bare `*` matches any type, `prefix/*` is a **subtree** match that
+    # crosses `/` at any depth, and anything else is exact.
+    #
+    # This was a hand-rolled segment glob until the ruling: `*` matched exactly
+    # one segment and `**` crossed them. Both are gone. The correction is not
+    # cosmetic — under the old reading `system/capability/*` matched
+    # `system/capability/grant-entry` and **not**
+    # `system/capability/path-scope/foo`, so a constraint an author wrote to
+    # cover a namespace silently admitted entities from its own subtree, and a
+    # `**` this corpus reserves nowhere was the only way to spell the form §5.4
+    # actually has.
+    #
+    # A constraint that must match one level only MUST enumerate its types (or
+    # use `one_of`) — §5.4's vocabulary is exact / subtree / match-all and
+    # carries no depth-limited form on purpose.
+    matched = _matches_pattern(pattern, referenced_type)
     return {
         "valid": matched,
         "reason": f"referenced type '{referenced_type}' must match: {pattern}",
@@ -527,12 +513,4 @@ __all__ = [
     "TYPE_CONSTRAINT_HANDLER_PATTERN",
     "type_constraint_handler",
     "_ecf_byte_equal_any",  # T4 narrowing uses this; intentionally exported.
-    "_glob_to_re2",
 ]
-
-
-# fnmatch is imported but only kept as a fallback marker; the glob
-# semantics in §4.6 differ enough from POSIX fnmatch that we hand-roll
-# the segment-aware translation above. Keeping the import suppresses
-# any future temptation to silently swap in fnmatch.translate.
-_ = _fnmatch

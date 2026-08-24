@@ -40,7 +40,6 @@ fix-in-place if the spec has a gap):
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 import unicodedata
 from typing import Any
@@ -504,14 +503,60 @@ def _anchor_accepted(accepted: list[str], trust_anchor: str) -> bool:
     return False
 
 
+def _resolver_ceiling(entry: dict[str, Any] | None) -> int | None:
+    """§6a.9.1 `[MUST when present, v1.11]` — the resolver's own local maximum.
+
+    **This is the half that protects the consumer.** §6a.3's entire argument is
+    about the consumer: a hostile byte-server withholds a revocation and `ttl`
+    bounds the exposure. A ceiling the *registry* enforces cannot protect a
+    consumer from that registry — a hostile issuer simply sets `max_ttl` high.
+    Only the party bearing the risk can bound it. This is the split DNS settled
+    decades ago: the authority sets the record's TTL, the resolver caps what it
+    will honor.
+
+    **Carried on the chain entry's `hints`, and the site is ours, not the
+    spec's.** §4's `resolver-config` schema declares no ceiling field and the
+    ruling names none — it says only *"a resolver MAY declare a local
+    maximum."* `hints` is declared `<opaque object | null>` / backend-specific
+    config and already carries `neg_ttl`, so this needs no new field on a
+    content-addressed type. Declaring one would move `system/registry/
+    resolver-config`'s type hash for a name no other seat would read — the
+    §6a.9.3 lesson about `approve-request`, where publishing a definition for
+    an unspecified name makes the divergence the publisher's. Filed as
+    SA-PY-15 so the site gets pinned rather than converged on by luck.
+
+    **A ceiling of `0` is dropped rather than honored.** Honored literally it
+    expires every binding instantly and the operator sees *"no binding for this
+    name"* — indistinguishable from a bad signature or a revocation. Ruled
+    upheld for `entity-browser-rust` at `6927500`.
+    """
+    if not entry:
+        return None
+    ceiling = (entry.get("hints") or {}).get("max_ttl")
+    if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
+        return ceiling
+    return None
+
+
 def _validate(
     ctx: HandlerContext,
     binding: Entity,
     trust_anchor: str,
     accepted: list[str],
+    local_max_ttl: int | None = None,
 ) -> str | None:
     """Substrate validation (§2.2 ``validate(r)`` / §5). Returns a rejection
-    ``reason`` string, or None if the binding is usable."""
+    ``reason`` string, or None if the binding is usable.
+
+    ``local_max_ttl`` is the resolver's own ceiling (`_resolver_ceiling`). It
+    bounds the **effective lifetime** used for the expiry check and is **never
+    written back** into the binding — the binding's bytes and content hash are
+    untouched, because this is a *use* bound and not a re-issue. A refactor
+    that ever rewrote the binding to carry the clamped value would move its
+    content address and every signature over it would stop verifying, which is
+    why the enforcement point asserts the hash is byte-identical clamped and
+    unclamped rather than asserting the clamped number.
+    """
     kind = binding.data.get("kind")
 
     # Receiver policy (trust-anchor filter).
@@ -558,6 +603,8 @@ def _validate(
     # expires (local-name / self-certifying). (REG-PEERISSUED-EXPIRED-1.)
     ttl = binding.data.get("ttl")
     issued_at = binding.data.get("issued_at")
+    if isinstance(ttl, int) and local_max_ttl is not None:
+        ttl = min(ttl, local_max_ttl)
     if isinstance(ttl, int) and isinstance(issued_at, int) and issued_at + ttl <= _now_ms():
         return "expired"
     return None
@@ -743,23 +790,125 @@ def _synthesize_pin_result(pin: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def name_glob_match(pattern: str, name: str) -> bool:
+    """`EXTENSION-REGISTRY` §4 — the **registry-local name matcher**, closed
+    grammar `[MUST, REGISTRY v1.13]`.
+
+    `*` matches any run of characters including none; **every other byte is a
+    literal** — `?`, `[`, `]`, `\\`, `.`, `:`, `@` and `/` match only
+    themselves. Any number of `*` is permitted (`*@*.*` is three and is row 4
+    of §4.1a). `/` is **not** a separator: a name is a flat string with no
+    segment structure, so `x*z` matches `x/y/z`. The match is anchored at both
+    ends; there is no substring form.
+
+    **This delegates to no library, deliberately.** `fnmatch` (what this was
+    until the v1.13 ruling) and Go's `path.Match` both give `?` and `[…]`
+    character-class meaning this grammar does not grant, and most stop `*` at a
+    `/`. *A matcher that merely omits those features and one that treats them
+    as literals are indistinguishable until a pattern carries one* — the same
+    argument that made `**` a rejection rather than an omission in
+    `EXTENSION-REVISION` §2.4, transplanted to a grammar where nothing is
+    rejected at all.
+
+    **No pattern is invalid here**, and that is a real difference from
+    REVISION's four forms: every string is well-formed because every non-`*`
+    byte is a literal, so a registry MUST NOT refuse a pattern for carrying
+    `?`, `[` or `\\`. There is no write-time validator to pair with this.
+
+    **Not `ENTITY-CORE-PROTOCOL` §5.4** (§4 states it outright): §5.4 governs
+    *paths*, where trailing `/*` is a subtree match and a leading `/*/` strips
+    a peer segment. A name has neither. Two matchers, two domains, and neither
+    confers a reading on the other.
+
+    Two-pointer greedy rather than a regex: it is the whole algorithm in
+    fifteen lines, it cannot backtrack pathologically on a pattern like
+    `*a*a*a*`, and it borrows no semantics from a regex dialect.
+    """
+    p = n = 0
+    star = -1          # index in `pattern` of the most recent `*`
+    resume = 0         # index in `name` to resume from when we backtrack to it
+    while n < len(name):
+        if p < len(pattern) and pattern[p] == name[n]:
+            p += 1
+            n += 1
+        elif p < len(pattern) and pattern[p] == "*":
+            star = p
+            resume = n
+            p += 1
+        elif star >= 0:
+            # Mismatch under an open `*` — let it swallow one more byte. `/`
+            # is not special, so this is where `x*z` reaches across `x/y/z`.
+            p = star + 1
+            resume += 1
+            n = resume
+        else:
+            return False
+    # Trailing `*`s may match the empty run; anything else must be consumed.
+    while p < len(pattern) and pattern[p] == "*":
+        p += 1
+    return p == len(pattern)
+
+
 def _dispatch_allows(
     config: dict[str, Any], name: str, backend_kind: str,
 ) -> bool:
-    """§4.1 step 2 — name_format_dispatch filter. A backend kind with NO
-    dispatch entry mentioning it is consulted always (match-all); a kind
-    that appears in some dispatch entry is consulted ONLY when a matching
-    entry's pattern matches the name. The primary privacy mechanism."""
+    """§4.1 step 2 — the `name_format_dispatch` filter. **Unruled, three-way
+    split, and this peer takes the fail-closed intersection.** SA-PY-17.
+
+    The rule here:
+
+    * An **empty** dispatch list filters nothing.
+    * Otherwise a backend is consulted **iff some entry whose `pattern` matches
+      the name names its kind.** A name matching several entries is eligible at
+      the **union** of their `backend_kinds` — §4 is explicit that this is a
+      *filter, not a routing table*: evaluation does not stop at the first
+      match, and precedence is `resolver_chain[].priority`, never row order.
+
+    **§4.1 step 2's second sentence has two clauses and they answer two edge
+    cases differently.** *"Backends without a `name_format_dispatch` entry
+    default to match all (no filtering); backends with one are consulted ONLY
+    when the pattern matches."*
+
+    | Edge case | go | rust | py |
+    |---|---|---|---|
+    | A — kind named by **no** entry, another entry matches the name | excluded | consulted | **excluded** |
+    | B — kind named by an entry, **no** entry matches the name | consulted | excluded | **excluded** |
+
+    We exclude in **both**, which is neither seat's position and is deliberately
+    the conjunction of their two exclusions rather than a vote:
+
+    * **Case A is the one that makes §4.1a's MUST real.** *"The catch-all MUST
+      NOT name a backend whose consultation transmits the queried name"* —
+      because *"the catch-all is the path every unscoped name takes."* If a kind
+      named in no entry is consulted anyway, that MUST is **evadable by leaving
+      a row out**: a `dns-txt` backend nobody mentioned sees every bare name a
+      user types. A normative privacy rule that omission bypasses is not the
+      intended reading. `entity-core-go` reaches this independently.
+    * **Case B has the text *and* the privacy argument on the same side.** The
+      second clause says *ONLY* when the pattern matches, and an operator who
+      scopes `dns-txt` to `*@*.*` has said in as many words that a bare handle
+      must not go there — consulting it for `alice` is the disclosure the row
+      was written to prevent. `entity-core-rust` reads it this way.
+    * The consequence is that a non-empty list with **no catch-all row**
+      resolves nothing. That is loud (`chain_exhausted`), not silent, and it is
+      §4.1 step 4's own posture: *"fail-closed; no silent fallback."*
+
+    **This peer was on rust's reading in both cases until 2026-08-18**, i.e.
+    fully per-backend. Case A was a real privacy hole and changing it was right.
+    Case B changed with it in the same commit on an argument that only covered
+    case A — corrected here. See `AGENTS.md`: an oracle failure that makes you
+    change behaviour is a claim about the rows it names, not about the ones the
+    same edit happens to touch.
+    """
     dispatch = config.get("name_format_dispatch") or []
-    mentioned = False
+    if not dispatch:
+        return True
     for entry in dispatch:
-        kinds = entry.get("backend_kinds") or []
-        if backend_kind in kinds:
-            mentioned = True
-            pattern = entry.get("pattern", "")
-            if fnmatch.fnmatchcase(name, pattern):
-                return True
-    return not mentioned
+        if backend_kind not in (entry.get("backend_kinds") or []):
+            continue
+        if name_glob_match(entry.get("pattern", ""), name):
+            return True
+    return False
 
 
 async def _meta_resolve(
@@ -810,10 +959,17 @@ async def _meta_resolve(
         if result is None or binding is None:
             continue
 
-        reason = _validate(ctx, binding, result["trust_anchor"], accepted)
+        # The resolver's own ceiling (§6a.9.1 v1.11) — applied to the expiry
+        # check AND to the `ttl` surfaced to the consumer, so a caller caching
+        # on the returned value inherits the same bound. Never written into
+        # `binding`: `result["binding"]` stays the unclamped content hash.
+        local_max = _resolver_ceiling(entry)
+        reason = _validate(ctx, binding, result["trust_anchor"], accepted, local_max)
         if reason is not None:
             last_reason = reason
             continue  # failed validation; try next (§2.2)
+        if local_max is not None and isinstance(result.get("ttl"), int):
+            result["ttl"] = min(result["ttl"], local_max)
         return result, backend_id, None
 
     # 4. Fail-closed on chain exhaustion (§4.1 step 4). A definitive
@@ -1104,6 +1260,31 @@ def _load_issuer_policy(ctx: HandlerContext) -> dict[str, Any] | None:
     return None
 
 
+def _clamp_to_policy_ceiling(ttl: int, policy: dict[str, Any] | None) -> int:
+    """§6a.9.1 `[MUST, v1.11]` — `effective = min(resolved, policy.max_ttl)`.
+
+    **Clamped, not refused**, and the reason is §6a.9.2's own: refusing bills a
+    well-formed request for a policy the requester cannot read, and teaches
+    requesters to probe for the ceiling. The clamp is silent to the requester by
+    design — the issued binding carries the clamped value, which is signed,
+    published and readable, so the disclosure is in the artifact rather than in
+    the response.
+
+    An absent `max_ttl` does not clamp. `set-issuer-policy` refuses to store a
+    live policy without one, so the only way to reach this is a policy seeded
+    out-of-band — and the spec pins no fail-closed answer for the ceiling the
+    way it does for a null `ttl` (§6a.9's D12 backstop). Inventing a refusal
+    here would be the implementation-chosen default that same paragraph
+    forbids, one field over.
+    """
+    if policy is None:
+        return ttl
+    ceiling = policy.get("max_ttl")
+    if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
+        return min(ttl, ceiling)
+    return ttl
+
+
 def _name_is_taken(ctx: HandlerContext, nfc_name: str) -> bool:
     """A peer-issued name is taken when its ``by-name`` pointer resolves to a
     binding that has NOT been revoked (a revocation frees the name, P7)."""
@@ -1346,13 +1527,58 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
 
     # name_constraints narrows EVERY mode when set (e.g. a registry that only
     # issues "*.lab" regardless of who asks).
+    #
+    # The matcher is §4's registry-local name matcher, and that is a CHOICE
+    # this spec does not make — §6a.9.1 declares the field as `<glob | null>`
+    # and defines the glob nowhere, while §4's v1.13 grammar is scoped "to this
+    # field" (`name_format_dispatch[].pattern`). Filed as SA-PY-14. We pick the
+    # one matcher this extension defines, over the same domain (a user-facing
+    # name string), rather than a stdlib whose rules no reading sanctions: this
+    # was `fnmatch` until the ruling landed one field away, and `fnmatch` grants
+    # `?` and `[…]` meaning nothing in the corpus grants anywhere. The decision
+    # is cross-impl-observable — it is whether a binding is issued at all — so
+    # it is a spec question, not a style one.
     constraint = policy.get("name_constraints")
-    if isinstance(constraint, str) and not fnmatch.fnmatchcase(nfc_name, constraint):
+    if isinstance(constraint, str) and not name_glob_match(constraint, nfc_name):
         return _error(403, "not_entitled", f"name {name!r} not permitted by name_constraints")
 
+    # TTL resolution runs BEFORE the manual-mode branch on purpose: the queued
+    # head records the terms the operator is being asked to approve, so an
+    # approval weeks later issues *those* terms rather than whatever the policy
+    # default happens to be at approval time.
     ttl = data.get("requested_ttl")
     if not isinstance(ttl, int):
         ttl = policy.get("default_ttl")
+
+    # D12 (§6a.9 [MUST]) — fail closed when the *stored* policy is already bad.
+    # D11 above binds `set-issuer-policy`; it cannot reach a policy seeded
+    # out-of-band by a CLI flag, written straight to the tree, or predating the
+    # rule — all three of which §6a.9.2's store-first resolution admits. So the
+    # backstop lives here, and it refuses **before** both the manual queue and
+    # the direct-issue path: "MUST publish nothing" means no binding *and* no
+    # queue entry.
+    #
+    # It MUST NOT substitute an implementation-chosen default either. That is
+    # the same mistake §6a.9.2 rejects one level up, where `get-issuer-policy`
+    # MUST NOT synthesize a default `open` — it turns an operator's omission
+    # into a silently-invented policy. On a security-relevant field it is
+    # worse: two registries would answer identically-stored policies with
+    # different binding lifetimes, a §5.10 determinism split the operator never
+    # sees.
+    if ttl is None:
+        return _error(
+            403, "policy_rejected",
+            "resolved ttl is null: the request omitted requested_ttl and the stored "
+            "issuer policy defines no default_ttl. Refusing rather than minting a "
+            "null-ttl binding (§6a.3, unresolvable per §6a.4) or substituting an "
+            "implementation-chosen default (§6a.9 D12). Set default_ttl on the "
+            "issuer policy.",
+        )
+
+    # The ceiling applies AFTER the cascade resolves (§6a.9.1 v1.11), and
+    # before the manual queue: the queued head records the terms the operator
+    # is being asked to approve, so it must record the clamped ones.
+    ttl = _clamp_to_policy_ceiling(ttl, policy)
 
     # Layer-2 — name entitlement.
     if mode == "manual":
@@ -1464,9 +1690,50 @@ async def _handle_renew_request(ctx: HandlerContext, params: dict[str, Any]) -> 
             "(§6a.9 layer-1)",
         )
     policy = _load_issuer_policy(ctx)
+
+    # §6a.9.1's three-step cascade `[MUST, v1.9]`. `renew-request` is the
+    # SECOND producer of peer-issued bindings and the null-ttl rules above
+    # swept only `register-request`, so this path minted the exact binding
+    # §6a.3 forbids without needing a bad policy at all: a CURATED registry
+    # (no policy entity, which §6a.9.2 makes conformant) has no `default_ttl`
+    # to fall back on. Filed from this tree as SA-PY-13; ruled at v1.9-v1.11.
+    #
+    #   1. the request's own `ttl`
+    #   2. the policy's `default_ttl` — current operator intent outranks
+    #      history, so an operator who lowers it sees renewals pick it up
+    #   3. the SUPERSEDED binding's `ttl`
+    #
+    # Step 3 is a recovery, not an invented default, and that distinction is
+    # the whole ruling: a synthesized number would have two registries answer
+    # identically-stored policies differently, while the predecessor's `ttl` is
+    # this registry's own prior signed act on this exact name — one value,
+    # already published, byte-identical at every conformant peer.
     ttl = data.get("ttl")
-    if not isinstance(ttl, int):
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
         ttl = policy.get("default_ttl") if policy else None
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        ttl = binding.data.get("ttl")
+
+    # The cascade is NOT total `[MUST, v1.10]`. Step 3 is non-null *on every
+    # conformant mint path*, which is not the same as non-null — a predecessor
+    # carrying `ttl: null` can be already there, seeded out-of-band or written
+    # straight to the tree, the identical "stored state is already bad" case
+    # D12 exists for. v1.9 asserted the branch unreachable; an implementation
+    # that merely guards the dereference falls through and mints the null-ttl
+    # successor the whole rule set exists to prevent. So it is enforced, not
+    # asserted, and it is required precisely because nothing conformant reaches
+    # it. Vector: REG-RENEW-TTL-NULLPRED-1.
+    if not isinstance(ttl, int) or isinstance(ttl, bool):
+        return _error(
+            403, "policy_rejected",
+            "renew resolved no ttl: the request omitted it, the stored issuer "
+            "policy defines no default_ttl, and the superseded binding carries "
+            "ttl: null — which §6a.3 forbids and no conformant mint path "
+            "produces. Refusing rather than minting a null-ttl successor or "
+            "substituting a default (§6a.9.1 v1.10). Publishing nothing.",
+        )
+
+    ttl = _clamp_to_policy_ceiling(ttl, policy)
     new_bh = _issue_binding(
         ctx, binding.data.get("name"), target_peer_id,
         binding.data.get("transports") or [], ttl, supersedes=bh,
@@ -1617,11 +1884,58 @@ async def _handle_set_issuer_policy(ctx: HandlerContext, params: dict[str, Any])
             "domain-control is deferred (§6a.9.1) until the challenge format lands "
             "— use open/allowlist/manual",
         )
+    # D11 (§6a.9.2 [MUST]) — a live-registration policy MUST define
+    # `default_ttl`. Every mode still standing here (open / allowlist /
+    # manual) can reach *approve*, and a request omitting `requested_ttl`
+    # against a policy with no default resolves to a **null** ttl — a binding
+    # §6a.3 forbids and no conformant resolver honors (§6a.4). Refuse rather
+    # than storing a policy that can only mint invalid bindings: the same move
+    # as the domain-control refusal one branch up, for the same stated reason.
+    #
+    # The gate is *here*, not on the requester's register-request, because
+    # this is where the missing input lives — `default_ttl` is the operator's
+    # field on the operator's operation. Billing the requester for the
+    # registry's own misconfiguration would teach clients to send
+    # `requested_ttl` defensively, handing TTL selection to the party §6a.1a
+    # treats as untrusted.
+    if data.get("default_ttl") is None:
+        return _error(
+            400, "invalid_params",
+            "a live-registration issuer policy MUST define default_ttl: a request "
+            "omitting requested_ttl would otherwise mint a null-ttl binding, which "
+            "§6a.3 forbids and §6a.4 makes unresolvable. Set default_ttl rather than "
+            "storing a policy that can only mint invalid bindings (§6a.9.2 D11).",
+        )
+    # The ceiling `[MUST, v1.11]` — same trigger, same site and the same stated
+    # reason as `default_ttl` one branch up: it is the operator's field on the
+    # operator's operation, and this is where the missing input lives.
+    #
+    # §6a.3 makes `ttl` the ONLY bound on a withheld revocation, so a
+    # requester-chosen `ttl` with nothing capping it reproduces the permanently
+    # unrevokable binding that rule exists to prevent — without ever setting the
+    # field to null, which is why D11 did not already catch it.
+    max_ttl = data.get("max_ttl")
+    if not isinstance(max_ttl, int) or isinstance(max_ttl, bool):
+        return _error(
+            400, "invalid_params",
+            "a live-registration issuer policy MUST define max_ttl (ms): §6a.3 makes "
+            "ttl the only bound on a withheld revocation, so an uncapped "
+            "requester-chosen ttl is a binding that cannot be revoked in practice "
+            "(§6a.9.1 v1.11). Requests above the ceiling are clamped, not refused.",
+        )
+    if data["default_ttl"] > max_ttl:
+        return _error(
+            400, "invalid_params",
+            f"default_ttl ({data['default_ttl']}ms) MUST NOT exceed max_ttl "
+            f"({max_ttl}ms) — a default above the ceiling is a policy whose own "
+            "unstated-ttl path is immediately clamped (§6a.9.1 v1.11).",
+        )
     stored = {
         "mode": mode,
         "allowlist": data.get("allowlist"),
         "name_constraints": data.get("name_constraints"),
         "default_ttl": data.get("default_ttl"),
+        "max_ttl": max_ttl,
     }
     policy = Entity(type=ISSUER_POLICY_TYPE, data=stored)
     ctx.emit_pathway.emit(ISSUER_POLICY_PATH, policy, EmitContext.from_handler_grant(ctx, "configure"))

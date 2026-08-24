@@ -220,11 +220,11 @@ class TestTheSDKDocSpellingsThatFailSilently:
         are right there in the request and the validator cannot see them.
         """
         required = [
-            "system/revision/**",
-            "system/tree/root/**",
-            "system/tree/tracking-config/**",
-            "system/history/**",
-            "system/clock/**",
+            "system/revision/*",
+            "system/tree/root/*",
+            "system/tree/tracking-config/*",
+            "system/history/*",
+            "system/clock/*",
         ]
 
         def config(field: str) -> dict:
@@ -245,6 +245,71 @@ class TestTheSDKDocSpellingsThatFailSilently:
         assert landed["config_path"].endswith("/config")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad", ["**", "a/**/b", "a*b", "*a*", "system/revision/**"]
+    )
+    async def test_a_pattern_outside_the_four_forms_is_refused_at_config_write(
+        self, client, bad
+    ):
+        """`REV-GLOB-REJECT-1/2` at the wire, not at the predicate.
+
+        `validate_exclude_pattern` is unit-pinned in
+        `tests/unit/test_revision_exclude_glob.py`; a passing predicate says
+        nothing about the **status and code** a peer answers, which is the only
+        thing a cross-impl probe can see. This drives the §4.4.17 surface and
+        asserts both.
+
+        Note `auto_version` is absent: V6 is deliberately ungated by it, so a
+        config that never reaches V2/V3 still cannot store a pattern this peer
+        cannot evaluate.
+        """
+        with pytest.raises(BadRequest) as exc:
+            await _raw(client, "config", {
+                "name": "glob-reject",
+                "action": "set",
+                "config": {
+                    "type": "system/revision/config",
+                    "data": {"prefix": "glob-reject/", "exclude": [bad]},
+                },
+            })
+        assert exc.value.status == 400
+        assert exc.value.code == "config/invalid-exclude-pattern"
+
+    @pytest.mark.asyncio
+    async def test_the_acceptance_control_beside_it(self, client):
+        """The teeth control: a valid form-2 pattern MUST be accepted.
+
+        Without it, every rejection above is attributable to a peer that
+        refuses all configs rather than to the grammar — which is the same
+        control `entity-core-go`'s probe runs first, and for the same reason.
+        """
+        landed = await _raw(client, "config", {
+            "name": "glob-accept",
+            "action": "set",
+            "config": {
+                "type": "system/revision/config",
+                "data": {"prefix": "glob-accept/", "exclude": ["tmp/*"]},
+            },
+        })
+        assert landed["config_path"].endswith("/config")
+
+    @pytest.mark.asyncio
+    async def test_exclude_types_is_held_to_the_same_grammar(self, client):
+        """§2.4's `subject` is the type name for `exclude_types`, and the forms
+        do not change with the subject — so V6 must read both fields. A gate
+        that budgets one of two fields reports the other as clean."""
+        with pytest.raises(BadRequest) as exc:
+            await _raw(client, "config", {
+                "name": "glob-types",
+                "action": "set",
+                "config": {
+                    "type": "system/revision/config",
+                    "data": {"prefix": "glob-types/", "exclude_types": ["app/**"]},
+                },
+            })
+        assert exc.value.code == "config/invalid-exclude-pattern"
+
+    @pytest.mark.asyncio
     async def test_exclude_patterns_is_absorbed_at_this_boundary(self, client):
         """Same config, same validator, through the wrapper — and it lands.
 
@@ -256,54 +321,71 @@ class TestTheSDKDocSpellingsThatFailSilently:
             "everything",
             auto_version=True,
             exclude_patterns=[
-                "system/revision/**",
-                "system/tree/root/**",
-                "system/tree/tracking-config/**",
-                "system/history/**",
-                "system/clock/**",
+                "system/revision/*",
+                "system/tree/root/*",
+                "system/tree/tracking-config/*",
+                "system/history/*",
+                "system/clock/*",
             ],
         )
         assert result["tracking_config_action"] == "created"
 
     @pytest.mark.asyncio
-    async def test_commit_does_not_yet_apply_config_excludes(self, client, rev):
-        """A characterization test, and a defect of **ours** — filed as SA-PY-8.
+    async def test_commit_applies_config_excludes(self, client, rev):
+        """§2.4 *"Exclude applies to trie building"* — a MUST we applied nowhere.
 
-        §4.4.1's algorithm builds the trie from `compute_versioned_bindings`,
-        which drops paths matching `exclude` (§2.4). `entity-core-go` does
-        exactly that (`computeVersionedBindings`, `ext/revision/snapshot.go`).
-        This peer builds the trie from every binding under the prefix and
-        consults the config nowhere — so two conformant peers with the same
-        config and the same tree state commit **different trie roots**, which
-        means different version hashes for identical content.
+        Filed as **SA-PY-8** and ruled confirmed by arch
+        (`ROUTING-2026-08-18-c` §3): a version entry's `root` MUST be the
+        exclude-filtered trie, on every path that emits one. Establishing it
+        turned up that §6.1 contradicts itself independently of any
+        implementation — its Amendment-2 paragraph requires the new version's
+        trie to carry explicit entries for every path in the parent's, which an
+        algorithm assigning `root = current_tracked_root(prefix)` can never do
+        because it builds no trie. The Algorithm block is the stale half, so
+        filtering is not a new constraint; it is what the rest of §6.1 already
+        required.
 
-        Why nothing caught it: every exclude test in this repo drives config
-        *validation* (§4.4.17 V1-V5), which reads the field. Nothing drove the
-        snapshot, which does not. The field is covered where it is checked and
-        uncovered where it is used — the same coverage shape `AGENTS.md`
-        already names for values with two representations, here applied to a
-        config field with a validator and a consumer.
+        This was the pin, inverted. It previously asserted the two roots were
+        **equal** — the characterization of our own defect — with the note
+        "flip this test when both land". Both landed:
+        `compute_versioned_bindings` at `commit`, and the filtered trie as the
+        auto-version root (D1), which is the half that matters more because
+        suppressing the version *entry* for an excluded write never suppressed
+        that path's contribution to the tracked root. One write later, the
+        root committed to data the config says is not versioned.
 
-        Not fixed in the same change because the commit path is only half of
-        it: under `auto_version: true` the version root comes from the
-        tracked structural root (`root_tracker.py`), which is exclude-unaware
-        too. Filtering one and not the other would make explicit commits and
-        auto-versions disagree about the same tree state, which is worse than
-        the current uniform wrongness. Flip this test when both land.
+        `entity-core-go` is at no fault here and their row should be read as a
+        spec revision rather than a defect report: filtering at `commit` and
+        not at auto-version is exactly what the text said.
         """
         await _write(client, "a.txt", "keep")
         await _write(client, "ephemeral/scratch", "drop")
 
-        without_config = (await rev.commit()).root
+        before = await rev.commit()
 
-        await rev.set_config("project", exclude=["ephemeral/**"])
+        await rev.set_config("project", exclude=["ephemeral/*"])
         await _write(client, "a.txt", "keep-2")
         await _write(client, "a.txt", "keep")
-        with_exclude = (await rev.commit()).root
+        after = await rev.commit()
+        without_config, with_exclude = before.root, after.root
 
-        assert with_exclude == without_config, (
-            "excludes are not applied at commit — if this now fails, the fix "
-            "landed and SA-PY-8 should be closed"
+        assert with_exclude != without_config, (
+            "the same tree state produced the same root with and without an "
+            "`ephemeral/*` exclude — §2.4's filter is not reaching the trie"
+        )
+
+        # The load-bearing half. A root that merely *differs* would also be
+        # produced by filtering the wrong thing, so name which path moved:
+        # `ephemeral/scratch` leaves the versioned set, `a.txt` — written twice
+        # and returned to its original content — does not.
+        delta = await rev.diff(before.version, after.version)
+        assert "ephemeral/scratch" in delta.removed, (
+            f"the excluded path is still versioned (removed={sorted(delta.removed)}, "
+            f"changed={sorted(delta.changed)})"
+        )
+        assert "a.txt" not in delta.removed and "a.txt" not in delta.changed, (
+            f"the exclude reached a path it does not name (removed="
+            f"{sorted(delta.removed)}, changed={sorted(delta.changed)})"
         )
 
     @pytest.mark.asyncio
@@ -771,36 +853,34 @@ class TestFindAncestor:
 
 class TestSinceMeansTwoThingsAcrossTwoSections:
     @pytest.mark.asyncio
-    async def test_log_since_starts_the_walk_here_and_go_stops_it_here(self, client, rev):
-        """Pinned because it is a live cross-impl divergence, not a preference.
+    async def test_log_takes_start_at_and_fetch_keeps_since(self, client, rev):
+        """SA-PY-7, ruled: the divergence this pinned is gone by construction.
 
-        `EXTENSION-REVISION` §4.4.2 calls `log`'s `since` *"start after this
-        version"* — a paging cursor pointing back toward the root. §4.4.6 calls
-        `fetch`'s identically-named field *"latest known version hash; DAG walk
-        stops here"* — a stop marker pointing forward from HEAD. They are
-        opposite ends of the same walk.
+        `EXTENSION-REVISION` §4.4.2 called `log`'s anchor *"start after this
+        version"* — a paging cursor toward the root — while §4.4.6 called
+        `fetch`'s identically-named field a stop marker pointing forward from
+        HEAD. Opposite ends of the same walk, one name, and the two peers split
+        exactly as the two sentences did: this one started the walk *at*
+        `since`, `entity-core-go` walked from HEAD and skipped it.
 
-        This peer implements the paging reading for `log` (inclusive of
-        `since`, so it reappears as the page's first element — not "after" it
-        either); `entity-core-go` walks from HEAD and skips `since`, i.e. the
-        §4.4.6 reading applied to §4.4.2's operation. Same call, two answers,
-        neither provably wrong against the text. Filed as SA-PY-7.
-
-        The test pins **our** behaviour so a change to it is deliberate, and
-        names the other so the next reader does not rediscover it in a
-        cross-impl run.
+        Neither was provably wrong against the text, which is why the fix was
+        to remove the collision rather than pick an inclusivity. `log` now
+        takes **`start_at`** (inclusive, walks older) and `fetch` keeps
+        **`since`** (exclusive, walks newer). A caller can no longer carry the
+        intuition from one operation to the other, because the field they
+        would type does not exist there.
         """
         await _write(client, "a.txt", "one")
         first = (await rev.commit()).version
         await _write(client, "a.txt", "two")
         second = (await rev.commit()).version
 
-        page = await rev.log(since=first)
-        assert page.versions == [first], (
-            "py: the walk starts at `since`, inclusive. go: it would return "
-            "[second] — everything newer, `since` skipped."
-        )
+        page = await rev.log(start_at=first)
+        assert page.versions == [first], "start_at is the inclusive anchor, walking older"
         assert second not in page.versions
+
+        # And the operation that kept `since` still means the other thing.
+        assert list((await rev.fetch(since=first)).versions) == [second]
 
 
 # =============================================================================
@@ -902,11 +982,11 @@ class TestMergeConfig:
 
     @pytest.mark.asyncio
     async def test_a_path_scoped_config_round_trips(self, rev):
-        result = await rev.set_merge_config(path="notes/**", strategy="three-way")
+        result = await rev.set_merge_config(path="notes/*", strategy="three-way")
         assert result["status"] == "set"
-        assert result["path"] == "system/revision/config/merge/path/notes/**"
+        assert result["path"] == "system/revision/config/merge/path/notes/*"
 
-        deleted = await rev.delete_merge_config(path="notes/**")
+        deleted = await rev.delete_merge_config(path="notes/*")
         assert deleted["status"] == "deleted"
 
     @pytest.mark.asyncio
@@ -930,7 +1010,7 @@ class TestMergeConfig:
 class TestPrefixConfig:
     @pytest.mark.asyncio
     async def test_a_config_write_reports_where_it_landed(self, rev):
-        result = await rev.set_config("project", exclude=["ephemeral/**"])
+        result = await rev.set_config("project", exclude=["ephemeral/*"])
         assert result["config_path"].endswith("/config")
         assert isinstance(result["config_hash"], bytes)
 
@@ -940,11 +1020,11 @@ class TestPrefixConfig:
             "project",
             auto_version=True,
             exclude=[
-                "system/revision/**",
-                "system/tree/root/**",
-                "system/tree/tracking-config/**",
-                "system/history/**",
-                "system/clock/**",
+                "system/revision/*",
+                "system/tree/root/*",
+                "system/tree/tracking-config/*",
+                "system/history/*",
+                "system/clock/*",
             ],
         )
         assert result["tracking_config_action"] == "created"

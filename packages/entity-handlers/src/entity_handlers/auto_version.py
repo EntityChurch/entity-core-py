@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from entity_core.peer.extensions import Extension, ExtensionContext
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import ChangeEvent, ChangeKind, EmitContext
+from entity_core.storage.trie import build_trie
 
 from entity_core.utils.ecf import compute_ecf_hash
 
@@ -44,6 +45,8 @@ from entity_handlers.revision import (
     _branch_path,
     _config_path_for_prefix,
     _head_path,
+    _matches_any_glob,
+    compute_versioned_bindings,
     sorted_parents,
     validate_revision_config,
 )
@@ -76,6 +79,11 @@ class _AutoVersionConfig:
     prefix: str
     auto_version: bool
     exclude: list[str]
+    #: §2.4's type filter. Carried here because the version root is now built
+    #: from `compute_versioned_bindings`, which applies both filters — before
+    #: D1 this extension only ever needed `exclude`, to decide whether a write
+    #: was worth versioning at all.
+    exclude_types: list[str]
 
 
 def _parse_config(data: dict) -> _AutoVersionConfig | None:
@@ -86,6 +94,7 @@ def _parse_config(data: dict) -> _AutoVersionConfig | None:
         prefix=prefix,
         auto_version=bool(data.get("auto_version", False)),
         exclude=list(data.get("exclude") or []),
+        exclude_types=list(data.get("exclude_types") or []),
     )
 
 
@@ -94,25 +103,21 @@ def _absolute_prefix(prefix: str, local_peer_id: str) -> str:
 
 
 def _exclude_matches(patterns: list[str], relative_path: str) -> bool:
-    """Simple glob-style match against the relative path (below prefix).
+    """§6.1's emission gate, over §2.4's `glob_match` — the same matcher the
+    trie filter uses, which it was not until the four-forms ruling landed.
 
-    Supports trailing `**` and `*` as prefix wildcards, and exact matches.
-    This is intentionally narrow — the spec's §4 excludes use either
-    `system/revision/**` style or exact paths; both fall under this.
+    This file used to carry a **second, narrower** matcher of its own: trailing
+    `/**` was a subtree, and `/*` was *segment-scoped*, matching only direct
+    children. §2.4 form 2 says the opposite — `<literal>/*` is the subtree
+    match and crosses `/` at any depth. So one peer disagreed with itself:
+    `tmp/*` suppressed the version entry for `tmp/x` but not for `tmp/a/b`,
+    while `compute_versioned_bindings` kept both out of the trie. Two
+    representations of one concept, coverage on one of them — and the divergent
+    half was the one no test drove past depth 1.
+
+    Delegates now, so the gate and the filter cannot drift apart again.
     """
-    for pat in patterns:
-        if pat.endswith("/**"):
-            base = pat[:-3]
-            if relative_path == base or relative_path.startswith(base + "/"):
-                return True
-        elif pat.endswith("/*"):
-            base = pat[:-2]
-            tail = relative_path[len(base) + 1:] if relative_path.startswith(base + "/") else None
-            if tail is not None and "/" not in tail:
-                return True
-        elif pat == relative_path:
-            return True
-    return False
+    return _matches_any_glob(relative_path, patterns)
 
 
 def _is_engine_write(relative_path: str) -> bool:
@@ -191,10 +196,10 @@ def _load_revision_config(emit: EmitPathway, prefix: str) -> _AutoVersionConfig 
     uri = emit.entity_tree.normalize_uri(config_path)
     h = emit.entity_tree.get(uri)
     if h is None:
-        return _AutoVersionConfig(prefix=prefix, auto_version=True, exclude=[])
+        return _AutoVersionConfig(prefix=prefix, auto_version=True, exclude=[], exclude_types=[])
     entity = emit.content_store.get(h)
     if entity is None or entity.type != REVISION_CONFIG_TYPE:
-        return _AutoVersionConfig(prefix=prefix, auto_version=True, exclude=[])
+        return _AutoVersionConfig(prefix=prefix, auto_version=True, exclude=[], exclude_types=[])
     config = _parse_config(entity.data)
     if config is None:
         return None
@@ -355,6 +360,35 @@ class AutoVersionExtension(Extension):
             )
             return
 
+        # §6.1 D1 (arch `ROUTING-2026-08-18-c` §3): a version entry's `root`
+        # MUST be the **exclude-filtered** trie, on every path that emits one.
+        # The tracked structural root is not that trie — it comes from
+        # EXTENSION-TREE §3.4.1a, driven by a `system/tree/tracking-config`
+        # that has no knowledge of any revision `exclude`, and TREE calls the
+        # binding "a direct pointer" with no filtering stage. So §2.4 and §6.1
+        # are two different roots, not two readings of one.
+        #
+        # The trap this closes is one write wide and easy to miss: suppressing
+        # the version *entry* for an excluded write (the `_exclude_matches`
+        # return above) does not suppress that path's *contribution to the
+        # tracked root*, so the very next non-excluded write emitted a version
+        # whose root committed to data the config says is not versioned. On
+        # this path the exclude did not work at all, one write late.
+        #
+        # Fast path preserved: with no excludes configured the filtered trie
+        # **is** the tracked root, so the O(1) read stands for every prefix
+        # that does not configure one.
+        if config.exclude or config.exclude_types:
+            version_root = build_trie(
+                sorted(compute_versioned_bindings(
+                    emit.entity_tree, emit.content_store, config.prefix,
+                    {"exclude": config.exclude, "exclude_types": config.exclude_types},
+                ).items()),
+                emit.content_store,
+            )
+        else:
+            version_root = tracked_root
+
         # Compute hash-addressed prefix segment (§3.1).
         absolute_prefix = emit.entity_tree.normalize_uri(config.prefix)
         ph = compute_ecf_hash({"type": "system/tree/path", "data": absolute_prefix}).hex()
@@ -371,7 +405,7 @@ class AutoVersionExtension(Extension):
         if (
             current_head_entity is not None
             and current_head_entity.type == VERSION_ENTRY_TYPE
-            and current_head_entity.data.get("root") == tracked_root
+            and current_head_entity.data.get("root") == version_root
         ):
             return
 
@@ -389,7 +423,7 @@ class AutoVersionExtension(Extension):
         version = Entity(
             type=VERSION_ENTRY_TYPE,
             data={
-                "root": tracked_root,
+                "root": version_root,
                 "parents": sorted_parents(parents),
             },
         )

@@ -43,6 +43,7 @@ from entity_handlers.root_tracker import (
     TRACKING_CONFIG_PREFIX,
     TRACKING_CONFIG_TYPE,
     RootTrackerExtension,
+    _root_binding_path,
 )
 
 
@@ -223,7 +224,7 @@ class TestExclude:
         _put_tracking_config(emit, "project", "project/")
         _put_revision_config(
             emit, "project/", auto_version=True,
-            exclude=["ephemeral/**"],
+            exclude=["ephemeral/*"],
         )
         _setup_peer(emit, keypair)
 
@@ -242,15 +243,27 @@ class TestExclude:
         assert _count_versions(content_store) == before + 1
 
 
-def test_exclude_helper_matches_trailing_star_star():
-    assert _exclude_matches(["system/revision/**"], "system/revision/head/p")
-    assert _exclude_matches(["system/revision/**"], "system/revision")
-    assert not _exclude_matches(["system/revision/**"], "system/tree/root/x")
+def test_the_emission_gate_uses_the_subtree_form():
+    assert _exclude_matches(["system/revision/*"], "system/revision/head/p")
+    assert not _exclude_matches(["system/revision/*"], "system/tree/root/x")
+    # The retained "/" means the bare prefix is NOT covered by its own subtree
+    # pattern. `system/revision` is a path, not a directory, and §2.4 form 2
+    # is `starts_with(subject, "system/revision/")`.
+    assert not _exclude_matches(["system/revision/*"], "system/revision")
 
 
-def test_exclude_helper_matches_single_star():
+def test_the_gate_and_the_trie_filter_agree_at_depth():
+    """§6.1's emission gate ran a *second* matcher until the four-forms ruling,
+    and that matcher read `/*` as segment-scoped — so `build/*` suppressed the
+    version for `build/out` but not for `build/a/b`, while the trie filter kept
+    both out. One peer disagreeing with itself about which writes are excluded.
+
+    Form 2 crosses `/`. This is the row that used to assert the opposite.
+    """
     assert _exclude_matches(["build/*"], "build/out")
-    assert not _exclude_matches(["build/*"], "build/a/b")
+    assert _exclude_matches(["build/*"], "build/a/b")
+    assert _exclude_matches(["build/*"], "build/a/b/c/d")
+    assert not _exclude_matches(["build/*"], "buildings/x")
 
 
 # ============================================================================
@@ -264,7 +277,7 @@ class TestSelfGuard:
     ):
         _put_tracking_config(emit, "univ", "/")
         _put_revision_config(
-            emit, "/", auto_version=True, exclude=["system/**"],
+            emit, "/", auto_version=True, exclude=["system/*"],
         )
         _setup_peer(emit, keypair)
 
@@ -438,3 +451,127 @@ class TestActiveBranchAdvance:
         branch_entity = content_store.get(branch_binding)
         assert branch_entity.type == "system/hash"
         assert branch_entity.data["hash"] == head_version_hash
+
+
+# ============================================================================
+# §6.1 D1 — the version root is the exclude-filtered trie, not the tracked root
+# ============================================================================
+
+
+class TestTheVersionRootIsExcludeFiltered:
+    """`ROUTING-2026-08-18-c` §3: a version entry's `root` MUST be the
+    exclude-filtered trie **on every path that emits one**.
+
+    The tracked structural root is not that trie. It comes from
+    `EXTENSION-TREE` §3.4.1a, driven by a `system/tree/tracking-config` that
+    has no knowledge of any revision `exclude`, and TREE calls the binding "a
+    direct pointer" with no filtering stage — so §2.4 and §6.1 name two
+    different roots rather than two readings of one.
+
+    The failure this closes is one write wide, which is why suppressing the
+    version *entry* for an excluded write looked sufficient for as long as it
+    did: suppression does not remove that path's contribution to the tracked
+    root, so the next non-excluded write emitted a version committing to data
+    the config says is not versioned. **On this path the exclude did not work
+    at all, one write late.**
+    """
+
+    def _bindings_of_head(self, emit, content_store, prefix: str) -> dict:
+        from entity_core.storage.trie import collect_all_bindings
+
+        head = _read_head(emit, prefix)
+        assert head is not None, "no version was emitted"
+        version = content_store.get(head)
+        assert version is not None and version.type == VERSION_ENTRY_TYPE
+        return dict(collect_all_bindings(version.data["root"], "", content_store))
+
+    def test_an_excluded_path_never_enters_a_version_root(
+        self, emit, keypair, content_store,
+    ):
+        _put_tracking_config(emit, "project", "project/")
+        _put_revision_config(
+            emit, "project/", auto_version=True, exclude=["ephemeral/*"],
+        )
+        _setup_peer(emit, keypair)
+
+        # The excluded write emits no version of its own (pre-existing
+        # behaviour) but does move the tracked root.
+        emit.emit("project/ephemeral/scratch", Entity(type="test/blob", data={"v": 1}))
+        # The *next* write is the one that used to leak it.
+        emit.emit("project/a.txt", Entity(type="test/blob", data={"v": 2}))
+
+        bindings = self._bindings_of_head(emit, content_store, "project/")
+        assert "ephemeral/scratch" not in bindings, (
+            f"the version root commits to an excluded path — the tracked root "
+            f"was used verbatim instead of the filtered trie: {sorted(bindings)}"
+        )
+        assert "a.txt" in bindings, (
+            f"the filtered trie dropped a path the exclude does not name: "
+            f"{sorted(bindings)}"
+        )
+
+    def test_with_no_excludes_the_root_is_still_the_tracked_root(
+        self, emit, keypair, content_store,
+    ):
+        """The O(1) fast path, kept deliberately.
+
+        With `exclude` and `exclude_types` both empty the filtered trie **is**
+        the tracked root, so the version takes it directly rather than
+        rebuilding a trie on every write. If this ever fails, the D1 change has
+        started paying full snapshot cost for prefixes that configured nothing.
+        """
+        _put_tracking_config(emit, "project", "project/")
+        _put_revision_config(emit, "project/", auto_version=True)
+        _setup_peer(emit, keypair)
+
+        emit.emit("project/a.txt", Entity(type="test/blob", data={"v": 1}))
+
+        head = _read_head(emit, "project/")
+        version = content_store.get(head)
+        tracked = emit.entity_tree.get(
+            emit.entity_tree.normalize_uri(_root_binding_path("project/"))
+        )
+        assert version.data["root"] == tracked
+
+    def test_the_two_paths_agree_on_the_root_REV_AUTOVERSION_EXCLUDE_PARITY_1(
+        self, emit, keypair, content_store,
+    ):
+        """D5's vector — the two-peer divergence reduced to a single peer.
+
+        `root` is the version entry's identity, so a root that depends on
+        *which path emitted it* forks the DAG with no content difference:
+        two peers over identical tree state and identical config produce
+        different `system/revision/entry` hashes, and entity exchange cannot
+        converge them. Nothing errors at either end.
+
+        The check is the one no existing vector reached — build the filtered
+        trie the way `commit` does, over the same live state, and require the
+        auto-version entry's root to equal it byte for byte. Write an excluded
+        path first, because that is the state in which the two computations
+        used to differ.
+        """
+        from entity_core.storage.trie import build_trie
+        from entity_handlers.revision import compute_versioned_bindings
+
+        _put_tracking_config(emit, "project", "project/")
+        _put_revision_config(
+            emit, "project/", auto_version=True, exclude=["ephemeral/*"],
+        )
+        _setup_peer(emit, keypair)
+
+        emit.emit("project/ephemeral/scratch", Entity(type="test/blob", data={"v": 1}))
+        emit.emit("project/a.txt", Entity(type="test/blob", data={"v": 2}))
+
+        auto_root = content_store.get(_read_head(emit, "project/")).data["root"]
+        commit_root = build_trie(
+            sorted(compute_versioned_bindings(
+                emit.entity_tree, content_store, "project/",
+                {"exclude": ["ephemeral/*"], "exclude_types": []},
+            ).items()),
+            content_store,
+        )
+
+        assert auto_root == commit_root, (
+            "the auto-version root and the commit root disagree over identical "
+            "live state — the version DAG forks on arrival path, not content"
+        )

@@ -1242,11 +1242,11 @@ class TestConfig:
             "prefix": "/",
             "auto_version": True,
             "exclude": [
-                "system/revision/**",
-                "system/tree/root/**",
-                "system/tree/tracking-config/**",
-                "system/history/**",
-                "system/clock/**",
+                "system/revision/*",
+                "system/tree/root/*",
+                "system/tree/tracking-config/*",
+                "system/history/*",
+                "system/clock/*",
             ],
         }
         result = await revision_handler(
@@ -2147,18 +2147,19 @@ class TestCustomMergeHandlerDelegation:
 class TestMergeConfigStarScope:
     """§5.1: a `pattern: "*"` merge config matches ALL paths, peer-wide.
 
-    core-go's A-6 E5 (HANDOFF-2026-08-14-c §6) names this a three-language
-    trap and lists Python among the languages whose stdlib pulls the other
-    way — "Python's `fnmatch` over a segment". For Go's `path.Match` and the
-    common Rust glob crates that is right; for Python's `fnmatch` it is not.
-    `fnmatch` translates `*` to `.*`, which crosses `/` — it has no concept of
-    path segments at all. So we get the spec's reading from the stdlib for
-    free, and the trap is real for two of the three languages, not three.
+    core-go's A-6 E5 (HANDOFF-2026-08-14-c §6) named this a three-language trap
+    and listed Python among the languages whose stdlib pulls the other way —
+    "Python's `fnmatch` over a segment". That was right about the danger and
+    wrong about Python: `fnmatch` translates `*` to `.*`, which crosses `/`, so
+    it has no concept of path segments at all. We got the spec's reading from
+    the stdlib for free.
 
-    Pinned here because "we happen to be correct" is worth exactly nothing
-    without a row that fails if the behaviour changes — swapping in a
-    segment-aware matcher (pathlib's `PurePath.match`, a glob crate binding)
-    would silently narrow every `*` config on the peer.
+    **And "we happen to be correct" was worth what this file said it was
+    worth — nothing.** `fnmatch` agreed with the spec on `*` and disagreed
+    everywhere else it was reachable: `?`, character classes, and infix `a*b`,
+    none of which any conformant peer can evaluate. The call site is §2.3's
+    `glob_match` now (SA-PY-12); these rows keep their teeth because a matcher
+    that narrowed `*` to a segment would still fail them.
     """
 
     def _put_config(self, ctx, name, data):
@@ -2195,8 +2196,8 @@ class TestMergeConfigStarScope:
             {"pattern": "*", "strategy": "source-wins"},
         )
         self._put_config(
-            handler_context, "txt-files",
-            {"pattern": "data/*.txt", "strategy": "target-wins"},
+            handler_context, "data-files",
+            {"pattern": "data/*", "strategy": "target-wins"},
         )
         assert _find_merge_strategy(
             handler_context, "", "data/notes.txt", None, None,
@@ -2204,6 +2205,131 @@ class TestMergeConfigStarScope:
         assert _find_merge_strategy(
             handler_context, "", "other/notes.md", None, None,
         ) == ("source-wins", None)
+
+    def test_an_infix_pattern_matches_nothing_and_that_is_SA_PY_12(
+        self, handler_context,
+    ):
+        """`data/*.txt` used to work here, and under no ruled reading does.
+
+        This test read `data/*.txt` → matches `data/notes.txt` until the
+        four-forms ruling, because the call site was `fnmatch`, which is the
+        only matcher in play that supports **infix** `*`. Neither candidate
+        reading of §2.3 does: the four forms have no infix form (ruled
+        deliberately), and §5.4's vocabulary is `*` / `prefix/*` / exact. So
+        the pattern falls to form 4 and matches the literal name `data/*.txt`,
+        i.e. nothing.
+
+        Pinned as a *loss*, not as correctness. `entity-core-go` evaluates this
+        surface with its four-form `globMatch`, so an operator with an infix
+        merge-config selected `source-wins` on py and the default on go — and
+        strategy decides merged content, which is hashed. That divergence is
+        the finding; which of the two readings §2.3 actually means is arch's,
+        and is filed as SA-PY-12.
+        """
+        self._put_config(
+            handler_context, "txt-files",
+            {"pattern": "data/*.txt", "strategy": "target-wins"},
+        )
+        assert _find_merge_strategy(
+            handler_context, "", "data/notes.txt", None, None,
+        ) == ("three-way", None), "an infix pattern matched — fnmatch is back"
+        # ...and it still matches its own literal spelling, which is form 4
+        # doing exactly what it says rather than the pattern being ignored.
+        assert _find_merge_strategy(
+            handler_context, "", "data/*.txt", None, None,
+        ) == ("target-wins", None)
+
+
+class TestMergeSelectionIsATotalOrder:
+    """§5.1 `[v3.12]` — the ruled ranks and the two vectors that separate them,
+    driven through `_find_merge_strategy` rather than through the key function.
+
+    A total order tested only at the comparator is a total order nothing
+    consults; these rows drive the walk that reads the tree, which is where the
+    old `specificity > best` compare lived and where enumeration order leaked.
+    """
+
+    def _put_config(self, ctx, name, data):
+        from entity_core.storage.emit import EmitContext
+        ctx.emit_pathway.emit(
+            f"system/revision/config/merge/path/{name}",
+            Entity(type="system/revision/merge-config", data=data),
+            EmitContext.protocol(author="operator"),
+        )
+
+    def test_merge_pattern_suffix_1(self, handler_context):
+        """`MERGE-PATTERN-SUFFIX-1` — form 3 is a whole-subject byte suffix and
+        reaches any depth. This is §5.1's own worked example and it is
+        **unexpressible** under §5.4."""
+        self._put_config(handler_context, "locks",
+                         {"pattern": "*.lock", "strategy": "source-wins"})
+        assert _find_merge_strategy(
+            handler_context, "", "deep/nested/a.lock", None, None,
+        ) == ("source-wins", None)
+
+    def test_merge_pattern_subtree_1(self, handler_context):
+        """`MERGE-PATTERN-SUBTREE-1` — form 2 crosses `/` at depth, and the
+        retained `/` blocks the sibling-prefix false positive."""
+        self._put_config(handler_context, "docs",
+                         {"pattern": "docs/*", "strategy": "target-wins"})
+        assert _find_merge_strategy(
+            handler_context, "", "docs/deep/nested/x", None, None,
+        ) == ("target-wins", None)
+        assert _find_merge_strategy(
+            handler_context, "", "docsy/x", None, None,
+        ) == ("three-way", None)
+
+    def test_anchored_beats_unanchored_at_the_call_site(self, handler_context):
+        """The chosen rung, end to end: for `docs/a.lock` both patterns match
+        and neither contains the other."""
+        self._put_config(handler_context, "kind",
+                         {"pattern": "*.lock", "strategy": "source-wins"})
+        self._put_config(handler_context, "place",
+                         {"pattern": "docs/*", "strategy": "target-wins"})
+        assert _find_merge_strategy(
+            handler_context, "", "docs/a.lock", None, None,
+        ) == ("target-wins", None)
+
+    def test_exact_outranks_both(self, handler_context):
+        self._put_config(handler_context, "place",
+                         {"pattern": "docs/*", "strategy": "target-wins"})
+        self._put_config(handler_context, "the-file",
+                         {"pattern": "docs/a.lock", "strategy": "source-wins"})
+        assert _find_merge_strategy(
+            handler_context, "", "docs/a.lock", None, None,
+        ) == ("source-wins", None)
+
+    def test_two_configs_with_one_pattern_select_by_name(self, handler_context):
+        """The tie the spec says MUST be impossible. Two configs may carry the
+        same `pattern` under different `{name}`s, and before v3.12 the winner
+        was whichever `list_entities` yielded first — unspecified ordering, so
+        two peers could resolve one conflict differently with nothing failing.
+        """
+        self._put_config(handler_context, "bravo",
+                         {"pattern": "docs/*", "strategy": "source-wins"})
+        self._put_config(handler_context, "alpha",
+                         {"pattern": "docs/*", "strategy": "target-wins"})
+        assert _find_merge_strategy(
+            handler_context, "", "docs/x", None, None,
+        ) == ("target-wins", None), "the by-name tiebreak did not run"
+
+    def test_deletion_resolution_uses_the_same_order(self, handler_context):
+        """One selection rule, two consumers. `deletion_resolution` was a
+        second copy of the walk and the compare until this change — and a
+        concept with two implementations in one process is the shape this repo
+        keeps finding on the wrong side of a boundary."""
+        self._put_config(handler_context, "kind", {
+            "pattern": "*.lock", "strategy": "three-way",
+            "deletion_resolution": "deletion-wins",
+        })
+        self._put_config(handler_context, "place", {
+            "pattern": "docs/*", "strategy": "three-way",
+            "deletion_resolution": "deterministic",
+        })
+        from entity_handlers.revision import _find_deletion_resolution
+        assert _find_deletion_resolution(
+            handler_context, "", "docs/a.lock",
+        ) == "deterministic"
 
 
 class TestMergeConfigCascade:
@@ -2293,11 +2419,14 @@ class TestMergeConfigCascade:
 
         from entity_core.storage.emit import EmitContext
         emit_ctx = EmitContext.protocol(author="remote-peer")
+        # `data/*` (form 2), not `data/*.txt` — the infix spelling this test
+        # carried is inert under §2.4's four forms, which is SA-PY-12's
+        # subject. Form 2 is the expressible way to say "under data/".
         path_config = Entity(
             type="system/revision/merge-config",
-            data={"pattern": "data/*.txt", "strategy": "source-wins"},
+            data={"pattern": "data/*", "strategy": "source-wins"},
         )
-        emit.emit("system/revision/config/merge/path/txt-files", path_config, emit_ctx)
+        emit.emit("system/revision/config/merge/path/data-files", path_config, emit_ctx)
 
         emit.emit("data/shared.txt", Entity(type="test/file", data={"content": "Original"}))
         r1 = await revision_handler(

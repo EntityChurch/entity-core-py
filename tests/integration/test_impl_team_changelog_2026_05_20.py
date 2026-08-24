@@ -661,7 +661,7 @@ class TestMergeConfigOperation:
                 "config": {
                     "type": "system/revision/merge-config",
                     "data": {
-                        "pattern": "**/*.lock",
+                        "pattern": "*.lock",
                         "strategy": "source-wins",
                         "deletion_resolution": "lww",
                     },
@@ -690,7 +690,7 @@ class TestMergeConfigOperation:
                 "config": {
                     "type": "system/revision/merge-config",
                     "data": {
-                        "pattern": "docs/**",
+                        "pattern": "docs/*",
                         "strategy": "three-way",
                         "deletion_resolution": "keep-both",
                     },
@@ -717,7 +717,7 @@ class TestMergeConfigOperation:
                     "config": {
                         "type": "system/revision/merge-config",
                         "data": {
-                            "pattern": f"dr-{dr}/**",
+                            "pattern": f"dr-{dr}/*",
                             "strategy": "three-way",
                             "deletion_resolution": dr,
                         },
@@ -729,6 +729,83 @@ class TestMergeConfigOperation:
             data = r["result"]["data"]
             assert data["status"] == "set"
             assert data["path"] == f"system/revision/config/merge/path/dr-{dr}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("pattern", ["**", "a/**/b", "a*b", "*a*"])
+    async def test_v7_rejects_a_pattern_outside_the_four_forms(self, pattern) -> None:
+        """`MERGE-PATTERN-REJECT-1` — §4.4.18 **V7** `[MUST, v3.12]`.
+
+        Same grammar, same reason and the same write-time site as §4.4.17 V6:
+        `pattern` selects the merge strategy, the strategy decides the merged
+        bytes, and the merged bytes are the version `root`. A pattern the peer
+        cannot evaluate under the four rules MUST NOT reach the tree — read-time
+        handling can only collapse it silently, which is the accept-then-
+        mismatch shape V6 exists to prevent.
+        """
+        ctx = _make_handler_context()
+        r = await revision_handler(
+            "system/revision", "merge-config",
+            {"data": {
+                "scope": "path",
+                "name": "rejected",
+                "action": "set",
+                "config": {
+                    "type": "system/revision/merge-config",
+                    "data": {"pattern": pattern, "strategy": "three-way"},
+                },
+            }},
+            ctx,
+        )
+        assert r["status"] == 400, r
+        assert r["result"]["data"]["code"] == "config/invalid-merge-pattern"
+        # No binding lands — the whole point of a write-time refusal.
+        tree = ctx.emit_pathway.entity_tree
+        assert tree.get(tree.normalize_uri(
+            "system/revision/config/merge/path/rejected"
+        )) is None
+
+    @pytest.mark.asyncio
+    async def test_v7_accepts_the_four_forms(self) -> None:
+        """The acceptance control `MERGE-PATTERN-REJECT-1` requires. A rejection
+        row without one passes trivially against a peer that rejects
+        everything (`GUIDE-CONFORMANCE` §2.4a)."""
+        for i, pattern in enumerate(["docs/*", "*.lock", "*", "docs/a.lock"]):
+            ctx = _make_handler_context()
+            r = await revision_handler(
+                "system/revision", "merge-config",
+                {"data": {
+                    "scope": "path",
+                    "name": f"ok-{i}",
+                    "action": "set",
+                    "config": {
+                        "type": "system/revision/merge-config",
+                        "data": {"pattern": pattern, "strategy": "three-way"},
+                    },
+                }},
+                ctx,
+            )
+            assert r["status"] == 200, (pattern, r)
+
+    @pytest.mark.asyncio
+    async def test_v7_does_not_bind_a_type_scoped_config(self) -> None:
+        """V7 is scoped to `scope == "path"`. A per-type config is keyed by a
+        type name and carries no `pattern` at all, so applying the four forms
+        there would refuse a config the spec never asked about."""
+        ctx = _make_handler_context()
+        r = await revision_handler(
+            "system/revision", "merge-config",
+            {"data": {
+                "scope": "type",
+                "name": "app/doc",
+                "action": "set",
+                "config": {
+                    "type": "system/revision/merge-config",
+                    "data": {"strategy": "three-way"},
+                },
+            }},
+            ctx,
+        )
+        assert r["status"] == 200, r
 
     @pytest.mark.asyncio
     async def test_op_rejects_handler_sentinel_without_companion_path(self) -> None:
@@ -752,7 +829,7 @@ class TestMergeConfigOperation:
                 "action": "set",
                 "config": {
                     "type": "system/revision/merge-config",
-                    "data": {"pattern": "notes/**", "strategy": "handler"},
+                    "data": {"pattern": "notes/*", "strategy": "handler"},
                 },
             }},
             ctx,
@@ -794,7 +871,7 @@ class TestMergeConfigOperation:
         config — or every config — would read as conformant. Both scopes,
         because the sentinel is legal in each."""
         for scope, name, extra in (
-            ("path", "sentinel-ok", {"pattern": "notes/**"}),
+            ("path", "sentinel-ok", {"pattern": "notes/*"}),
             ("type", "app/note", {}),
         ):
             ctx = _make_handler_context()
@@ -828,7 +905,7 @@ class TestMergeConfigOperation:
             "config": {
                 "type": "system/revision/merge-config",
                 "data": {
-                    "pattern": "idem/**",
+                    "pattern": "idem/*",
                     "strategy": "three-way",
                     "deletion_resolution": "preserve-on-conflict",
                 },
@@ -880,7 +957,7 @@ class TestMergeConfigOperation:
                 "action": "set",
                 "config": {
                     "type": "system/revision/merge-config",
-                    "data": {"pattern": "x/**", "strategy": "source-wins"},
+                    "data": {"pattern": "x/*", "strategy": "source-wins"},
                 },
             }},
             ctx,
@@ -908,7 +985,7 @@ class TestMergeConfigOperation:
                 "action": "set",
                 "config": {
                     "type": "system/revision/merge-config",
-                    "data": {"pattern": "guarded/**", "strategy": "three-way"},
+                    "data": {"pattern": "guarded/*", "strategy": "three-way"},
                 },
                 "expected_hash": b"\x00" + b"\xff" * 32,
             }},

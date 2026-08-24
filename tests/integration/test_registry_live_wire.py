@@ -35,8 +35,14 @@ async def registry_peer():
 
     _emit(peer, "system/registry/issuer-policy",
           Entity(type="system/registry/issuer-policy",
+                 # `default_ttl` is not decoration: §6a.9.2 D11 makes a live
+                 # policy without one unstorable, because a request omitting
+                 # `requested_ttl` would resolve to a null ttl and mint a
+                 # binding §6a.3 forbids. This fixture writes the entity
+                 # directly, so D11 cannot refuse it — D12 would refuse the
+                 # registration instead, one layer later.
                  data={"mode": "open", "allowlist": None,
-                       "name_constraints": None, "default_ttl": None}))
+                       "name_constraints": None, "default_ttl": 86_400_000}))
     _emit(peer, "system/registry/resolver-config",
           Entity(type="system/registry/resolver-config",
                  data={"resolver_chain": [

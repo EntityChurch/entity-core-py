@@ -123,12 +123,19 @@ class IssuerPolicy:
     Every optional field is written on each `set`, absent meaning *unset*. That
     is the spec's replace-whole rule surfacing as a value type: there is no way
     to spell "leave this one alone."
+
+    **`default_ttl` and `max_ttl` are optional here and required on the wire**
+    for any live-registration mode (§6a.9.2 D11, §6a.9.1 v1.11). They stay
+    `None`-able on this type deliberately: a client that cannot express the
+    refused shape cannot exercise the refusal, and the peer's `400` is the
+    contract — an SDK-side pre-check would hide which side enforces it.
     """
 
     mode: str
     allowlist: list[str] | None = None
     name_constraints: Any | None = None
     default_ttl: int | None = None
+    max_ttl: int | None = None
 
     def to_data(self) -> dict[str, Any]:
         return {
@@ -136,6 +143,7 @@ class IssuerPolicy:
             "allowlist": self.allowlist,
             "name_constraints": self.name_constraints,
             "default_ttl": self.default_ttl,
+            "max_ttl": self.max_ttl,
         }
 
     @classmethod
@@ -147,6 +155,7 @@ class IssuerPolicy:
             allowlist=list(allowlist) if isinstance(allowlist, list) else None,
             name_constraints=d.get("name_constraints"),
             default_ttl=d.get("default_ttl"),
+            max_ttl=d.get("max_ttl"),
         )
 
 

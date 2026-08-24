@@ -322,10 +322,14 @@ def _check_type_pattern(
 ) -> tuple[bool, str]:
     """§6.2 type_pattern: child pattern is more specific.
 
-    Concretely: child is more specific iff child equals parent OR
-    parent uses ``**``/``*`` segments that child collapses to literal
-    segments (longer literal prefix). The spec text is "more specific
-    (longer prefix or exact match)" — we accept either.
+    Concretely: child is more specific iff child equals parent OR child
+    extends parent's literal prefix. The spec text is "more specific (longer
+    prefix or exact match)" — we accept either.
+
+    The rule is unchanged by the §4.6 matcher ruling and the comparison never
+    depended on the matcher's semantics, but this docstring named ``**`` as a
+    form and that token is reserved nowhere in the corpus — §5.4's vocabulary
+    is exact / `prefix/*` subtree / bare `*`.
     """
     c = child.get("pattern")
     p = parent.get("pattern")

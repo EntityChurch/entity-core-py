@@ -122,6 +122,24 @@ class HandlerRegistry:
                 return registered
         return None
 
+    def unregister(self, pattern: str) -> bool:
+        """Remove the handler registered at exactly ``pattern``.
+
+        Returns True if one was removed. Exact-pattern keyed, never globbed:
+        the caller is undoing a specific registration, so a glob here could
+        take down a neighbour that merely matches.
+
+        **Not a public SDK surface.** `SDK-OPERATIONS` §11.6 is explicit that
+        *"direct access to the underlying handler dispatch index MUST NOT be
+        part of the SDK's public API surface"* — the `register_handler`
+        primitive's handle is the only sanctioned way to reach this, and it is
+        what pairs the removal with the tree entries. This method exists for
+        that handle to call.
+        """
+        before = len(self._handlers)
+        self._handlers = [h for h in self._handlers if h.pattern != pattern]
+        return len(self._handlers) != before
+
     def list_handlers(self) -> list[RegisteredHandler]:
         """List all registered handlers.
 

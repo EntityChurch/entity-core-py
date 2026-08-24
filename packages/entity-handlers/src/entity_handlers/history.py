@@ -113,15 +113,57 @@ def canonicalize_pattern(pattern: str, local_peer_id: str) -> str:
     return f"/{local_peer_id}/{pattern}"
 
 
-def pattern_specificity(pattern: str) -> tuple[int, int]:
-    """Compute specificity for pattern ordering.
+def pattern_specificity(pattern: str) -> tuple[int, int, str]:
+    """`EXTENSION-HISTORY` §6.2 — the ordering key, **three** keys `[MUST,
+    v1.7]`. Compare as an ordered tuple, most significant first; higher wins.
 
-    Returns (literal_segment_count, total_depth) where higher = more specific.
-    Per EXTENSION-HISTORY Section 2.2: more literal segments wins, then depth.
+    | 1 | count of **literal** (non-`*`) segments |
+    | 2 | **total** segment depth |
+    | 3 | lexicographic byte order on the canonicalized pattern — **lower** wins |
+
+    **Key 3 is what makes the order total**, which keys 1-2 are not: `a/*/c` and
+    `a/b/*` are each 2 literal segments at depth 3, and §6.2's pseudocode
+    compares with `>` while `list_entities` ordering is unspecified. Two peers
+    with identical configs would then record history under different settings,
+    with nothing failing anywhere. It is negated below so a single `>` compare
+    keeps working with "lower wins" on that key alone.
+
+    §2.2's peer-ID rule needs no separate key: an explicit peer segment is
+    literal and a `*` peer segment is not, so key 1 already ranks
+    `/{peerA}/project/*` above `*/project/*`.
+
+    **The name is not unique in the corpus and this definition is history-local.**
+    `EXTENSION-REVISION` §5.1 calls a `pattern_specificity` over merge patterns
+    with a different order (form rank, then literal length). Neither confers a
+    reading on the other, and one shared implementation would be wrong at
+    whichever site it did not come from — see `_merge_config_order_key`.
+
+    This returns the spec's tuple as the spec presents it. Selection uses
+    `_config_order_key` below, because key 3 runs the *opposite* direction from
+    keys 1-2 and no single-direction comparison can carry all three: negating
+    the string to force one direction gets the prefix case backwards (`a` must
+    beat `ab`, and every inversion trick reverses that).
     """
     segments = [s for s in pattern.split("/") if s]
     literal_count = sum(1 for s in segments if s != "*")
-    return (literal_count, len(segments))
+    return (literal_count, len(segments), pattern)
+
+
+def _config_order_key(pattern: str) -> tuple[int, int, str]:
+    """`pattern_specificity` as a sort key — **lower sorts more specific**,
+    select with `min`. Keys 1-2 negated, key 3 as-is.
+
+    Three keys, because three is what §6.2 pins. Note that this does **not**
+    quite make the order total the way the section claims: two configs stored
+    under different `{name}`s may carry the *same* pattern, and then all three
+    keys tie and enumeration decides again. `EXTENSION-REVISION` §5.1 closes
+    exactly that residue with a fourth key on `{name}`; §6.2 stops at three.
+    Reported rather than fixed unilaterally — inventing a fourth key here would
+    be a selection rule no other seat implements, which is the divergence the
+    ruling exists to close.
+    """
+    literal_count, depth, canonical = pattern_specificity(pattern)
+    return (-literal_count, -depth, canonical)
 
 
 # =============================================================================
@@ -171,17 +213,17 @@ class _ConfigIndex:
         from entity_core.capability.checking import matches_pattern
 
         best: HistoryConfig | None = None
-        best_spec = (-1, -1)
+        best_key: tuple[int, int, str] | None = None
 
         for config in self._configs.values():
             if not config.enabled:
                 continue
             canonical = canonicalize_pattern(config.pattern, self._local_peer_id)
             if matches_pattern(canonical, path):
-                spec = pattern_specificity(canonical)
-                if spec > best_spec:
+                key = _config_order_key(canonical)
+                if best_key is None or key < best_key:
                     best = config
-                    best_spec = spec
+                    best_key = key
 
         return best
 

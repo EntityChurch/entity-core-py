@@ -54,6 +54,19 @@ BLANKET = {
     ]
 }
 
+#: §6a.9.2 D11 — a live-registration policy MUST carry a `default_ttl`, so
+#: every policy in this file that is meant to be *stored* names one. Until D11
+#: landed they all omitted it, which means the whole registry surface here was
+#: exercised against a policy that could only mint bindings §6a.3 forbids: the
+#: helpers were minting the one form the rule now refuses, and nothing looked
+#: wrong because no test read the ttl a binding ended up with.
+_LIVE_TTL = 86_400_000
+
+#: §6a.9.1 v1.11 — and a live policy MUST carry `max_ttl` too. Generous, for
+#: the same reason: these tests are not about the ceiling, and a low one would
+#: clamp every binding they assert on without saying so.
+_LIVE_MAX_TTL = 365 * 86_400_000
+
 
 @pytest.fixture
 def peer():
@@ -127,7 +140,7 @@ class TestIssuerPolicy:
         assert exc.value.status == 404
 
     async def test_set_then_get_round_trips(self, client):
-        stored = await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        stored = await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
         assert stored.mode == "open"
 
         read_back = await get_issuer_policy(client)
@@ -144,24 +157,59 @@ class TestIssuerPolicy:
         failure. This goes through the client, and the assertion is simply that
         it comes back with the policy rather than a 400.
         """
-        await set_issuer_policy(client, IssuerPolicy(mode="allowlist", allowlist=[]))
+        await set_issuer_policy(client, IssuerPolicy(mode="allowlist", allowlist=[], default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
         assert (await get_issuer_policy(client)).mode == "allowlist"
 
     async def test_the_policy_is_replaced_whole_not_merged(self, client):
         """`[MUST]` — an absent optional field means *unset*, never
         *unchanged*. A merge would make the stored policy depend on write
-        order, which two peers cannot reconstruct."""
+        order, which two peers cannot reconstruct.
+
+        Demonstrated on `name_constraints`, not on `default_ttl`. This test
+        used to drop the ttl, and D11 has since made that the one field a live
+        policy cannot drop — so it stopped being able to prove replace-whole
+        without also proving something the spec forbids. The rule is unchanged;
+        only the field carrying the demonstration moved.
+        """
         await set_issuer_policy(
             client,
-            IssuerPolicy(mode="allowlist", allowlist=["a"], default_ttl=60_000),
+            IssuerPolicy(
+                mode="allowlist", allowlist=["a"],
+                name_constraints="*.lab", default_ttl=60_000, max_ttl=_LIVE_MAX_TTL,
+            ),
         )
-        assert (await get_issuer_policy(client)).default_ttl == 60_000
+        stored = await get_issuer_policy(client)
+        assert stored.name_constraints == "*.lab" and stored.default_ttl == 60_000
 
-        # Same mode, no ttl. The stored ttl must be gone, not retained.
-        await set_issuer_policy(client, IssuerPolicy(mode="allowlist", allowlist=["a"]))
+        # Same mode, no constraint. The stored one must be gone, not retained.
+        await set_issuer_policy(
+            client, IssuerPolicy(mode="allowlist", allowlist=["a"], default_ttl=60_000,
+                         max_ttl=_LIVE_MAX_TTL),
+        )
         after = await get_issuer_policy(client)
-        assert after.default_ttl is None
+        assert after.name_constraints is None
         assert after.allowlist == ["a"]
+
+    async def test_a_live_policy_without_a_default_ttl_is_refused(self, client):
+        """§6a.9.2 D11 `[MUST]` — the refusal, at the SDK boundary.
+
+        Every mode that can reach *approve* is covered, because "live" is the
+        property that matters and `manual` reaches approve by a slower route.
+        The negative half matters as much as the status: a peer that answers
+        400 and stores the policy anyway passes a status-only check.
+        """
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
+
+        for policy in (
+            IssuerPolicy(mode="open", max_ttl=_LIVE_MAX_TTL),
+            IssuerPolicy(mode="allowlist", allowlist=["a"], max_ttl=_LIVE_MAX_TTL),
+            IssuerPolicy(mode="manual", max_ttl=_LIVE_MAX_TTL),
+        ):
+            with pytest.raises(BadRequest) as exc:
+                await set_issuer_policy(client, policy)
+            assert exc.value.status == 400, policy.mode
+
+        assert (await get_issuer_policy(client)).default_ttl == _LIVE_TTL
 
     async def test_domain_control_is_refused_by_the_registry_not_pre_empted(self, client):
         """§6a.9.1 — the registry refuses to *store* a mode it cannot enforce,
@@ -181,7 +229,7 @@ class TestIssuerPolicy:
 
 class TestRegister:
     async def test_open_mode_binds_and_returns_the_binding_hash(self, client, publisher):
-        await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
 
         result = await register(client, publisher, "alice")
 
@@ -195,7 +243,7 @@ class TestRegister:
     async def test_manual_mode_queues_and_202_is_not_a_failure(self, client, publisher):
         """§6a.9: the 202 is accepted-pending, and `system/protocol/error` MUST
         NOT carry it — so this must return a result, not raise."""
-        await set_issuer_policy(client, IssuerPolicy(mode="manual"))
+        await set_issuer_policy(client, IssuerPolicy(mode="manual", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
 
         result = await register(client, publisher, "bob")
 
@@ -211,7 +259,7 @@ class TestRegister:
         """§6a.9 layer-1: the signature must be *by* `target_peer_id`, so the
         two can never legitimately differ. The wrapper takes only a keypair —
         there is no parameter with which to express a mismatch."""
-        await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
         await register(client, publisher, "carol")
 
         binding = await client.get("system/registry/binding/by-name/carol")
@@ -221,7 +269,7 @@ class TestRegister:
     async def test_an_allowlist_refusal_surfaces_as_a_typed_error(self, client, publisher):
         """Layer-2 admission: proof accepted, policy says no → 403."""
         await set_issuer_policy(
-            client, IssuerPolicy(mode="allowlist", allowlist=["someone-else"])
+            client, IssuerPolicy(mode="allowlist", allowlist=["someone-else"], default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL)
         )
 
         from entity_sdk import AuthorizationError
@@ -234,7 +282,7 @@ class TestRegister:
     async def test_a_replayed_nonce_is_rejected(self, client, publisher):
         """`REG-REGISTER-REPLAY-1`. The nonce is injectable precisely so this
         is drivable without racing a clock or hoping for a collision."""
-        await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
         nonce = b"\x01" * 16
 
         first = await register(client, publisher, "erin", nonce=nonce)
@@ -285,7 +333,7 @@ class TestReplayDefenseDiscriminator:
         no-op. §6a.9: the fields *"would be harmless but add no security and
         break cohort convergence."*
         """
-        await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
         bound = await register(client, publisher, "frank")
         assert bound.binding_hash is not None
 
@@ -349,7 +397,7 @@ class TestLayer1ProofReachesTheHandlerOnBothDispatchPaths:
         )
         from entity_core.protocol.entity import Entity
 
-        await set_issuer_policy(client, IssuerPolicy(mode="open"))
+        await set_issuer_policy(client, IssuerPolicy(mode="open", default_ttl=_LIVE_TTL, max_ttl=_LIVE_MAX_TTL))
 
         data = {
             "name": "grace",

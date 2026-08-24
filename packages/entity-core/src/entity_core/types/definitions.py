@@ -2540,7 +2540,11 @@ def type_system_revision_log_params() -> Entity:
             "fields": {
                 "prefix": {"type_ref": "system/tree/path"},
                 "limit": {"type_ref": "primitive/uint", "optional": True},
-                "since": {"type_ref": "system/hash", "optional": True},
+                # RENAMED from `since` — `fetch.since` is an exclusive
+                # watermark walking toward *newer*, this is an inclusive anchor
+                # walking toward *older*, and one name meant both. The two
+                # return disjoint sets over the same DAG (SA-PY-7).
+                "start_at": {"type_ref": "system/hash", "optional": True},
             },
         },
     )
@@ -5949,6 +5953,10 @@ def type_system_type_constraint_type_pattern() -> Entity:
     `system/tree/path` fields; validates the referenced entity's
     `type` field matches the glob pattern. Resolution failure
     SHOULD pass with a warning.
+
+    The matcher is `matches_pattern` (`ENTITY-CORE-PROTOCOL` §5.4) applied to
+    the type name — exact / `prefix/*` subtree / bare `*`, and nothing else.
+    No segment-scoped wildcard and no `**`.
     """
     return Entity(
         type="system/type",
@@ -6416,6 +6424,13 @@ def type_system_registry_issuer_policy() -> Entity:
     `allowlist` (only listed peer-ids), `manual` (queue for operator), or the
     DEFERRED `domain-control`. Its presence is what makes a registry *live*; a
     peer with no issuer-policy is curated/static and rejects `register-request`.
+
+    `max_ttl` is REQUIRED and `default_ttl` is not, which follows §6a.9.1's own
+    schema block: `default_ttl: <ms | null>` carries the null, `max_ttl:
+    <ms duration>` does not. Both are refused at `set-issuer-policy` for a live
+    policy (D11 and v1.11), so the declaration and the write gate disagree only
+    for a policy seeded out-of-band — which is the case D12 and the renew
+    cascade's terminal `403` exist to catch at read time.
     """
     return Entity(
         type="system/type",
@@ -6428,6 +6443,7 @@ def type_system_registry_issuer_policy() -> Entity:
                 },
                 "name_constraints": {"type_ref": "primitive/string", "optional": True},
                 "default_ttl": {"type_ref": "primitive/uint", "optional": True},
+                "max_ttl": {"type_ref": "primitive/uint"},
             },
         },
     )

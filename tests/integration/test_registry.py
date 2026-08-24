@@ -341,9 +341,52 @@ async def test_unknown_backend_kind_skipped(peer):
 
 @pytest.mark.asyncio
 async def test_name_format_dispatch_filters_backends(peer):
-    """§4.1 step 2 — a backend mentioned in name_format_dispatch is consulted
-    ONLY when the pattern matches; the local-name store is dispatched to *.local
-    names only here, so a non-matching name misses it."""
+    """§4.1 step 2 — the filter narrows **per name**: the eligible set is the
+    union of `backend_kinds` over the entries whose pattern matches, and a
+    backend outside that set is not consulted however the rest of the list
+    reads.
+
+    The list here is §4.1a's shape in miniature — a scoped row plus a catch-all
+    naming a backend that is not in the chain. `grace` matches only the
+    catch-all, so `local-name` is narrowed out; `grace.local` matches both, so
+    it is back in.
+
+    **This test asserted the same two statuses for the opposite reason until
+    2026-08-18** — a per-backend reading in which `local-name` was excluded by
+    being *mentioned and unmatched* rather than by *not being in the matched
+    union*. The two agree on every configuration where the narrowed backend is
+    in the chain, which is every configuration this suite had. See SA-PY-17.
+    """
+    target = Keypair.generate().peer_id
+    await _call(peer, "bind", {"name": "grace", "target_peer_id": target}, uri="system/registry/local-name")
+    _emit_resolver_config(
+        peer,
+        [{"backend_kind": "local-name", "priority": 0, "accepted_trust_anchors": ["local_name"]}],
+        dispatch=[
+            {"pattern": "*.local", "backend_kinds": ["local-name"]},
+            {"pattern": "*", "backend_kinds": ["did-web"]},
+        ],
+    )
+    # "grace" matches only the catch-all → eligible = {did-web} → local-name out.
+    r = await _call(peer, "resolve", {"name": "grace"})
+    assert r["result"]["data"]["status"] == "chain_exhausted"
+    # "grace.local" matches both → eligible = {local-name, did-web}.
+    await _call(peer, "bind", {"name": "grace.local", "target_peer_id": target}, uri="system/registry/local-name")
+    r = await _call(peer, "resolve", {"name": "grace.local"})
+    assert r["result"]["data"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_a_name_matching_no_entry_reaches_nothing(peer):
+    """SA-PY-17 edge case **B** — a backend named by an entry is consulted
+    *"ONLY when the pattern matches"* (§4.1 step 2, second clause).
+
+    An operator who scopes a backend to a name shape has said in as many words
+    that other shapes must not go there, so a name outside every scope resolves
+    nowhere — loudly (`chain_exhausted`), which is §4.1 step 4's own posture:
+    *"fail-closed; no silent fallback."* `entity-core-go` reads this row the
+    other way (unmatched ⇒ unfiltered); the split is routed, not voted on.
+    """
     target = Keypair.generate().peer_id
     await _call(peer, "bind", {"name": "grace", "target_peer_id": target}, uri="system/registry/local-name")
     _emit_resolver_config(
@@ -351,13 +394,8 @@ async def test_name_format_dispatch_filters_backends(peer):
         [{"backend_kind": "local-name", "priority": 0, "accepted_trust_anchors": ["local_name"]}],
         dispatch=[{"pattern": "*.local", "backend_kinds": ["local-name"]}],
     )
-    # "grace" doesn't match "*.local" → local-name not consulted.
     r = await _call(peer, "resolve", {"name": "grace"})
     assert r["result"]["data"]["status"] == "chain_exhausted"
-    # A matching name is consulted.
-    await _call(peer, "bind", {"name": "grace.local", "target_peer_id": target}, uri="system/registry/local-name")
-    r = await _call(peer, "resolve", {"name": "grace.local"})
-    assert r["result"]["data"]["status"] == "resolved"
 
 
 # ---------------------------------------------------------------------------
@@ -619,10 +657,29 @@ async def test_reg_peerissued_offline_notfound_1(peer, monkeypatch):
 import time as _time
 
 
-def _emit_issuer_policy(peer, mode, *, allowlist=None, name_constraints=None, default_ttl=None):
+#: A live policy MUST define `default_ttl` (§6a.9.2 D11) — a registry without
+#: one can only mint null-ttl bindings, which §6a.3 forbids. This helper writes
+#: the policy entity *directly*, which is exactly the out-of-band seeding path
+#: D11 cannot reach, so it defaults to a valid ttl rather than inheriting the
+#: null that every one of these tests used to arm. Pass `default_ttl=None`
+#: deliberately to seed the bad-stored-policy case D12 answers.
+_LIVE_DEFAULT_TTL_MS = 86_400_000
+
+#: And a live policy MUST define `max_ttl` (§6a.9.1 v1.11), for the same reason
+#: one field over: §6a.3 makes `ttl` the only bound on a withheld revocation, so
+#: an uncapped requester-chosen `ttl` is a binding nobody can revoke in
+#: practice. The default here is generous — these tests are not about the
+#: ceiling and a low one would silently clamp every binding they assert on.
+_LIVE_MAX_TTL_MS = 365 * 86_400_000
+
+
+def _emit_issuer_policy(peer, mode, *, allowlist=None, name_constraints=None,
+                        default_ttl=_LIVE_DEFAULT_TTL_MS,
+                        max_ttl=_LIVE_MAX_TTL_MS):
     pol = Entity(type="system/registry/issuer-policy", data={
         "mode": mode, "allowlist": allowlist,
         "name_constraints": name_constraints, "default_ttl": default_ttl,
+        "max_ttl": max_ttl,
     })
     _emit(peer, "system/registry/issuer-policy", pol)
 
@@ -1204,12 +1261,102 @@ async def test_reg_renew_request_supersedes(peer):
 async def test_reg_set_get_issuer_policy(peer):
     """§6a.9.2 — `:set-issuer-policy` installs the policy `:get-issuer-policy`
     reads back, and `set` echoes the stored policy as written."""
-    r = await _call(peer, "set-issuer-policy", {"mode": "allowlist", "allowlist": ["p1"]})
+    r = await _call(peer, "set-issuer-policy", {
+        "mode": "allowlist", "allowlist": ["p1"], "default_ttl": 60_000,
+        "max_ttl": _LIVE_MAX_TTL_MS,
+    })
     assert r["status"] == 200
     assert r["result"]["type"] == "system/registry/issuer-policy"
     assert r["result"]["data"]["mode"] == "allowlist"
     got = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
     assert got["mode"] == "allowlist" and got["allowlist"] == ["p1"]
+
+
+@pytest.mark.asyncio
+async def test_reg_set_issuer_policy_null_default_ttl_400(peer):
+    """§6a.9.2 D11 [MUST] — a live-registration policy with `default_ttl: null`
+    can only mint null-ttl bindings (§6a.3 forbids them, §6a.4 cannot resolve
+    them), so `set` refuses to *store* it. Same move, same subsection and same
+    stated reason as the `domain-control` refusal above.
+
+    The negative half is the point: a status-only check passes a peer that
+    answers 400 and stores the policy anyway. `entity-core-go`'s probe says so
+    in as many words, so the read-back is asserted here too.
+    """
+    await _call(peer, "set-issuer-policy", {
+        "mode": "open", "default_ttl": 60_000, "max_ttl": _LIVE_MAX_TTL_MS,
+    })
+
+    for mode, extra in (("open", {}), ("allowlist", {"allowlist": ["p1"]}), ("manual", {})):
+        r = await _call(peer, "set-issuer-policy", {
+            "mode": mode, "max_ttl": _LIVE_MAX_TTL_MS, **extra,
+        })
+        assert r["status"] == 400, f"{mode}: a null-default_ttl policy was stored"
+
+    # ...and the rejected write did not overwrite the good policy.
+    got = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
+    assert got["default_ttl"] == 60_000, "the refused policy was stored anyway"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["open", "manual"])
+async def test_reg_null_ttl_stored_policy_fails_closed_403(peer, mode):
+    """§6a.9 D12 [MUST] — the backstop D11 cannot reach.
+
+    D11 refuses to *store* a null-`default_ttl` live policy, but §6a.9.2's
+    store-first resolution admits three ways one is already there: seeded by a
+    CLI flag, written straight to the tree, or predating the rule. This test
+    takes the second, via `_emit_issuer_policy`, which is the only path that
+    can still produce the bad state.
+
+    Both halves are asserted. **403 `policy_rejected`**, and **nothing
+    published** — for `manual` that means no queue entry either, which is why
+    the refusal sits before the mode branch rather than on the issue path.
+    Substituting an implementation-chosen default would be the same mistake
+    §6a.9.2 rejects for `get-issuer-policy`: an operator's omission turned into
+    a silently-invented policy, here on a field that sets binding lifetime.
+    """
+    _emit_issuer_policy(peer, mode, default_ttl=None)
+    reg_kp = Keypair.generate()
+    data = _register_data(reg_kp.peer_id, "nullttl.lab")   # no requested_ttl
+    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
+
+    r = await _call(peer, "register-request", data)
+
+    assert r["status"] == 403, f"{mode}: a null-ttl binding path was not refused"
+    assert r["result"]["data"]["code"] == "policy_rejected"
+    # Published nothing: the name never became resolvable, and — the half that
+    # only `manual` can fail — no pending head was queued either. Refusing on
+    # the issue path alone would leave the operator a queue entry to approve
+    # whose terms are a null ttl.
+    resolved = await _call(peer, "resolve", {"name": "nullttl.lab"})
+    assert resolved["result"]["data"]["status"] != "resolved"
+    assert _by_request(peer, reg_kp.peer_id, "nullttl.lab") is None, (
+        f"{mode}: nothing may be published, and a queue entry is a publication"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reg_a_request_carrying_its_own_ttl_survives_the_null_policy(peer):
+    """The teeth control beside D12.
+
+    The refusal above must be attributable to the *resolved* ttl being null,
+    not to the peer refusing every request against a seeded policy. §6a.9.2's
+    resolution is `requested_ttl` first, `default_ttl` second — so the same
+    stored policy with a request that names its own ttl resolves fine and MUST
+    bind. Without this row, a peer that rejected all registration would read
+    green on D12.
+    """
+    _emit_issuer_policy(peer, "open", default_ttl=None)
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    data = _register_data(reg_kp.peer_id, "hasttl.lab", requested_ttl=60_000)
+    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
+
+    r = await _call(peer, "register-request", data)
+
+    assert r["status"] == 200, "a request carrying its own ttl was refused"
+    assert (await _call(peer, "resolve", {"name": "hasttl.lab"}))["result"]["data"]["status"] == "resolved"
 
 
 @pytest.mark.asyncio
@@ -1239,17 +1386,26 @@ async def test_reg_set_issuer_policy_replaces_whole(peer):
     """§6a.9.2 [MUST] — replace-whole, not merge. An optional field absent from
     the second write means *unset*, not *unchanged*; merge semantics would make
     the stored policy depend on write order, which two peers cannot
-    reconstruct."""
+    reconstruct.
+
+    Demonstrated on `allowlist` and `name_constraints` rather than on
+    `default_ttl`, which this test used to unset: D11 now makes `default_ttl`
+    the one field a live policy cannot drop, so it is the wrong field to prove
+    replace-whole with. The rule itself is unchanged — every *droppable*
+    optional field still drops."""
     await _call(peer, "set-issuer-policy", {
         "mode": "allowlist", "allowlist": ["p1"],
         "name_constraints": "*.lab", "default_ttl": 60_000,
+        "max_ttl": _LIVE_MAX_TTL_MS,
     })
-    await _call(peer, "set-issuer-policy", {"mode": "open"})
+    await _call(peer, "set-issuer-policy", {
+        "mode": "open", "default_ttl": 90_000, "max_ttl": _LIVE_MAX_TTL_MS,
+    })
     got = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
     assert got["mode"] == "open"
     assert got["allowlist"] is None
     assert got["name_constraints"] is None
-    assert got["default_ttl"] is None
+    assert got["default_ttl"] == 90_000
 
 
 @pytest.mark.asyncio

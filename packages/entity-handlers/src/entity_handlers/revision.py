@@ -21,11 +21,10 @@ Operations (17 total):
 
 from __future__ import annotations
 
-import fnmatch
 import logging
 from collections import deque
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
@@ -43,6 +42,10 @@ from entity_core.types.deletion_marker import (
 )
 from entity_core.utils.ecf import Hash, compute_ecf_hash, hash_to_display, is_zero_hash
 from entity_handlers.manifest import error_response as _error_response
+
+if TYPE_CHECKING:
+    from entity_core.storage.content_store import ContentStore
+    from entity_core.storage.entity_tree import EntityTree
 
 logger = logging.getLogger(__name__)
 
@@ -154,14 +157,27 @@ def _prefix_encompasses(prefix: str, required_path: str) -> bool:
 
 
 def _exclude_covers(exclude_patterns: list[str], required_path: str) -> bool:
-    """True if the exclude list covers the required path.
+    """True if the exclude list actually keeps everything under `required_path`
+    out of the versioned bindings, **under §2.4's four forms**.
 
-    Accepts both `"system/revision/**"` and `"system/revision/"` style patterns.
+    Only two of the four forms can cover a subtree: form 1 (`*`) and form 2
+    (`<literal>/*`, which crosses `/` at any depth). Form 3 is a suffix and
+    form 4 is exact, so neither can.
+
+    Until the four-forms ruling this accepted `"system/revision/**"` *and*
+    `"system/revision/"`. Both are now wrong in the same direction and it
+    matters: `**` no longer parses (V6 refuses it at write), and the bare
+    trailing-slash spelling is a **form-4 exact** pattern that excludes the
+    single path `system/revision/` and nothing beneath it. Keeping the old
+    leniency would let V2 pass a config whose reentrancy exclusion does not
+    exclude — the self-feeding loop §6.1 exists to prevent, admitted by the
+    check written to forbid it.
     """
+    req = required_path.rstrip("/") + "/"
     for pat in exclude_patterns:
-        norm = pat.rstrip("*").rstrip("/")
-        req = required_path.rstrip("/")
-        if norm == req or req.startswith(norm + "/"):
+        if pat == "*":
+            return True
+        if pat.endswith("/*") and req.startswith(pat[:-1]):
             return True
     return False
 
@@ -529,22 +545,135 @@ def _normalize_merge_sides(
 # =============================================================================
 
 
+def _glob_match(pattern: str, subject: str) -> bool:
+    """`EXTENSION-REVISION` §2.4 `glob_match` — **four closed forms, in order.**
+
+    Hash-determining, so this is wire contract rather than style: the matcher
+    decides trie membership, membership decides the version `root`, and `root`
+    is the version entry's identity. Two peers reading one pattern differently
+    mint different version hashes for identical content with nothing erroring
+    anywhere — which is what SA-PY-11 reported when §2.4 named `glob_match` and
+    defined it nowhere.
+
+    **Reach for no stdlib glob here.** Neither `fnmatch` nor a `path.Match`
+    port is conformant, and the reason is simpler than the withdrawn doublestar
+    pin claimed: *both accept patterns this grammar rejects* (§4.4.17 V6,
+    `validate_exclude_pattern` below). `subject` is the prefix-relative path
+    for `exclude` and the entity type name for `exclude_types`.
+    """
+    # 1. MATCH-ALL.
+    if pattern == "*":
+        return True
+    # 2. SUBTREE PREFIX — `ENTITY-CORE-PROTOCOL` §5.4 `matches_pattern`
+    #    verbatim, so the `*` crosses `/` at any depth. The retained trailing
+    #    "/" is what stops `system/revision/*` matching `system/revisionary`.
+    if pattern.endswith("/*"):
+        return subject.startswith(pattern[:-1])
+    # 3. TRAILING LITERAL — a byte suffix over the WHOLE subject, `/` not
+    #    special. The only addition to §5.4's vocabulary in the corpus,
+    #    scoped to these two fields, because an ignore-list wants extensions.
+    if pattern.startswith("*"):
+        return subject.endswith(pattern[1:])
+    # 4. EXACT — not a prefix: `docs` excludes `docs`, never `docs/x`.
+    return subject == pattern
+
+
+def validate_exclude_pattern(pattern: str) -> bool:
+    """`EXTENSION-REVISION` §4.4.17 **V6** — is `pattern` one of the four forms?
+
+    At most one `*`, positioned as the whole pattern, the final character after
+    `/`, or the first character. `**`, `a/**/b`, `a*b` and `*a*` all fail.
+
+    **Rejection is what closes the divergence, and it is why this exists at
+    all.** A spec that merely omits `**` and one that rejects it are
+    indistinguishable until a config carries one — omission leaves each peer to
+    do something reasonable, and "reasonable" is how `path.Match` and `fnmatch`
+    ended up in two implementations. An unrepresentable config cannot be
+    stored, so no two conformant peers can hold patterns they evaluate
+    differently. `REV-GLOB-REJECT-1` is the vector that enforces it.
+    """
+    if not isinstance(pattern, str):
+        return False
+    if pattern.count("*") > 1:
+        return False
+    if "*" not in pattern:
+        return True                      # form 4
+    if pattern == "*":
+        return True                      # form 1
+    if pattern.endswith("/*"):
+        return True                      # form 2 — final char, preceded by "/"
+    return pattern.startswith("*")       # form 3 — first char
+
+
+def _matches_any_glob(name: str, patterns: list[str] | None) -> bool:
+    return any(_glob_match(p, name) for p in (patterns or []))
+
+
+def compute_versioned_bindings(
+    tree: "EntityTree",
+    content_store: "ContentStore",
+    prefix: str,
+    config: dict[str, Any] | None,
+) -> dict[str, bytes]:
+    """`EXTENSION-REVISION` §2.4 — the prefix's bindings, exclude-filtered.
+
+    §2.4's *"Exclude applies to trie building"* is a MUST, and this repo
+    applied excludes **nowhere** until 2026-08-18: the field was validated at
+    config write (§4.4.17 V1-V5) and read by no consumer, so an exclude list
+    was accepted, stored, and applied to nothing. Filed as SA-PY-8 and ruled
+    confirmed by arch (`ROUTING-2026-08-18-c` §3), which also established that
+    the *auto-version* root must be this same filtered trie — see
+    `entity_handlers.auto_version`, which now calls this rather than reading
+    the tracked structural root.
+
+    `exclude_types` is matched by **glob**, per §2.4's pseudocode
+    (`glob_match(pattern, entity.type)`). `entity-core-go` matches it by
+    **exact equality** (`matchesAnyExact`), so any `exclude_types` entry
+    carrying a metacharacter is a live cross-impl root divergence — filed as
+    SA-PY-11. Patterns without metacharacters behave identically, which is
+    every pattern either implementation currently ships.
+    """
+    full_prefix = tree.normalize_uri(prefix)
+    exclude = list((config or {}).get("exclude") or [])
+    exclude_types = list((config or {}).get("exclude_types") or [])
+
+    bindings: dict[str, bytes] = {}
+    for uri in tree.list_prefix(full_prefix):
+        h = tree.get(uri)
+        if not h:
+            continue
+        relative = uri[len(full_prefix):]
+        if not relative:
+            continue
+        if _matches_any_glob(relative, exclude):
+            continue
+        if exclude_types:
+            entity = content_store.get(h)
+            if entity is not None and _matches_any_glob(entity.type, exclude_types):
+                continue
+        bindings[relative] = h
+
+    return bindings
+
+
 def _get_snapshot_bindings(
     ctx: HandlerContext,
     prefix: str,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, bytes]:
-    """Get current tree bindings for a prefix (excluding system/ paths)."""
-    tree = ctx.emit_pathway.entity_tree
-    full_prefix = tree.normalize_uri(prefix)
-    bindings: dict[str, bytes] = {}
+    """Current tree bindings for a prefix, exclude-filtered when `config` is given.
 
-    for uri in tree.list_prefix(full_prefix):
-        h = tree.get(uri)
-        if h:
-            relative = uri[len(full_prefix):]
-            bindings[relative] = h
-
-    return bindings
+    `config` is **not** defaulted from the tree here on purpose: the callers
+    that build a *version* trie must filter, and a caller reading live tree
+    state for some other purpose must not silently inherit that. Passing it is
+    the statement of which one you are.
+    """
+    return compute_versioned_bindings(
+        ctx.emit_pathway.entity_tree,
+        ctx.emit_pathway.content_store,
+        prefix,
+        config,
+    )
 
 
 def _get_version_bindings(
@@ -723,9 +852,55 @@ def _compute_snapshot_diff(
     }
 
 
-def _pattern_specificity(pattern: str) -> int:
-    """Score a glob pattern by specificity — more literal characters = higher."""
-    return len(pattern) - pattern.count("*") - pattern.count("?")
+def _merge_pattern_rank(pattern: str) -> int:
+    """`EXTENSION-REVISION` §5.1 `[v3.12]` — the rank of a merge-config pattern
+    among §2.4's four forms, most specific first.
+
+    | 3 | `<literal>` exact         | constrains the whole subject |
+    | 2 | `<literal>/*` subtree     | anchored at the trie root    |
+    | 1 | `*<literal>` byte suffix  | unanchored, matches at any depth |
+    | 0 | `*` match-all             | constrains nothing |
+
+    **Rank 2 above rank 1 is the one genuinely chosen rung** and the spec
+    records it as a choice: for `docs/a.lock` both `docs/*` and `*.lock` match
+    and neither contains the other. The prefix wins because it names a location
+    the operator laid out, while the suffix names a file kind that may appear
+    anywhere — the narrower claim is the located one.
+    """
+    if pattern == "*":
+        return 0
+    if pattern.endswith("/*"):
+        return 2
+    if pattern.startswith("*"):
+        return 1
+    return 3
+
+
+def _merge_config_order_key(pattern: str, name: str) -> tuple[int, int, str, str]:
+    """`EXTENSION-REVISION` §5.1 `pattern_specificity` — the **total** order,
+    pinned `[v3.12]`. Lower sorts more specific; select with `min`.
+
+    Rank, then literal length (the pattern with its single `*` removed —
+    longer wins within a rank), then lexicographic byte order on `pattern`, then
+    on the config's `{name}`.
+
+    **The last two keys are the requirement, not decoration.** Two configs may
+    legitimately carry the same `pattern` under different `{name}`s, so rank
+    plus length is not yet total — and the `specificity > best` comparison this
+    replaced kept whichever config `list_entities` happened to yield first.
+    `list_entities` ordering is unspecified, so two peers with identical configs
+    and identical content could resolve one conflict differently, with nothing
+    failing anywhere. Both tiebreak keys are peer-independent by construction.
+
+    **This function is revision-local and the name is not unique in the
+    corpus.** `EXTENSION-HISTORY` §6.2 calls a `pattern_specificity` over a
+    different domain (tree paths) with a different order (literal *segments*,
+    then depth, then lexicographic). Neither confers a reading on the other, and
+    sharing one implementation between the two sites is wrong at whichever site
+    it did not come from — which is why this one is named for its subject.
+    """
+    return (-_merge_pattern_rank(pattern), -len(pattern.replace("*", "", 1)),
+            pattern, name)
 
 
 def _find_merge_strategy(
@@ -748,10 +923,14 @@ def _find_merge_strategy(
     how this limb stayed unbuilt here. `handler_path` is None for every
     built-in strategy.
 
-    A `pattern: "*"` config matches ALL paths, at any depth: `fnmatch` has no
-    segment concept and translates `*` to `.*`. That is §5.1's reading (and
-    v7.70 A1's peer-wide footgun) — see `TestMergeConfigStarScope`, which
-    exists so a swap to a segment-aware matcher cannot narrow it silently.
+    A `pattern: "*"` config matches ALL paths, at any depth — §2.4 form 1,
+    which is §5.1's reading and v7.70 A1's peer-wide footgun. See
+    `TestMergeConfigStarScope`, which exists so a swap to a segment-aware
+    matcher cannot narrow it silently.
+
+    The matcher is `_glob_match`, per §2.3's own pseudocode. It was `fnmatch`
+    until SA-PY-12 — which reached the same answer for `"*"` and a different
+    one for everything else `fnmatch` can express.
     """
     cs = ctx.emit_pathway.content_store
     tree = ctx.emit_pathway.entity_tree
@@ -774,11 +953,44 @@ def _find_merge_strategy(
                 config_entity.data.get("handler"),
             )
 
-    config_prefix = "system/revision/config/merge/path/"
-    full_config_prefix = tree.normalize_uri(config_prefix)
+    best_key: tuple[int, int, str, str] | None = None
     best_strategy: str | None = None
     best_handler: str | None = None
-    best_specificity = -1
+
+    for config, pattern, name in _matching_merge_configs(ctx, prefix + path):
+        key = _merge_config_order_key(pattern, name)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_strategy = config.data.get("strategy")
+            best_handler = config.data.get("handler")
+
+    if best_strategy:
+        return best_strategy, best_handler
+
+    return "three-way", None
+
+
+def _matching_merge_configs(ctx: HandlerContext, full_path: str):
+    """Every per-path merge-config whose `pattern` matches `full_path`, as
+    `(config_entity, pattern, config_name)`.
+
+    One walk, shared by the strategy lookup and the `deletion_resolution`
+    lookup, because two copies of a selection rule is how the two drift — and
+    the rule they share is now a four-key total order rather than a scalar
+    compare, which is more than enough surface to drift on.
+
+    The matcher is `_glob_match`. §2.3's own pseudocode calls `glob_match`
+    here, so this is that matcher and not a stdlib one. It was
+    `fnmatch.fnmatch` until SA-PY-12, which accepts `?`, character classes and
+    infix `a*b` — none of which any conformant peer can evaluate, and all of
+    which select a merge *strategy*, so they reach the merged content and its
+    hash. See `docs/SPEC-AMBIGUITIES.md` SA-PY-12 for the tension this sits on:
+    §2.4 scopes the four forms to `exclude`/`exclude_types` "and nowhere else",
+    while §2.3 invokes the function by name here.
+    """
+    cs = ctx.emit_pathway.content_store
+    tree = ctx.emit_pathway.entity_tree
+    full_config_prefix = tree.normalize_uri("system/revision/config/merge/path/")
 
     for uri in tree.list_prefix(full_config_prefix):
         config_hash = tree.get(uri)
@@ -788,20 +1000,10 @@ def _find_merge_strategy(
         if not config or not config.data:
             continue
         pattern = config.data.get("pattern")
-        if not pattern:
+        if not isinstance(pattern, str) or not pattern:
             continue
-        full_path = prefix + path
-        if fnmatch.fnmatch(full_path, pattern):
-            specificity = _pattern_specificity(pattern)
-            if specificity > best_specificity:
-                best_strategy = config.data.get("strategy")
-                best_handler = config.data.get("handler")
-                best_specificity = specificity
-
-    if best_strategy:
-        return best_strategy, best_handler
-
-    return "three-way", None
+        if _glob_match(pattern, full_path):
+            yield config, pattern, uri.rsplit("/", 1)[-1]
 
 
 def _find_deletion_resolution(
@@ -822,32 +1024,17 @@ def _find_deletion_resolution(
     write time. Defensive read-time guard collapses any non-conforming
     value back to the default via `_effective_deletion_resolution`.
     """
-    cs = ctx.emit_pathway.content_store
-    tree = ctx.emit_pathway.entity_tree
-
-    config_prefix = "system/revision/config/merge/path/"
-    full_config_prefix = tree.normalize_uri(config_prefix)
+    best_key: tuple[int, int, str, str] | None = None
     best_value: str | None = None
-    best_specificity = -1
 
-    for uri in tree.list_prefix(full_config_prefix):
-        config_hash = tree.get(uri)
-        if not config_hash:
+    for config, pattern, name in _matching_merge_configs(ctx, prefix + path):
+        dr = config.data.get("deletion_resolution")
+        if dr is None:
             continue
-        config = cs.get(config_hash)
-        if not config or not config.data:
-            continue
-        pattern = config.data.get("pattern")
-        if not pattern:
-            continue
-        full_path = prefix + path
-        if fnmatch.fnmatch(full_path, pattern):
-            dr = config.data.get("deletion_resolution")
-            if dr is not None:
-                specificity = _pattern_specificity(pattern)
-                if specificity > best_specificity:
-                    best_value = dr
-                    best_specificity = specificity
+        key = _merge_config_order_key(pattern, name)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_value = dr
 
     return _effective_deletion_resolution(best_value)
 
@@ -1236,8 +1423,9 @@ async def _handle_commit(
     if not ctx.check_caller_permission("commit", prefix):
         return _error_response(403, "forbidden", f"Capability doesn't grant commit on: {prefix}")
 
-    # Get current bindings
-    bindings = _get_snapshot_bindings(ctx, prefix)
+    # Get current bindings, exclude-filtered per §2.4 ("Exclude applies to
+    # trie building" — a MUST this repo applied nowhere until 2026-08-18).
+    bindings = _get_snapshot_bindings(ctx, prefix, _get_config(ctx, ph))
 
     # Get current HEAD (resolve before computing the trie so we can
     # diff against the parent version's bindings — required by §6.1
@@ -1320,15 +1508,43 @@ async def _handle_log(
     params: dict[str, Any],
     ctx: HandlerContext,
 ) -> dict[str, Any]:
-    """List version history with pagination."""
+    """List version history with pagination, newest first.
+
+    Anchored by **`start_at`**, an *inclusive* anchor: the walk begins AT that
+    version and proceeds toward older ones. `since` is refused — see below.
+    """
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
     limit = params.get("limit")
-    since = params.get("since")
+
+    # `since` is REFUSED on log, and the refusal is deliberate rather than
+    # ordinary unknown-field tolerance. §4.4.2 carried `since` until the
+    # rename, and `fetch` still does — with the opposite meaning. Measured on
+    # this engine over `v1 → v2 → v3`: `fetch(since=v2)` → `[v3]` (newer,
+    # exclusive watermark), `log(since=v2)` → `[v2, v1]` (older, inclusive
+    # cursor). **Disjoint**, from one field name, with no error anywhere; that
+    # measurement is what promoted the rename to a determinism pin (SA-PY-7).
+    #
+    # Ignoring the field would silently answer from HEAD — the worst of the
+    # three options, because a caller paging with the old spelling gets a
+    # plausible page that is not the one they asked for. So the error names
+    # the operation each spelling belongs to, per this repo's rule that a
+    # documented mistake gets a mapping and not a bare "invalid".
+    if params.get("since") is not None:
+        return _error_response(
+            400, "invalid_params",
+            "log takes `start_at`, not `since` (SA-PY-7). `start_at` is an "
+            "INCLUSIVE anchor and walks toward OLDER versions; `fetch` keeps "
+            "`since` as an EXCLUSIVE watermark walking toward NEWER ones. The "
+            "two returned disjoint sets under one name, so the collision was "
+            "removed rather than adjudicated.",
+        )
+
+    start_at = params.get("start_at")
 
     # Get starting point
-    if since:
-        start_hash = since
+    if start_at:
+        start_hash = start_at
     else:
         head_entity = _get_entity_at_path(ctx, _head_path(ph))
         if head_entity is None:
@@ -1416,7 +1632,10 @@ async def _handle_status(
     if local_hash:
         head_bindings = _get_version_bindings(ctx, local_hash)
         if head_bindings is not None:
-            current_bindings = _get_snapshot_bindings(ctx, prefix)
+            # Filtered, because this count is compared against a version's
+            # own bindings — an unfiltered live read would report every
+            # excluded path as a pending change, forever.
+            current_bindings = _get_snapshot_bindings(ctx, prefix, _get_config(ctx, ph))
             for path in current_bindings:
                 if path not in head_bindings:
                     pending += 1
@@ -2289,8 +2508,9 @@ async def _handle_cherry_pick(
 
     # Compute target tree bindings (current + diff) WITHOUT mutating the tree,
     # so we can build the trie, create the version, and advance head BEFORE
-    # applying bindings (§6A.2 structural rule).
-    current_bindings = _get_snapshot_bindings(ctx, prefix)
+    # applying bindings (§6A.2 structural rule). Filtered — this becomes a
+    # version trie, so §2.4 binds it.
+    current_bindings = _get_snapshot_bindings(ctx, prefix, _get_config(ctx, ph))
     target_bindings = dict(current_bindings)
     for path, h in diff["added"].items():
         target_bindings[path] = h
@@ -2436,7 +2656,8 @@ async def _handle_revert(
 
     # Compute target tree bindings (current + inverse diff) without mutating
     # the tree, so head advances BEFORE binding application (§6A.3).
-    current_bindings = _get_snapshot_bindings(ctx, prefix)
+    # Filtered — this becomes a version trie, so §2.4 binds it.
+    current_bindings = _get_snapshot_bindings(ctx, prefix, _get_config(ctx, ph))
     target_bindings = dict(current_bindings)
     for path, h in diff["added"].items():
         target_bindings[path] = h
@@ -3202,6 +3423,24 @@ async def _handle_config_set(
     cfg_ph = _compute_prefix_hash(ctx, prefix)
     config_path = _config_path_for_prefix(cfg_ph)
 
+    # V6: the exclude grammar is CLOSED (§2.4 four forms). Checked before V2/V3
+    # and ungated by `auto_version`, because both of those ask whether the
+    # patterns *cover* something — a question with no meaning for a pattern
+    # this peer cannot evaluate. Refusing at write is the whole mechanism: an
+    # unrepresentable config cannot be stored, so no two conformant peers hold
+    # patterns they read differently (REV-GLOB-REJECT-1).
+    for field in ("exclude", "exclude_types"):
+        for pat in list(cfg.get(field) or []):
+            if not validate_exclude_pattern(pat):
+                return _error_response(
+                    400, "config/invalid-exclude-pattern",
+                    f"{field} pattern {pat!r} is not one of §2.4's four forms: "
+                    "at most one '*', as the whole pattern, the final character "
+                    "after '/', or the first character. There is no '**' and no "
+                    "segment-scoped '*' — a subtree is '<literal>/*', which "
+                    "already crosses '/' at any depth (§4.4.17 V6).",
+                )
+
     # V2: auto_version exclude enforcement
     if cfg.get("auto_version"):
         errors = validate_revision_config(cfg)
@@ -3215,7 +3454,7 @@ async def _handle_config_set(
             if not _exclude_covers(excludes, "system/tree/root/"):
                 return _error_response(
                     400, "config/missing-trie-root-exclude",
-                    f"auto_version with prefix {prefix!r} requires system/tree/root/** in exclude",
+                    f"auto_version with prefix {prefix!r} requires system/tree/root/* in exclude",
                 )
 
     # merge_order validation
@@ -3445,6 +3684,26 @@ async def _handle_merge_config(
         return _error_response(
             400, "invalid_params",
             "per-path merge-config requires a `pattern` field",
+        )
+
+    # V7 `[MUST, v3.12]` — `pattern` is one of §2.4's four forms. Same grammar,
+    # same reason and the same write-time site as §4.4.17 V6: `pattern` selects
+    # the merge strategy, the strategy decides the merged bytes, and the merged
+    # bytes are the version `root`.
+    #
+    # **A matcher with no validator is half a pin**, which is what this surface
+    # was for a day: SA-PY-12 moved the evaluation onto `_glob_match` while V6
+    # still bound `exclude`/`exclude_types` only — so an unevaluable pattern was
+    # storable and then fell silently to form 4 (exact), the accept-then-
+    # mismatch shape V6 exists to prevent, one field away from where V6 was put.
+    # A spec that omits a token and one that rejects it are indistinguishable
+    # until a config carries one; read-time handling can only collapse it.
+    if scope == "path" and not validate_exclude_pattern(cfg["pattern"]):
+        return _error_response(
+            400, "config/invalid-merge-pattern",
+            "merge-config `pattern` carries at most one `*`, positioned as the "
+            "whole pattern, the final character after `/`, or the first "
+            f"character (see §2.4). Got {cfg['pattern']!r}.",
         )
 
     # Step 5: idempotent write — re-issuing the same content_hash is a no_change.
