@@ -378,14 +378,18 @@ async def test_name_format_dispatch_filters_backends(peer):
 
 @pytest.mark.asyncio
 async def test_a_name_matching_no_entry_reaches_nothing(peer):
-    """SA-PY-17 edge case **B** — a backend named by an entry is consulted
-    *"ONLY when the pattern matches"* (§4.1 step 2, second clause).
+    """§4.1 step 2 edge case **B**, **RULED 2026-08-19** (REGISTRY 1.14): a
+    name matching no entry narrows the chain to the **empty set**, so it
+    resolves nowhere — loudly (`chain_exhausted`), which is §4.1 step 4's own
+    posture: *"fail-closed; no silent fallback."*
 
-    An operator who scopes a backend to a name shape has said in as many words
-    that other shapes must not go there, so a name outside every scope resolves
-    nowhere — loudly (`chain_exhausted`), which is §4.1 step 4's own posture:
-    *"fail-closed; no silent fallback."* `entity-core-go` reads this row the
-    other way (unmatched ⇒ unfiltered); the split is routed, not voted on.
+    Filed as SA-PY-17 while it was contested; go read it the other way
+    (unmatched ⇒ unfiltered) and has since flipped, rust already excluded.
+    The sentence go and this peer both once implemented — *"a name matching no
+    entry is treated as matching the catch-all"* — is deleted: the catch-all is
+    `*`, which matches every name, so it can never be the row an unmatched name
+    falls to, and it is the most **restrictive** row in §4.1a's list rather
+    than a licence to skip filtering.
     """
     target = Keypair.generate().peer_id
     await _call(peer, "bind", {"name": "grace", "target_peer_id": target}, uri="system/registry/local-name")

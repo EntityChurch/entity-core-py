@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-18 · public: v0.8.0 (master)_
+_Updated: 2026-08-19 (c) · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -38,6 +38,96 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
+**§4.3 is built, the load-time normalizer is gone, and the new operation absorbed a capability
+nobody meant it to (2026-08-19 c).** Arch ruled SA-PY-21 Q1/Q2 and SA-PY-22 as one model (REGISTRY
+**v1.17/v1.18**): the §4.1 step 2 privacy MUST is **kind-scoped** and binds the **write**, not the
+load. Landed at `7488ee3` — `set-resolver-config` / `get-resolver-config` with whole-config
+validation, no partial application, and `acknowledge_name_disclosure` as a **parameter of the
+operation** (a field would be writable by whoever writes the bytes); the load-time normalizer
+**deleted**, replaced by a diagnostic that never normalizes and never refuses to start. Q1 went
+against our implementation and our filed argument was recorded as *not* the justification — both
+worth reading in `SPEC-AMBIGUITIES`. Three new SAs: **SA-PY-23** (the "unscoped name" classifier is
+undefined and we and go already differ on `*.*`; we took the conservative conjunction),
+**SA-PY-24** (§4.3 writes `pinned_bindings`, which §5 gives its own capability — and a pin
+short-circuits §4.1 step 1 ahead of both the disclosure filter *and* the ceiling), and the type-ref
+divergence in the gate below. Full detail: `ROUTING-2026-08-19-c-…`.
+
+**The citable number is `1601 · 1586 P · 14 W · 1 F · 0 S @ core-go `5655494`` (2026-08-19 c)**,
+armed `validate-complete.sh python` from the committed tree at `7488ee3`: pass 1b (`--profile
+core`) `747 · 632 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute `8/8`, and
+**`registry 18/18`** — go's two new checks (`v15_dispatch_config_refused`,
+`v16_ttl_ceiling_reread`) both PASS on the first run, so the §4.3 wire shape agreed across two
+independent implementations without either adjusting. **The one FAIL is a type-ref divergence we
+believe is go's:** `set-resolver-config-request.config` is `system/registry/resolver-config` here
+(§4.3's own table) and `core/entity` there (a reflection artifact of `entity.Entity`) — the
+identical question was ruled *precise* for `EXTENSION-SUBSTITUTE` §2.3's `entry`, where go had
+loosened the same way. Routed, not worked around; one line to withdraw if arch rules otherwise.
+Local suite `3903 passed`, `tests/interop` excluded — a foreign container on this host holds the
+fixed port 9000 and the handshake now **hangs** rather than failing.
+
+**The resolver ceiling's sticky arm is closed, and the privacy MUST turns out to have one
+implementer (2026-08-19 b).** `REG-TTL-RESOLVER-CEILING-1` row (d) — a sticky binding takes the
+ceiling as its lifetime — failed against a **3820-test-green** tree when core-go ran the armed gate
+(`v4c_ttl_resolver_ceiling`). `min(binding.ttl, local_max)` has no arm for a null `ttl`, and the
+guard that makes `min` type-safe applied the control **only where a bound already existed**, which
+is the control inverted. Fixed at `bf9e43d` as `_effective_lifetime` — three arms, one function,
+both call sites (the expiry verdict and the surfaced `ttl`) — with all four vector rows plus two the
+wire vector cannot reach: the sticky arm's *teeth* (a sticky binding aged past the ceiling stops
+resolving; go's probe reads the response, not the verdict) and read-at-resolution (one process,
+three configs). **SA-PY-15 closes** — ruled v1.16 at our site, verbatim. Filed **SA-PY-22**: an
+exhaustive named search finds **no production implementation of §4.1 step 2's privacy MUST in go
+`ca53e2a` or rust `e6fb500`**, and no `REG-DISPATCH-CATCHALL-LOCAL-1` in the harness — so the seat
+that filed SA-PY-21 is the only seat its answer binds. Full detail, including the argument *against*
+our own Q1 reading: `ROUTING-2026-08-19-b-…`.
+
+**The citable number is `1597 · 1582 P · 15 W · 0 F · 0 S @ core-go `ca53e2a`` (2026-08-19 b)** —
+the full armed `validate-complete.sh python`, **exit 0**, measured from the committed tree at
+`bf9e43d`: pass 1b (`--profile core`) `745 · 630 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3
+`32/32`, substitute `8/8`, `registry 16/16/0/0`. Local suite `3899 · 1 F`, the one failure being
+`tests/interop/test_connect_to_rust_peer` dialing a fixed `127.0.0.1:9000` held by an unrelated
+container on this host — the third instance of the fixed-port anti-pattern, now in `AGENTS.md`.
+
+**Both registry rulings are landed and the widened MUST is built (2026-08-19).** REGISTRY
+**1.14** (§4.1 step 2's filter) and **1.15** (one name matcher per registry) closed
+`SA-PY-17` and `SA-PY-14` — *neither owed a behaviour change here*, because `c74f95e` and
+`c65bfe2` had already landed both before arch read us. What **was** owed: v1.14's privacy MUST,
+restated at the width of the configuration rather than the catch-all row, is now normalized at
+load (`1cb7c01`) — two doors, exact classification, mutation-checked. And the coverage the
+ruling exposed: `name_constraints` was correct and **untested**, because its only fixture used
+the spec's own `*.lab` example, which discriminates nothing (`2890f47`). Filed `SA-PY-21` (the
+widened MUST's scope, and an operator `MAY` no field can express) and corrected arch on
+`SA-PY-15`, which `ROUTING-2026-08-19-c` §3's *"the board is closed"* passed over — it was
+dropped in handling, not decided. Full detail:
+`ROUTING-2026-08-19-the-two-registry-rulings-are-landed-…`.
+
+**The citable number is `1595 · 1581 P · 14 W · 0 F · 0 S @ core-go `7671f06`` (2026-08-19)** —
+the real `validate-complete.sh python`, all six passes exit 0, measured from a clean committed
+tree; pass 2 `55/55`, pass 3 `registry_issuer` **32/32** (reproducing core-go's own measurement
+of this peer on the *new* tree, so `name_constraints_grammar` is green after these commits) and
+`registry` `14/14`. The 14 W are the known py baseline, none new.
+
+**`SDK-OPERATIONS` §16.1's MUST list is complete (2026-08-18 f).** The last row, §11.6
+`register_handler`, is built (`447a8e0`): the four §11.6.1 paired writes in order, the
+collision check on both sides, §11.6.2's handle (idempotent close, `async with`, no finalizer),
+§11.6.4 compensation with types exempt, and §12.5's four code strings as constants. Six
+mutations run against it. §11.6.9 service-owning handlers is deliberately unbuilt — §16.1 does
+not name it and publishing its type definitions with no producer would manufacture a
+type-census divergence. Three SAs came out of building it (SA-PY-18/-19/-20), all found by
+building rather than reading; SA-PY-20 changed the code, because §11.6.1 step 3's conditional
+grant produces a handler V7 §6.2 will not dispatch to.
+
+**And we corrected our own §4.1 filing the same day (`c74f95e`).** SA-PY-17 was filed as a
+two-way split; §4.1 step 2 has **two edge cases** and `-f` argued only the first. Case A (a
+kind named in no entry, when another matches) was a real privacy hole — §4.1a's catch-all MUST
+is evadable by omitting a row otherwise. Case B (a kind named by an entry, when nothing
+matches) flipped in the same commit on that argument and was never argued for; it is now
+excluded too. We exclude in **both**, which is the conjunction of go's and rust's exclusions
+rather than either seat's position. core-go has since **pulled** the oracle that started this
+(`8d2f5ad`) because it discriminated on the unruled filter question rather than the ruled
+grammar — and the lesson we ratcheted is the mirror image of theirs: **a failing oracle is
+evidence that something is wrong, never evidence about what is right.** Full detail:
+`ROUTING-2026-08-18-g-…`.
+
 **The consolidated core-peer worklist is closed (2026-08-18 e).** `ROUTING-2026-08-18-o` §4 as
 amended by `-q` §3 — six rows, all landed and mutation-checked: REGISTRY **v1.13** direct (the
 renew cascade + terminal `403`, `max_ttl` REQUIRED on a live policy, register/renew clamp, and
@@ -48,7 +138,11 @@ the resolver-side ceiling that is the half protecting the consumer) at `c65bfe2`
 dispatch list. Both SAs filed yesterday came back **ruled in our favour** (SA-PY-12 at arch
 `86d6b20`, SA-PY-13 as the whole renew-cascade arc).
 
-**The citable number is `1596 · 1582 P · 14 W · 0 F · 0 S @ core-go `7747602``** — the real
+*(Superseded 2026-08-19 — see the number above.)* **`1595 · 1580 P · 15 W · 0 F · 0 S @ core-go
+`6ae71c4``** — one check fewer because core-go withdrew `v15_dispatch_grammar`, and one warning
+more because
+`concurrency.t1_1_concurrent_demux` is a timing-sensitive informational check that flaps.
+Superseding `1596 · 1582 P · 14 W · 0 F · 0 S @ core-go `7747602``, which was — the real
 `validate-complete.sh`, all six passes exit 0, pass 2 `55/55` and pass 3 `31/31` (up from 28;
 core-go's three new TTL vectors pass on their first run against this peer).
 

@@ -861,6 +861,18 @@ REGISTRY_HANDLER_MANIFEST = build_handler_manifest(
         "get-issuer-policy": {
             "output_type": "system/registry/issuer-policy",
         },
+        # §4.3 [v1.18] — resolver-config management, gated by
+        # `registry-configure`. `set` echoes the stored config as written; `get`
+        # is 404 when unset (the §10 synthesized default is not a stored
+        # config). The acknowledgement rides the *request* type, never the
+        # config entity — see `_handle_set_resolver_config`.
+        "set-resolver-config": {
+            "input_type": "system/registry/set-resolver-config-request",
+            "output_type": "system/registry/resolver-config",
+        },
+        "get-resolver-config": {
+            "output_type": "system/registry/resolver-config",
+        },
     },
 )
 

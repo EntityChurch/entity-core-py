@@ -125,14 +125,20 @@ class TestDispatchGrammar:
         """The matcher reaching `_dispatch_allows` is what matters — a
         conformant helper wired to nothing is not a fix.
 
-        **This test pins the grammar AND our §4.1 step 2 filter reading
-        together, and cannot separate them.** `entity-core-go` removed their
-        equivalent wire check for exactly this reason: observing "the pattern
-        did not match" over the wire requires observing an *exclusion*, and
-        whether a non-match excludes is the contested filter question
-        (SA-PY-17). The uncontested grammar pin is the unit rows above; these
-        rows additionally encode our fail-closed reading, and they flip if arch
-        rules the other way. Written so that they do.
+        **This test pins the grammar AND the §4.1 step 2 filter reading
+        together, and cannot separate them.** `entity-core-go` pulled their
+        equivalent *wire* check for exactly this reason: observing "the pattern
+        did not match" requires observing an **exclusion**, and whether a
+        non-match excludes was the contested filter question (SA-PY-17) — so a
+        check that claimed to measure the matcher was measuring the filter, and
+        it went green go-on-go while failing a conformant rust.
+
+        **Both halves are now ruled** (REGISTRY 1.14 filter + 1.15 matcher), so
+        these rows no longer straddle an open question. The wire vector stays
+        pulled until all three seats have landed the filter branch — arch's
+        sequencing, `ROUTING-2026-08-19-a` §4 — and the grammar's own
+        cross-impl check is `registry_issuer.name_constraints_grammar`, which
+        this peer passes 32/32.
         """
         target = Keypair.generate().peer_id
         await _call(
@@ -153,16 +159,18 @@ class TestDispatchGrammar:
     async def test_a_kind_named_by_no_entry_is_excluded_when_another_matches(
         self, peer,  # noqa: F811
     ):
-        """Edge case **A** of SA-PY-17, and the one that makes §4.1a's MUST
-        real: *"the catch-all MUST NOT name a backend whose consultation
-        transmits the queried name."*
+        """Edge case **A**, **RULED 2026-08-19** (REGISTRY 1.14) — and
+        SA-PY-17's argument for it is what arch adopted as the ruling's
+        rationale: a kind named in **no** entry being consulted anyway makes
+        §4.1a's privacy MUST *evadable by leaving a row out*. A `dns-txt`
+        backend nobody mentioned would see every bare name a user types, which
+        is a larger disclosure than the one the rule forbids.
 
-        If a kind named in **no** entry were consulted anyway, that MUST would
-        be evadable by leaving a row out — a `dns-txt` backend nobody mentioned
-        would see every bare name a user types, which is a larger disclosure
-        than the one the rule forbids. `entity-core-go` reaches this
-        independently; `entity-core-rust` reads it the other way, and this peer
-        did too until 2026-08-18.
+        rust read it the other way and owes the flip; this peer did too until
+        2026-08-18. **The v1.14 widening is what closes the door properly** —
+        the MUST now binds the whole configuration, not the catch-all row, so
+        the omission route is shut at load as well as here (see
+        `test_registry_name_privacy.py`).
         """
         target = Keypair.generate().peer_id
         await _call(
@@ -205,6 +213,153 @@ class TestDispatchGrammar:
         )
         r = await _call(peer, "resolve", {"name": "x/y/z"})
         assert r["result"]["data"]["status"] == "chain_exhausted"
+
+
+# ===========================================================================
+# REG-NAME-CONSTRAINTS-GRAMMAR-1 — §6a.9.1, the SECOND call site
+# ===========================================================================
+
+
+class TestNameConstraintsGrammar:
+    """§6a.9.1 + §4 `[MUST, v1.15]` — `name_constraints` uses §4's matcher,
+    because **there is one matcher per registry**.
+
+    **Why these rows exist even though the matcher above is already pinned.**
+    The defect this class closes is not a wrong matcher; it is a **call site
+    pointed at the wrong function** while the matcher beside it is correct.
+    Until 2026-08-19 the only `name_constraints` test in this repo used
+    `*.lab` — the spec's own example, which is grammar-identical under every
+    candidate reading. Arch says that is *why the divergence survived review*,
+    and it is why a control-only fixture at a call site is not coverage: swap
+    the call at `registry.py` to `fnmatch` and every pre-existing
+    `name_constraints` assertion still passes.
+
+    This is an **admission gate**, so the observable is `403 not_entitled`
+    versus a signed, published binding — two registries running the same
+    operator policy admitting different names. `entity-core-rust` was measured
+    on row 1 the other way on 2026-08-19 (`a?c` admitted `abc`) and owes the
+    v1.15 landing; go and py both pass 32/32.
+
+    **Row 3 (`x*z` admits `x/y/z`) is absent by construction, not by
+    omission.** §6.3 forbids `/` in a name and `_validate_name_path_safety`
+    runs *before* admission, so no register-request can carry one — the
+    property is pinned at the matcher in `TestDispatchGrammar`, and go's
+    spec-issue `2026-08-19-b` routes the §11.1 row upstream.
+    """
+
+    @staticmethod
+    async def _register(peer, name, *, nonce):
+        kp = Keypair.generate()
+        data = _register_data(kp.peer_id, name, nonce=nonce)
+        _sign_into_store(peer, kp, "system/registry/register-request", data)
+        return await _call(peer, "register-request", data)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("constraint,admitted,refused", [
+        # Row 1 — `?` is a literal. Inverted under `path.Match` / `fnmatch`.
+        ("a?c", "a?c", "abc"),
+        # Row 2 — `[…]` is three literals, not a character class.
+        ("a[bc]d", "a[bc]d", "abd"),
+        # Control — the spec's own example. Passes under BOTH readings and
+        # proves nothing alone; here so a failure of the rows above cannot be
+        # misread as `name_constraints` being ignored entirely.
+        ("*.lab", "alice.lab", "alice.dev"),
+    ])
+    async def test_the_admission_rows(
+        self, peer, constraint, admitted, refused,  # noqa: F811
+    ):
+        _emit_issuer_policy(peer, "open", name_constraints=constraint)
+
+        ok = await self._register(peer, admitted, nonce=b"\x31" * 16)
+        assert ok["status"] == 200
+
+        no = await self._register(peer, refused, nonce=b"\x32" * 16)
+        assert no["status"] == 403
+        assert no["result"]["data"]["code"] == "not_entitled"
+
+    @pytest.mark.asyncio
+    async def test_row_4_a_malformed_glob_is_a_literal_and_never_a_5xx(self, peer):  # noqa: F811
+        """Row 4 — `name_constraints: "a[b"`. **Asserted separately from row 2
+        because a shell-glob implementation fails this one by *erroring*, not by
+        answering wrongly**, and an error is not a wrong answer that a
+        result-asserting check would catch. §4: *no pattern is invalid*, so
+        `set-issuer-policy` stores it and the literal name `a[b` is admitted.
+
+        Driven through the **operation** rather than a direct entity write,
+        because the accept half is a claim about `set-issuer-policy`.
+
+        **What this row does and does not discriminate — measured, not
+        assumed.** It catches a `path.Match`-family implementation, which
+        returns `ErrBadPattern` on an unterminated `[` (that is the
+        `500 internal_error` arm `entity-core-go` deleted at v1.15), and it
+        catches a write-time validator added later on the theory that `a[b` is
+        malformed. It does **not** catch Python's `fnmatch`: `fnmatchcase`
+        treats an unterminated `[` as a literal and answers exactly as this
+        grammar does, so a mutation of the call site to `fnmatch` leaves this
+        row green. **Rows 1 and 2 are the ones that go red on that mutation**
+        — verified by running it, not predicted. Per `AGENTS.md`: when a
+        mutation is caught by a different test than the one whose docstring
+        claimed to be sharp, the prediction is the finding, and the docstring
+        is what gets corrected.
+        """
+        set_r = await _call(peer, "set-issuer-policy", {
+            "mode": "open", "name_constraints": "a[b",
+            "default_ttl": _DAY, "max_ttl": _YEAR,
+        })
+        assert set_r["status"] == 200
+        stored = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
+        assert stored["name_constraints"] == "a[b"
+
+        ok = await self._register(peer, "a[b", nonce=b"\x33" * 16)
+        assert ok["status"] == 200
+
+        # And the literal is anchored: `a[b`'s only match is itself. A shell
+        # glob raises or treats `[b` as an unterminated class; neither answers
+        # 200 here and then 403 below.
+        no = await self._register(peer, "ab", nonce=b"\x34" * 16)
+        assert no["status"] == 403
+        assert no["result"]["data"]["code"] == "not_entitled"
+
+    def test_the_admission_gate_calls_the_one_matcher_by_name(self):
+        """§4 v1.15's actual sentence — *"there is one matcher per registry"* —
+        pinned as **identity at the call site**, which is a different claim from
+        the behavioural rows above and is the one this field's history calls
+        for.
+
+        Behavioural agreement is the weaker claim: two functions can agree on
+        every row a suite spells and diverge on the first one it does not,
+        which is exactly how `name_constraints` and
+        `name_format_dispatch[].pattern` drifted apart in three
+        implementations while every test stayed green. So this reads the
+        admission function's own source and asserts the call, not the answer.
+
+        A source assertion is unusual here and is justified by what it caught:
+        an earlier version of this test asserted `name_glob_match` and
+        `_dispatch_allows` behaviour instead, and a mutation of the admission
+        call site to `fnmatch` left it **green** — it never reached the site it
+        was named for.
+
+        **And the first draft of the source check failed on its own comment.**
+        The call site *explains* that it used to be `fnmatch`, so a bare
+        substring search over the source read that prose as a violation — the
+        same inflation the presentation-tier gate hit counting `entity://` in
+        docstrings (`AGENTS.md`). A gate that cannot tell a sanctioned mention
+        from a smuggled call is not a gate, so this strips comments first.
+        """
+        import inspect
+
+        import entity_handlers.registry as reg
+
+        src = inspect.getsource(reg._handle_register_request)
+        code = "\n".join(
+            line.split("#", 1)[0] for line in src.splitlines()
+        )
+        assert "name_glob_match(" in code, (
+            "the §6a.9.1 admission gate must call §4's matcher (v1.15)"
+        )
+        assert "fnmatch" not in code, (
+            "a shell-glob at the admission gate is the v1.15 divergence"
+        )
 
 
 # ===========================================================================
@@ -454,8 +609,31 @@ class TestRenewCascade:
 
 
 class TestResolverCeiling:
-    """§6a.9.1 `[MUST when present, v1.11]` — `min(binding.ttl, local_max)`,
-    computed at resolution, **never written back**."""
+    """`REG-TTL-RESOLVER-CEILING-1` `[v1.16]` — the four rows, plus the two
+    teeth the wire vector cannot reach.
+
+    §6a.9.1: the effective lifetime is `min(binding.ttl, local_max)` computed
+    at resolution from `resolver_chain[].hints.max_ttl`, **never written
+    back** — and a binding carrying **no** `ttl` takes `local_max`.
+
+    | row | fixture | expected |
+    |---|---|---|
+    | (a) | `ttl` above the ceiling | effective lifetime is exactly `max_ttl`, binding hash unchanged |
+    | (b) | `ttl` below the ceiling | returned untouched |
+    | (c) | `hints.max_ttl: 0` | identical to an absent `hints` — the binding's own `ttl` survives |
+    | (d) | sticky binding, no `ttl` | effective lifetime is `max_ttl` |
+
+    **Row (d) is the one this peer failed on a live wire vector** (go
+    `v4c_ttl_resolver_ceiling`, 2026-08-19) while 3820 local tests stayed
+    green — and the reason is in the fixtures, not the code. Every row above
+    was seeded with a `local-name` binding carrying an explicit `ttl`, which
+    is a shape the **bind path never mints** (`_handle_bind` writes
+    `ttl: None`, sticky until removed). So the whole class exercised the arm
+    `min` has an answer for and never the arm production actually produces —
+    the two-representations law with the *fixture* on the wrong side of it.
+    `test_the_bind_path_mints_the_sticky_shape` pins that the seeded shape and
+    the minted shape now agree.
+    """
 
     def _seed(self, peer, *, ttl, ceiling, issued_at=None):  # noqa: F811
         binding = Entity(type="system/registry/binding", data={
@@ -538,6 +716,17 @@ class TestResolverCeiling:
         assert d["ttl"] == _YEAR
 
     @pytest.mark.asyncio
+    async def test_row_b_a_ttl_below_the_ceiling_is_returned_untouched(self, peer):  # noqa: F811
+        """The ceiling is a bound, not a value: a binding that already asks
+        for less keeps its own number. A resolver that returned `max_ttl`
+        here would be *extending* lifetimes the issuer deliberately kept
+        short, which is the control pointed backwards."""
+        self._seed(peer, ttl=_DAY, ceiling=_YEAR)
+        d = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        assert d["status"] == "resolved"
+        assert d["ttl"] == _DAY
+
+    @pytest.mark.asyncio
     async def test_no_ceiling_ships_by_default(self, peer):  # noqa: F811
         """§6a.3's ceiling is a `MAY` and the corpus writes no number, for the
         reason §4.10 writes none: there is no defensible constant, and choosing
@@ -546,3 +735,151 @@ class TestResolverCeiling:
         self._seed(peer, ttl=_YEAR, ceiling=None)
         d = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
         assert d["ttl"] == _YEAR
+
+    @pytest.mark.asyncio
+    async def test_the_ceiling_is_read_at_resolution_and_never_latched(self, peer):  # noqa: F811
+        """`REG-TTL-CEILING-REREAD-1` `[v1.17]` — durable configuration read
+        **at resolution**, not a process-lifetime setting fixed at
+        construction.
+
+        rust's argument, which decided this cohort-wide: a ceiling read at
+        start-up applies on a cold boot and silently does not on a warm one,
+        and *a control present on one boot path and absent on the other is
+        worse than absent — it tests green on whichever path the test happens
+        to take.* So the discriminating fixture is **one process, three
+        configs**: a latched implementation answers the first one three times,
+        and no amount of restarting-the-peer testing would show it.
+
+        **This check was specified `[v1.17]` and was not constructible** — the
+        state it needs is a running peer whose `resolver-config` has been
+        rewritten, and no operation existed to do that. §4.3's
+        `set-resolver-config` is its enabling surface, which is why the rows
+        below go through the **wire operation** rather than an emit: an
+        in-process seed would exercise a path a conformance client cannot
+        reach, and the missing operation is exactly what made this check and
+        §4.1 step 2's write-time MUST unbuildable *together*.
+        """
+        self._seed(peer, ttl=_YEAR, ceiling=None)
+        r1 = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        await self._set_ceiling_over_the_wire(peer, _DAY)
+        r2 = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        await self._set_ceiling_over_the_wire(peer, 2 * _DAY)
+        r3 = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        assert [r1["ttl"], r2["ttl"], r3["ttl"]] == [_YEAR, _DAY, 2 * _DAY], (
+            "the ceiling was latched — an operator editing resolver-config on a "
+            "running peer is not obeyed"
+        )
+
+    @staticmethod
+    async def _set_ceiling_over_the_wire(peer, ceiling):  # noqa: F811
+        """Rebind the ceiling through §4.3's operation, as a conformance client
+        must. `hints` is opaque backend config, so this round-trips a whole
+        config rather than patching a field."""
+        entry = {"backend_kind": "local-name", "priority": 0, "hints": {"max_ttl": ceiling}}
+        cfg = Entity(type="system/registry/resolver-config", data={
+            "resolver_chain": [entry],
+            "pinned_bindings": [],
+            "name_format_dispatch": [],
+        })
+        r = await _call(peer, "set-resolver-config", {
+            "config": cfg.to_dict(include_hash=False),
+        })
+        assert r["status"] == 200, r
+        return r
+
+    # -- row (d): the sticky arm, which is the shape production mints --------
+
+    @pytest.mark.asyncio
+    async def test_row_d_a_sticky_binding_takes_the_ceiling_as_its_lifetime(self, peer):  # noqa: F811
+        """`min(binding.ttl, local_max)` has **no arm for a null `ttl`**, and
+        the sticky kinds (`local-name`, `pinned`) carry none — so a guard
+        written `if isinstance(ttl, int)` applies the control only where a
+        bound already exists and leaves the unbounded case uncovered. That is
+        the inversion §6a.9.1 v1.16 rules out, and it is what this peer did
+        until `_effective_lifetime`.
+        """
+        self._seed(peer, ttl=None, ceiling=_DAY)
+        d = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        assert d["status"] == "resolved"
+        assert d["ttl"] == _DAY, (
+            "a sticky binding under a ceiling surfaced no lifetime — the guard "
+            "that only clamps a present ttl skips exactly the unbounded case"
+        )
+
+    @pytest.mark.asyncio
+    async def test_row_d_teeth_the_sticky_arm_bounds_honoring_and_not_just_the_number(
+        self, peer,  # noqa: F811
+    ):
+        """**The row the wire vector cannot see.** go's `v4c` reads the
+        surfaced `ttl` off a *freshly bound* name, so an implementation that
+        stamps `local_max` into the result and never feeds it to the expiry
+        check passes the vector and still honors a sticky binding forever.
+        The security property is the honoring, so assert on that: a sticky
+        binding older than the ceiling MUST stop resolving.
+        """
+        binding = Entity(type="system/registry/binding", data={
+            "name": "stickystale.lab", "kind": "local-name",
+            "target_peer_id": _FIXED_TARGET, "transports": [],
+            "issued_at": int(_time.time() * 1000) - 10 * _DAY, "ttl": None,
+        })
+        _emit(peer, "system/registry/binding/local-name/stickystale.lab", binding)
+
+        # Control first: with no ceiling a sticky binding never expires, so the
+        # refusal below is attributable to the ceiling and not to the age.
+        self._set_ceiling(peer, None)
+        d0 = (await _call(peer, "resolve", {"name": "stickystale.lab"}))["result"]["data"]
+        assert d0["status"] == "resolved" and d0["ttl"] is None
+
+        self._set_ceiling(peer, _DAY)
+        d = (await _call(peer, "resolve", {"name": "stickystale.lab"}))["result"]["data"]
+        assert d["status"] != "resolved", (
+            "the resolver surfaced a bounded ttl but honored the binding anyway "
+            "— the ceiling reached the response and not the expiry verdict"
+        )
+
+    @pytest.mark.asyncio
+    async def test_row_d_under_c_a_zero_ceiling_leaves_a_sticky_binding_sticky(self, peer):  # noqa: F811
+        """Rows (c) and (d) interact, and this is the pair that would make a
+        `0` ceiling maximally destructive: undeclared means the sticky arm
+        does not fire either, so the binding keeps its null lifetime rather
+        than being handed `0` and expiring instantly."""
+        self._seed(peer, ttl=None, ceiling=0)
+        d = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        assert d["status"] == "resolved"
+        assert d["ttl"] is None
+
+    @pytest.mark.asyncio
+    async def test_row_d_the_ceiling_is_still_not_written_back(self, peer):  # noqa: F811
+        """Row (a)'s hash gate, on the sticky arm — where it is easier to get
+        wrong, because `local_max` is a value the binding never carried at all
+        and a "fill in the missing ttl" refactor reads as helpful."""
+        binding = self._seed(peer, ttl=None, ceiling=None)
+        d1 = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+        self._set_ceiling(peer, _DAY)
+        d2 = (await _call(peer, "resolve", {"name": "ceiling.lab"}))["result"]["data"]
+
+        stored = peer.content_store.get(bytes(d2["binding"]))
+        assert stored.data["ttl"] is None, "the ceiling was written into the binding"
+        assert bytes(d2["binding"]) == binding.compute_hash()
+        assert bytes(d1["binding"]) == bytes(d2["binding"])
+        assert d1["ttl"] is None and d2["ttl"] == _DAY
+
+    @pytest.mark.asyncio
+    async def test_the_bind_path_mints_the_sticky_shape(self, peer):  # noqa: F811
+        """The fixture-vs-production check this class was missing. Every other
+        row seeds a binding by hand; if the seeded shape ever stops matching
+        what `bind` actually writes, the class goes back to testing an arm no
+        deployment reaches. `local-name` bindings are sticky (§6.3: *"ttl:
+        null — local-names are sticky until the user removes them"*), so the
+        sticky arm is the **default** path through this code, not an edge."""
+        r = await _call(
+            peer, "bind", {"name": "minted.lab", "target_peer_id": _FIXED_TARGET},
+            uri="system/registry/local-name",
+        )
+        assert r["status"] == 200
+        stored = peer.content_store.get(bytes(r["result"]["data"]["binding_hash"]))
+        assert stored.data["kind"] == "local-name"
+        assert stored.data["ttl"] is None, (
+            "bind now mints a ttl-bearing local-name — the ceiling rows above "
+            "seed a shape production no longer produces"
+        )

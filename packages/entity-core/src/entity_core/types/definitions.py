@@ -6173,6 +6173,35 @@ def type_system_registry_resolver_config() -> Entity:
     )
 
 
+def type_system_registry_set_resolver_config_request() -> Entity:
+    """`system/registry/set-resolver-config-request` — §4.3 `[v1.18]`.
+
+    The wrapper `set-resolver-config` takes: the `resolver-config` entity to
+    store, plus the operator's `acknowledge_name_disclosure` act.
+
+    **The acknowledgement lives here and MUST NOT be a field of
+    `resolver-config`.** A field would be written by whoever writes the bytes —
+    so a distribution could set it and defeat the §4.1 step 2 rule that bounds
+    it — and it would move a content-addressed type's hash to carry a claim it
+    cannot secure. Provenance is a property of the **act**, so it rides the
+    capability-gated operation. That is also why the type exists at all rather
+    than the operation taking a bare `resolver-config`: the request and the
+    stored artifact are different things, and only one of them is stored.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/registry/set-resolver-config-request",
+            "fields": {
+                "config": {"type_ref": "system/registry/resolver-config"},
+                "acknowledge_name_disclosure": {
+                    "type_ref": "primitive/bool", "optional": True,
+                },
+            },
+        },
+    )
+
+
 def type_system_registry_local_name_config() -> Entity:
     """`system/registry/local-name-config` — local-name-store config (§6.4)."""
     return Entity(
@@ -7467,6 +7496,7 @@ ALL_TYPE_DEFINITIONS = [
     type_system_registry_pinned_binding,
     type_system_registry_name_format_dispatch,
     type_system_registry_resolver_config,
+    type_system_registry_set_resolver_config_request,
     type_system_registry_local_name_config,
     type_system_registry_resolution_result,
     type_system_registry_resolution_log,

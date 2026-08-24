@@ -204,6 +204,28 @@ KNOWN_BACKEND_KINDS = {
 # Kinds with no issuer signature — the user / self is the trust source (§3).
 SIG_EXEMPT_KINDS = {"self-certifying", "local-name"}
 
+# §4.1 step 2 [MUST, v1.14] — the kinds whose consultation puts the QUERIED
+# NAME on the wire. The spec names exactly these four.
+#
+# **`peer-issued` is deliberately not here, and that is the v1.14 retarget.**
+# The banned property is name transmission, not remoteness: §6a.4 resolution
+# walks a signed root by content address, so a peer-issued read is remote and
+# name-blind, and §4.1a row 6 *recommends* it in the catch-all. A check that
+# asserted "no read against any remote registry" would fail the default list
+# this spec ships (§11.1, `REG-DISPATCH-CATCHALL-LOCAL-1`, retargeted v1.14).
+NAME_TRANSMITTING_KINDS = frozenset({
+    "dns-txt", "well-known-url", "did-web", "consensus-anchored",
+})
+
+#: Last surfaced resolver-config hash, per peer — see `_surface_config_diagnostic`.
+_last_surfaced_config: dict[str, bytes | None] = {}
+
+# An **unscoped name** is a bare name carrying no explicit authority marker —
+# `alice`, as opposed to `alice@example.com`, `alice.eth` or `did:web:alice`.
+# These three bytes are the markers the spec's own §4.1a rows key on (`*@*.*`
+# → DNS-style handles, `*.eth` → ENS, `did:web:*` → did:web).
+_AUTHORITY_MARKERS = frozenset(".@:")
+
 # trust_anchor variants (§2.4 — underscore enum form).
 TA_SELF_CERTIFYING = "self_certifying"
 TA_LOCAL_NAME = "local_name"
@@ -250,6 +272,11 @@ _OP_APPROVE = "approve-request"
 _OP_DENY = "deny-request"
 _OP_SET_POLICY = "set-issuer-policy"
 _OP_GET_POLICY = "get-issuer-policy"
+# §4.3 [v1.18] resolver-config management, gated by registry-configure
+_OP_SET_RESOLVER_CONFIG = "set-resolver-config"
+_OP_GET_RESOLVER_CONFIG = "get-resolver-config"
+
+SET_RESOLVER_CONFIG_REQUEST_TYPE = "system/registry/set-resolver-config-request"
 
 
 # ===========================================================================
@@ -295,6 +322,179 @@ def _load_local_name_config(ctx: HandlerContext) -> dict[str, Any]:
     return {"default_pinned": True, "allow_supersede": True, "case_normalization": "none"}
 
 
+def _pattern_reaches_unscoped_name(pattern: Any) -> bool:
+    """Can this dispatch pattern match a name the user typed **bare** — with no
+    authority they chose to disclose it to?
+
+    A pattern is **scoped (narrow)** only when it requires one of the three
+    shapes `§4.1a` ships as its non-catch-all rows, i.e. the shapes in which an
+    authority is actually pinned:
+
+    * an ``@``-authority anywhere — ``*@*``, ``*@*.*`` (rows 4-5): the *user*
+      names the authority inside the name;
+    * a ``:`` scheme prefix — ``did:web:*``, ``did:key:*`` (rows 1-2);
+    * a dotted **literal** suffix — ``*.eth`` (row 3): the *rule* names the
+      authority (ENS), and the star may not reach into it.
+
+    Everything else is broad: the catch-all ``*``, a bare prefix ``a*``, a bare
+    literal, and — the row worth stating — ``*.*``, whose suffix is a star and
+    therefore pins no authority at all. This classifies §4.1a rows 1-5 narrow
+    and row 6 broad, which is the fixture that matters: **the recommended
+    default list contains the MUST, so a classifier that made row 3 broad would
+    make the list this spec SHOULD-ships violate its own rule.**
+
+    **Fail broad on anything unclassifiable** — `entity-browser-rust`'s
+    `is_broad` argument, which the cohort has adopted: *"a pattern we cannot
+    confidently classify is treated as broad, because calling a broad pattern
+    narrow is what leaks."*
+
+    **This is deliberately the conservative half of a live cross-impl
+    divergence — see SA-PY-23.** Until 2026-08-19 this peer classified on a
+    different and genuinely defensible argument: under the closed grammar every
+    name a pattern matches carries all of the pattern's literal bytes, so a
+    literal ``.``/``@``/``:`` anywhere means *every* match carries an authority
+    marker, making ``*.*`` and ``a.b`` scoped. `entity-core-go` classifies both
+    **broad**. §4.1a's default list cannot tell the two readings apart — every
+    row it carries is classified identically by both — so the divergence is
+    invisible to the one fixture the spec provides. We moved to the strictly
+    larger broad-set, on §4.1's own asymmetry argument: the false positive is a
+    visible edit with a documented override, and the false negative is
+    ``my.private.handle`` and every dotted typo going to a third party.
+    """
+    if not isinstance(pattern, str):
+        return True
+    # An `@`-authority or a `:` scheme prefix: the name states where it goes.
+    if "@" in pattern or ":" in pattern:
+        return False
+    # `*.<literal>` — one leading star, then a dotted literal suffix the star
+    # cannot reach into. `*.*` does NOT qualify: its suffix is a star.
+    if pattern.startswith("*."):
+        rest = pattern[len("*."):]
+        if rest and "*" not in rest:
+            return False
+    return True
+
+
+def _disclosure_violations(config: dict[str, Any]) -> list[str]:
+    """§4.1 step 2 `[MUST, v1.14]` — every way this config makes a
+    **name-transmitting** backend eligible for an **unscoped** name. Returns
+    one human-readable line per violation, **never just the first**: §4.3 says
+    an operator repairing a chain wants the whole list, and a refusal that
+    reports one violation at a time turns one edit into N round-trips.
+
+    The rule binds **the configuration as a whole, not one row** (v1.14), and
+    it has two doors:
+
+    * **Door A — a rule whose pattern reaches unscoped names names the kind.**
+    * **Door B — an absent or empty `name_format_dispatch` while such a kind
+      sits in the `resolver_chain`.** The filter is disabled, every kind is
+      eligible for every name, and there is no row to inspect.
+
+    A third door — leaving the kind out of every rule so it "defaults to match
+    all" — is closed **by construction** by the ruled `eligible_kinds` (see
+    `_dispatch_allows`) and needs no clause here.
+
+    **Door A is KIND-SCOPED `[MUST, v1.17]`** — a broad rule naming `did-web`
+    violates whether or not the chain currently carries a `did-web` entry. We
+    filed the opposite reading as SA-PY-21 and it was **ruled against us**; the
+    deciding argument is worth carrying because it is not the one we argued.
+    The MUST binds *a distribution*, and under the chain-scoped reading
+    *"this shipped config is safe"* is not a property of the shipped artifact
+    at all — it is a property of the artifact paired with whatever a downstream
+    operator later adds to the chain, which the distribution cannot evaluate,
+    cannot re-review, and (§1's bootstrap model) cannot reach again. **You
+    cannot hold a party to a property they are structurally unable to
+    evaluate.** Kind-scoped makes validity a function of `name_format_dispatch`
+    alone — monotone under extension — so a reviewed artifact stays reviewed.
+    *(Our own filed argument — that a chain-scoped config "arms silently" when
+    the backend is added later — was recorded by arch as **not** the
+    justification: whole-config validation at the write catches that edit under
+    either reading. It is the monotonicity that decides it, not detectability.)*
+
+    The set of name-transmitting kinds is **exactly the four §4.1 declares**;
+    an unknown kind is not transmitting (§4.2), because refusing a config for
+    naming a kind this build does not recognize would reject a deployment
+    authored against a newer vocabulary — the case §4.2 exists to permit.
+    """
+    out: list[str] = []
+    dispatch = config.get("name_format_dispatch") or []
+
+    if not dispatch:
+        for entry in config.get("resolver_chain") or []:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("backend_kind")
+            if kind in NAME_TRANSMITTING_KINDS:
+                out.append(
+                    f"no name_format_dispatch, so the filter is disabled and "
+                    f"{kind!r} in the resolver_chain is eligible for every "
+                    f"unscoped name (§4.1 step 2, door B)"
+                )
+        return out
+
+    for rule in dispatch:
+        if not isinstance(rule, dict):
+            continue
+        if not _pattern_reaches_unscoped_name(rule.get("pattern")):
+            continue
+        for kind in rule.get("backend_kinds") or []:
+            if kind in NAME_TRANSMITTING_KINDS:
+                out.append(
+                    f"dispatch pattern {rule.get('pattern')!r} matches unscoped "
+                    f"names and names name-transmitting backend kind {kind!r} "
+                    f"(§4.1 step 2, door A)"
+                )
+    return out
+
+
+def _surface_config_diagnostic(
+    peer_id: str, config_hash: bytes | None, violations: list[str],
+) -> None:
+    """§4.1 step 2 `[MUST, v1.17]` — **at load: surface it, never normalize it,
+    never refuse to start.**
+
+    This peer normalized at load until 2026-08-19 (narrowing the offending rows
+    in the loaded view), on §11.1's *"refused or normalized at load"* — a
+    sentence now **withdrawn**. Both halves of it were wrong, in opposite
+    directions, and the argument is one to keep:
+
+    * **Normalizing makes the operator's stored bytes lie.** The config says
+      one thing and the peer does another, with no diagnostic. Ours narrowed
+      only the in-memory view (never the stored entity), which is why the
+      subtraction is small — but a silent behaviour change is the same defect
+      whether or not it also corrupts the artifact.
+    * **Refusing to start would delete the operator `MAY` granted in the same
+      paragraph.** A peer that will not boot on a config the operator
+      deliberately wrote has revoked the override it was given.
+
+    The load path cannot do better than surface, because **at load the two acts
+    are indistinguishable by construction**: §6a.9.2's store-first rule puts a
+    distribution's seed and an operator's deliberate edit in the same entity at
+    the same path. Provenance is a property of the *write*, so enforcement
+    lives on `set-resolver-config` (§4.3) where an identified, capability-gated
+    actor is present — and the out-of-band tree-write path stays open and
+    *loud* rather than blocked.
+
+    Deduped by config content hash so a per-resolution reload does not turn a
+    diagnostic into a log flood — the same value repeated is not new
+    information, and a diagnostic nobody can read is one nobody acts on. The
+    dedup is keyed by **peer**, not module-wide: two peers in one process (the
+    ordinary shape of an interop test) are two operators, and suppressing the
+    second one's diagnostic because the first shares a config hash would make
+    the surfacing MUST test green on a peer that never surfaced anything.
+    """
+    if config_hash is not None and _last_surfaced_config.get(peer_id) == config_hash:
+        return
+    _last_surfaced_config[peer_id] = config_hash
+    logger.warning(
+        "registry: the stored resolver-config discloses unscoped names to a "
+        "name-transmitting backend (§4.1 step 2) — honored as written and "
+        "surfaced, not normalized and not refused (§4.1 step 2 [MUST, v1.17]): "
+        "%s",
+        "; ".join(violations),
+    )
+
+
 def _load_resolver_config(ctx: HandlerContext) -> dict[str, Any]:
     """Load resolver-config, defaulting to local-name-only (§10) so the local
     local-name store is usable without explicit configuration (§5.2).
@@ -303,9 +503,27 @@ def _load_resolver_config(ctx: HandlerContext) -> dict[str, Any]:
     local-name single-store case (§6.2) it defaults to the local peer's
     identity; we fill that here at config-construction time so the effective
     config always carries it — whether the config is the synthesized default
-    or a stored one that omitted it for the local-name backend."""
+    or a stored one that omitted it for the local-name backend.
+
+    **The §4.1 step 2 privacy check does NOT run here — it surfaces here and
+    binds at the write** (`set-resolver-config`, §4.3). This peer normalized on
+    this path until 2026-08-19, when `[MUST, v1.17]` withdrew §11.1's *"refused
+    or normalized at load"*: a load cannot distinguish a distribution's seed
+    from an operator's deliberate edit (§6a.9.2 store-first puts both in one
+    entity at one path), so load-time enforcement necessarily over-enforced and
+    deleted the operator `MAY` in the same paragraph. What remains at load is
+    the diagnostic — which is not nothing, because the out-of-band tree-write
+    path carries no acknowledgement and a kind may have *become*
+    name-transmitting since the config was written.
+
+    The synthesized default is compliant by construction (local-name only, and
+    local-name transmits nothing), so this is silent on an unconfigured peer.
+    """
     cfg = _get_entity(ctx, RESOLVER_CONFIG_PATH)
     if cfg is not None and cfg.type == RESOLVER_CONFIG_TYPE:
+        violations = _disclosure_violations(cfg.data)
+        if violations:
+            _surface_config_diagnostic(ctx.local_peer_id, cfg.compute_hash(), violations)
         return _fill_chain_backend_ids(dict(cfg.data), ctx.local_peer_id)
     return _fill_chain_backend_ids(
         {
@@ -504,7 +722,8 @@ def _anchor_accepted(accepted: list[str], trust_anchor: str) -> bool:
 
 
 def _resolver_ceiling(entry: dict[str, Any] | None) -> int | None:
-    """§6a.9.1 `[MUST when present, v1.11]` — the resolver's own local maximum.
+    """§6a.9.1 `[MUST, v1.16]` — the resolver's own local maximum, read from
+    `resolver_chain[].hints.max_ttl` (ms), **per chain entry**.
 
     **This is the half that protects the consumer.** §6a.3's entire argument is
     about the consumer: a hostile byte-server withholds a revocation and `ttl`
@@ -514,21 +733,33 @@ def _resolver_ceiling(entry: dict[str, Any] | None) -> int | None:
     decades ago: the authority sets the record's TTL, the resolver caps what it
     will honor.
 
-    **Carried on the chain entry's `hints`, and the site is ours, not the
-    spec's.** §4's `resolver-config` schema declares no ceiling field and the
-    ruling names none — it says only *"a resolver MAY declare a local
-    maximum."* `hints` is declared `<opaque object | null>` / backend-specific
-    config and already carries `neg_ttl`, so this needs no new field on a
-    content-addressed type. Declaring one would move `system/registry/
-    resolver-config`'s type hash for a name no other seat would read — the
-    §6a.9.3 lesson about `approve-request`, where publishing a definition for
-    an unspecified name makes the divergence the publisher's. Filed as
-    SA-PY-15 so the site gets pinned rather than converged on by luck.
+    **The site was ours before it was the spec's, and filing it is what made
+    it the spec's.** §4's `resolver-config` schema declared no ceiling field
+    and v1.11's ruling named none — it said only *"a resolver MAY declare a
+    local maximum"* — so this peer put it on `hints` (declared `<opaque
+    object | null>`, backend-scoped, already carrying `neg_ttl`) rather than
+    adding a top-level field that would move `system/registry/resolver-config`'s
+    type hash for a name no other seat would read. Filed as **SA-PY-15** so
+    the site got pinned rather than converged on by luck — and it did not
+    converge by luck: four seats had put it in **three** places. **Ruled
+    v1.16** at exactly this key, on this reasoning. (The filing also matters
+    as a process fact: SA-PY-15 reached arch only inside `entity-core-go`'s
+    cohort sweep, after arch had twice declared the registry board closed
+    over it.)
 
-    **A ceiling of `0` is dropped rather than honored.** Honored literally it
-    expires every binding instantly and the operator sees *"no binding for this
-    name"* — indistinguishable from a bad signature or a revocation. Ruled
-    upheld for `entity-browser-rust` at `6927500`.
+    **It MUST be read at resolution, not latched** `[MUST, v1.16]` —
+    `_load_resolver_config` runs per `_meta_resolve`, so an operator editing
+    `resolver-config` is obeyed on a warm process. rust's argument, which is
+    the one that decided it cohort-wide: a ceiling read at construction
+    applies on a cold boot and silently does not on a warm one, and a security
+    control present on one boot path and absent on the other tests green on
+    whichever path the test happens to take.
+
+    **A ceiling of `0` is dropped rather than honored** `[MUST, v1.16]`.
+    Honored literally it expires every binding instantly and the operator sees
+    *"no binding for this name"* — indistinguishable from a bad signature or a
+    revocation. Ruled upheld for `entity-browser-rust` at `6927500`; all four
+    implementing seats reached it independently before it was written down.
     """
     if not entry:
         return None
@@ -536,6 +767,38 @@ def _resolver_ceiling(entry: dict[str, Any] | None) -> int | None:
     if isinstance(ceiling, int) and not isinstance(ceiling, bool) and ceiling > 0:
         return ceiling
     return None
+
+
+def _effective_lifetime(ttl: Any, local_max: int | None) -> int | None:
+    """§6a.9.1 — the lifetime this resolver will honor, given a binding's own
+    ``ttl`` and the chain entry's ceiling. **Three arms, and `min` supplies
+    only two of them.**
+
+    * no ceiling declared → the binding's `ttl`, untouched;
+    * a ceiling and an int `ttl` → ``min(ttl, local_max)``;
+    * a ceiling and **no** `ttl` → ``local_max`` `[MUST, v1.16]`.
+
+    The third arm is the whole point of the rule and it is the one a guard
+    written as ``if isinstance(ttl, int)`` silently skips: `min` over a null
+    has no natural answer, so an implementation reaches for the guard and
+    thereby applies the control **only where a bound already exists**, leaving
+    the unbounded case — the sticky `local-name` / `pinned` kinds, which are
+    the ones a resolver holds longest — uncovered. That inverts the control.
+    (`peer-issued` never reaches this arm: §6a.4 requires a non-null `ttl`
+    before a result is surfaced at all.)
+
+    **One function, two call sites, by construction.** The lifetime is read in
+    two places — the expiry verdict in `_validate` and the `ttl` surfaced to
+    the consumer — and they must agree: a resolver that clamped only the
+    surfaced number would still *honor* a binding past the ceiling, and one
+    that clamped only the expiry check hands a caller a cache hint the
+    resolver itself would not accept. Splitting them is the two-
+    representations bug with an authorization decision on one side.
+    """
+    has_ttl = isinstance(ttl, int) and not isinstance(ttl, bool)
+    if local_max is None:
+        return ttl if has_ttl else None
+    return min(ttl, local_max) if has_ttl else local_max
 
 
 def _validate(
@@ -600,11 +863,10 @@ def _validate(
 
     # TTL expiry (PROPOSAL-PEER-ISSUED §2.1 step 3): a binding with a non-null
     # ttl is excluded once issued_at + ttl has passed. ttl == null never
-    # expires (local-name / self-certifying). (REG-PEERISSUED-EXPIRED-1.)
-    ttl = binding.data.get("ttl")
+    # expires *absent a ceiling* (local-name / self-certifying) — under one it
+    # takes `local_max` (§6a.9.1 v1.16). (REG-PEERISSUED-EXPIRED-1.)
+    ttl = _effective_lifetime(binding.data.get("ttl"), local_max_ttl)
     issued_at = binding.data.get("issued_at")
-    if isinstance(ttl, int) and local_max_ttl is not None:
-        ttl = min(ttl, local_max_ttl)
     if isinstance(ttl, int) and isinstance(issued_at, int) and issued_at + ttl <= _now_ms():
         return "expired"
     return None
@@ -792,7 +1054,24 @@ def _synthesize_pin_result(pin: dict[str, Any]) -> dict[str, Any]:
 
 def name_glob_match(pattern: str, name: str) -> bool:
     """`EXTENSION-REGISTRY` §4 — the **registry-local name matcher**, closed
-    grammar `[MUST, REGISTRY v1.13]`.
+    grammar `[MUST, REGISTRY v1.13]`, and **the ONLY one `[MUST, v1.15]`**.
+
+    **Two call sites, one matcher, by mandate.** Every field in this extension
+    that globs a user-facing name uses this function:
+    `name_format_dispatch[].pattern` (§4) and the issuer policy's
+    `name_constraints` (§6a.9.1). v1.13 closed the grammar and scoped it *"to
+    this field"* — a sentence written to fence the matcher off from
+    `ENTITY-CORE-PROTOCOL` §5.4, which it still does (below), and which fenced
+    off `name_constraints` as collateral, leaving an **admission gate** with an
+    undefined grammar. v1.15 removes that scoping: *"there is one matcher per
+    registry."* We had already picked this one at `name_constraints` and filed
+    the question as `SA-PY-14`; **the interim is the ruling** (arch `c984f93`).
+    A second matcher over this domain diverges silently — the two fields sit
+    two subsections apart, match the same flat name string in the same handler,
+    and the one example the spec gave for each (`*.eth`, `*.lab`) is
+    grammar-identical under every candidate reading, so nothing in the document
+    discriminated them. `entity-core-rust` was measured on a shell-glob at
+    `name_constraints` on 2026-08-19 and owes the landing.
 
     `*` matches any run of characters including none; **every other byte is a
     literal** — `?`, `[`, `]`, `\\`, `.`, `:`, `@` and `/` match only
@@ -800,6 +1079,13 @@ def name_glob_match(pattern: str, name: str) -> bool:
     of §4.1a). `/` is **not** a separator: a name is a flat string with no
     segment structure, so `x*z` matches `x/y/z`. The match is anchored at both
     ends; there is no substring form.
+
+    **The `/`-crossing property is pinned in-tree and NOT on the wire**, in
+    both of its §11.1 rows (`REG-DISPATCH-GRAMMAR-1`, and
+    `REG-NAME-CONSTRAINTS-GRAMMAR-1` row 3): §6.3 forbids `/` in a name and
+    `_validate_name_path_safety` runs *before* admission, so no registerable
+    name can carry a `/` for the `*` to cross. Same disposition as
+    `entity-core-go`, whose spec-issue `2026-08-19-b` routes it upstream.
 
     **This delegates to no library, deliberately.** `fnmatch` (what this was
     until the v1.13 ruling) and Go's `path.Match` both give `?` and `[…]`
@@ -852,53 +1138,53 @@ def name_glob_match(pattern: str, name: str) -> bool:
 def _dispatch_allows(
     config: dict[str, Any], name: str, backend_kind: str,
 ) -> bool:
-    """§4.1 step 2 — the `name_format_dispatch` filter. **Unruled, three-way
-    split, and this peer takes the fail-closed intersection.** SA-PY-17.
+    """§4.1 step 2 — the `name_format_dispatch` filter. **RULED 2026-08-19**
+    (arch `6378606`, spec `86643f8`, REGISTRY 1.14). **Eligibility is a pure
+    function of the name**, and this is that function:
 
-    The rule here:
+    ```
+    eligible_kinds(config, name):
+      rules := config.name_format_dispatch
+      if rules is absent or empty:  return ALL          ; filter disabled
+      matched := [ r for r in rules if match(r.pattern, name) ]
+      return union( r.backend_kinds for r in matched )  ; EMPTY if none matched
+    ; consult entry IFF entry.backend_kind ∈ eligible_kinds(config, name)
+    ```
 
-    * An **empty** dispatch list filters nothing.
-    * Otherwise a backend is consulted **iff some entry whose `pattern` matches
-      the name names its kind.** A name matching several entries is eligible at
-      the **union** of their `backend_kinds` — §4 is explicit that this is a
-      *filter, not a routing table*: evaluation does not stop at the first
-      match, and precedence is `resolver_chain[].priority`, never row order.
+    **A kind reaches eligibility only by being named.** No per-backend default,
+    no "match all" for a kind named nowhere, and no fallback when nothing
+    matches — that is the empty set, and the chain reports `chain_exhausted`
+    (§4.1 step 4, fail-closed). Row order is irrelevant; the union is order-free
+    and `resolver_chain[].priority` carries all the precedence (§4: this is a
+    *filter, not a routing table* — evaluation does not stop at the first hit).
 
-    **§4.1 step 2's second sentence has two clauses and they answer two edge
-    cases differently.** *"Backends without a `name_format_dispatch` entry
-    default to match all (no filtering); backends with one are consulted ONLY
-    when the pattern matches."*
+    **Nobody misread the spec and nobody won.** The paragraph answered the same
+    question twice, differently: one sentence set-valued, the next per-backend.
+    The per-backend sentence was a **category error** — rules name
+    `backend_kinds`, not backends, so *"a backend without an entry"* had no
+    referent — and it is deleted, not reworded. Three seats reached three
+    behaviours from it; each changed exactly one branch.
 
-    | Edge case | go | rust | py |
-    |---|---|---|---|
-    | A — kind named by **no** entry, another entry matches the name | excluded | consulted | **excluded** |
-    | B — kind named by an entry, **no** entry matches the name | consulted | excluded | **excluded** |
+    | Edge case | go had | rust had | py had | **ruled** |
+    |---|---|---|---|---|
+    | A — kind named by **no** entry, another entry matches | excluded | consulted | excluded | **excluded** |
+    | B — kind named by an entry, **no** entry matches the name | consulted | excluded | excluded | **excluded** → `chain_exhausted` |
 
-    We exclude in **both**, which is neither seat's position and is deliberately
-    the conjunction of their two exclusions rather than a vote:
+    **`SA-PY-17`'s row-A analysis is adopted as the ruling's rationale** — that
+    a kind named in *no* row being consulted anyway makes §4.1a's privacy MUST
+    evadable by leaving a row out. The catch-all sentence we and go had both
+    implemented as *"no filtering"* (*"a name matching no entry is treated as
+    matching the catch-all"*) is removed: the catch-all is `*`, which matches
+    every name, so with one configured no name fails to match and without one
+    the sentence names a row with no referent. *"No filtering"* is the one
+    meaning it cannot carry — the catch-all is the most **restrictive** row in
+    §4.1a's recommended list.
 
-    * **Case A is the one that makes §4.1a's MUST real.** *"The catch-all MUST
-      NOT name a backend whose consultation transmits the queried name"* —
-      because *"the catch-all is the path every unscoped name takes."* If a kind
-      named in no entry is consulted anyway, that MUST is **evadable by leaving
-      a row out**: a `dns-txt` backend nobody mentioned sees every bare name a
-      user types. A normative privacy rule that omission bypasses is not the
-      intended reading. `entity-core-go` reaches this independently.
-    * **Case B has the text *and* the privacy argument on the same side.** The
-      second clause says *ONLY* when the pattern matches, and an operator who
-      scopes `dns-txt` to `*@*.*` has said in as many words that a bare handle
-      must not go there — consulting it for `alice` is the disclosure the row
-      was written to prevent. `entity-core-rust` reads it this way.
-    * The consequence is that a non-empty list with **no catch-all row**
-      resolves nothing. That is loud (`chain_exhausted`), not silent, and it is
-      §4.1 step 4's own posture: *"fail-closed; no silent fallback."*
-
-    **This peer was on rust's reading in both cases until 2026-08-18**, i.e.
-    fully per-backend. Case A was a real privacy hole and changing it was right.
-    Case B changed with it in the same commit on an argument that only covered
-    case A — corrected here. See `AGENTS.md`: an oracle failure that makes you
-    change behaviour is a claim about the rows it names, not about the ones the
-    same edit happens to touch.
+    This peer arrived here in two steps and only the first was argued at the
+    time: case A changed on the privacy argument, and case B **rode along in
+    the same commit** before being justified on its own (`c74f95e`). See
+    `AGENTS.md` — an oracle failure that makes you change behaviour is a claim
+    about the rows it names, not about the rows the same edit happens to touch.
     """
     dispatch = config.get("name_format_dispatch") or []
     if not dispatch:
@@ -959,17 +1245,17 @@ async def _meta_resolve(
         if result is None or binding is None:
             continue
 
-        # The resolver's own ceiling (§6a.9.1 v1.11) — applied to the expiry
-        # check AND to the `ttl` surfaced to the consumer, so a caller caching
-        # on the returned value inherits the same bound. Never written into
+        # The resolver's own ceiling (§6a.9.1 v1.16) — applied to the expiry
+        # check AND to the `ttl` surfaced to the consumer, through the one
+        # `_effective_lifetime` so the two cannot drift, so a caller caching on
+        # the returned value inherits the same bound. Never written into
         # `binding`: `result["binding"]` stays the unclamped content hash.
         local_max = _resolver_ceiling(entry)
         reason = _validate(ctx, binding, result["trust_anchor"], accepted, local_max)
         if reason is not None:
             last_reason = reason
             continue  # failed validation; try next (§2.2)
-        if local_max is not None and isinstance(result.get("ttl"), int):
-            result["ttl"] = min(result["ttl"], local_max)
+        result["ttl"] = _effective_lifetime(result.get("ttl"), local_max)
         return result, backend_id, None
 
     # 4. Fail-closed on chain exhaustion (§4.1 step 4). A definitive
@@ -1528,16 +1814,22 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
     # name_constraints narrows EVERY mode when set (e.g. a registry that only
     # issues "*.lab" regardless of who asks).
     #
-    # The matcher is §4's registry-local name matcher, and that is a CHOICE
-    # this spec does not make — §6a.9.1 declares the field as `<glob | null>`
-    # and defines the glob nowhere, while §4's v1.13 grammar is scoped "to this
-    # field" (`name_format_dispatch[].pattern`). Filed as SA-PY-14. We pick the
-    # one matcher this extension defines, over the same domain (a user-facing
-    # name string), rather than a stdlib whose rules no reading sanctions: this
-    # was `fnmatch` until the ruling landed one field away, and `fnmatch` grants
-    # `?` and `[…]` meaning nothing in the corpus grants anywhere. The decision
-    # is cross-impl-observable — it is whether a binding is issued at all — so
-    # it is a spec question, not a style one.
+    # The matcher is §4's registry-local name matcher — **RULED [MUST, v1.15]**
+    # (arch `c984f93`; `SA-PY-14` closed, our interim adopted as the ruling).
+    # §6a.9.1 declared the field as `<glob | null>` and defined the glob
+    # nowhere, and v1.13's "scoped to this field" read §4's grammar out of
+    # reach; we picked the one matcher this extension defines, over the same
+    # domain, rather than a stdlib whose rules no reading sanctions. It was
+    # `fnmatch` until the v1.13 ruling landed one field away, and `fnmatch`
+    # grants `?` and `[…]` meaning nothing in the corpus grants anywhere.
+    #
+    # This is an **admission gate**: it decides `403 not_entitled` versus a
+    # signed, published binding, so two registries running the same operator
+    # policy admitted different names. The discriminating rows live in
+    # `test_registry_ttl_and_dispatch_grammar.py::TestNameConstraintsGrammar`
+    # and they are asserted HERE rather than only at the matcher, because the
+    # defect this closes was a *call site* pointed at the wrong function while
+    # the matcher itself was correct.
     constraint = policy.get("name_constraints")
     if isinstance(constraint, str) and not name_glob_match(constraint, nfc_name):
         return _error(403, "not_entitled", f"name {name!r} not permitted by name_constraints")
@@ -1960,6 +2252,114 @@ async def _handle_get_issuer_policy(ctx: HandlerContext, params: dict[str, Any])
     return _ok(ISSUER_POLICY_TYPE, dict(policy))
 
 
+async def _handle_set_resolver_config(
+    ctx: HandlerContext, params: dict[str, Any],
+) -> dict[str, Any]:
+    """§4.3 ``:set-resolver-config`` `[v1.18]` — store the resolver-config,
+    gated by ``system/capability/registry-configure``.
+
+    **The operation exists because the capability named an act the corpus never
+    defined.** `registry-configure` was declared as a bare tree-write against
+    `system/registry/resolver-config`, so §4.1 step 2's write-time MUST had no
+    surface to bind to, there was nowhere for an operator override to live, and
+    `REG-TTL-CEILING-REREAD-1` was not constructible — a config surface with no
+    write operation cannot be validated, cannot be rebound, and cannot be
+    conformance-driven at all. Identical hole to `registry-manage-issuer-policy`
+    before §6a.9.2, one entity over.
+
+    Three MUSTs, and each has a row in the vector:
+
+    * **Validate the WHOLE config before storing**, not the delta — §4.1 step 2
+      against every rule and every chain entry.
+    * **No partial application.** On refusal nothing is written and a following
+      `get-resolver-config` returns the previous bytes unchanged. Here that is
+      structural rather than compensated: the single `emit` happens after the
+      check, so there is no half-applied state to unwind.
+    * **`acknowledge_name_disclosure` is the operator `MAY`, made
+      expressible** — absent or `false` refuses a violating config `403
+      policy_rejected` **with the full violation list**; `true` stores it, and
+      every subsequent load surfaces the disclosure.
+
+    **The acknowledgement is a parameter of this operation and MUST NOT become
+    a field of the config entity.** A field is written by whoever writes the
+    bytes — so a distribution could set it and defeat the rule that bounds it —
+    and it would move a content-addressed type's hash to carry a claim it
+    cannot secure. Provenance is a property of the **act**, so it rides the
+    capability-gated call by an identified actor, which is exactly the thing a
+    stored byte cannot be. This is also the whole reason load-time enforcement
+    could never honor the `MAY`.
+    """
+    data = _params_data(params)
+    raw_config = data.get("config")
+    if not isinstance(raw_config, dict):
+        return _error(
+            400, "invalid_params",
+            "set-resolver-config requires a `config` entity "
+            f"({RESOLVER_CONFIG_TYPE}) — §4.3",
+        )
+    if raw_config.get("type") != RESOLVER_CONFIG_TYPE:
+        return _error(
+            400, "invalid_params",
+            f"config MUST be a {RESOLVER_CONFIG_TYPE} entity, got "
+            f"{raw_config.get('type')!r}",
+        )
+    config_data = raw_config.get("data")
+    if not isinstance(config_data, dict):
+        return _error(400, "invalid_params", "config.data must be a map")
+
+    config = Entity(type=RESOLVER_CONFIG_TYPE, data=config_data)
+    # A caller-supplied hash is a claim about bytes we are about to store under
+    # our own name (§1.8): validate it or drop it, never carry it unchecked.
+    claimed = _normalize_hash(raw_config.get("content_hash"))
+    if claimed is not None and claimed != config.compute_hash():
+        return _error(
+            400, "invalid_params",
+            "config.content_hash does not match ECF({type, data}) — refusing "
+            "to store bytes under a hash the caller asserted (§1.8)",
+        )
+
+    violations = _disclosure_violations(config_data)
+    acknowledged = data.get("acknowledge_name_disclosure") is True
+    if violations and not acknowledged:
+        return _error(
+            403, "policy_rejected",
+            "this resolver-config would make a name-transmitting backend "
+            "eligible for an unscoped name (§4.1 step 2) — set "
+            "acknowledge_name_disclosure to store it deliberately. Violations: "
+            + "; ".join(violations),
+            violations=violations,
+        )
+
+    ctx.emit_pathway.emit(
+        RESOLVER_CONFIG_PATH, config, EmitContext.from_handler_grant(ctx, "configure"),
+    )
+    return _ok(RESOLVER_CONFIG_TYPE, dict(config_data))
+
+
+async def _handle_get_resolver_config(
+    ctx: HandlerContext, params: dict[str, Any],
+) -> dict[str, Any]:
+    """§4.3 ``:get-resolver-config`` `[v1.18]` — the stored config, as written,
+    or `404 not_found` when unset. Takes no params (§3.2 empty-params shape).
+
+    **Unset is not empty, and it is not the default either.** `_load_resolver_config`
+    synthesizes a local-name-only chain so an unconfigured peer resolves its own
+    local-names (§10) — returning *that* here would report a config the operator
+    never wrote and would make a `set` → `get` round-trip unverifiable against
+    a peer that stored nothing. Same call as `get-issuer-policy`'s: reading back
+    a synthesized default is how a peer tells an operator their write landed
+    when it did not.
+    """
+    stored = _get_entity(ctx, RESOLVER_CONFIG_PATH)
+    if stored is None or stored.type != RESOLVER_CONFIG_TYPE:
+        return _error(
+            404, "not_found",
+            "no resolver-config is stored (§4.3) — this peer runs the §10 "
+            "local-name-only default, which is not a stored configuration",
+        )
+    return _ok(RESOLVER_CONFIG_TYPE, dict(stored.data))
+
+
 async def registry_handler(
     path: str,
     operation: str,
@@ -1995,6 +2395,11 @@ async def registry_handler(
         return await _handle_set_issuer_policy(ctx, params)
     if operation == _OP_GET_POLICY:
         return await _handle_get_issuer_policy(ctx, params)
+    # §4.3 resolver-config management
+    if operation == _OP_SET_RESOLVER_CONFIG:
+        return await _handle_set_resolver_config(ctx, params)
+    if operation == _OP_GET_RESOLVER_CONFIG:
+        return await _handle_get_resolver_config(ctx, params)
     return _error(
         404, "unknown_operation",
         f"system/registry has no operation {operation!r}",
