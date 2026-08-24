@@ -31,6 +31,11 @@ from entity_core.peer.liveness import (
 from entity_core.protocol.auth import create_identity_entity
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
+from entity_core.utils.path import is_safe_path_segment
+from entity_handlers.continuation import (
+    STEP_INDEX_UNSPECIFIED,
+    _synthesized_step_key,
+)
 from entity_handlers.network import (
     NetworkExtension,
     backoff_path,
@@ -145,7 +150,12 @@ class TestMaintainPeerEstablishesGraph:
                 data = result.result["data"]
                 assert data["peer_id"] == server.peer_id
                 assert data["session_id"]
-                assert data["chain_id"].startswith("network/maintain/")
+                # §3.11: a single path segment — chain_id is a segment of the
+                # §3.10.6 marker path, so a "/" forks the marker tree. Shape
+                # only: the value is opaque and our spelling is not the
+                # contract (mirrors Go's network_maintain_installs_graph).
+                assert data["chain_id"]
+                assert "/" not in data["chain_id"]
                 assert len(data["subscriptions"]) == 2
 
                 # The graph is in the tree: two inbox residents + the
@@ -170,10 +180,27 @@ class TestMaintainPeerEstablishesGraph:
                     assert ent.data["dispatch_capability"] == grant_hash, (
                         f"continuation at {path} must ride the handler grant (§11)"
                     )
-                    assert "on_error" not in ent.data, (
-                        f"continuation at {path} carries on_error — a failed "
-                        f"reconnect must bind the §3.10 lost marker instead"
-                    )
+                # Arch ruling 3 inverted this: the on-disconnect continuation
+                # MUST carry on_error routing a failed reconnect to the backoff
+                # seam, so the expected failure routes instead of binding a
+                # marker per attempt. This vector previously asserted on_error
+                # was ABSENT ("a failed reconnect must bind the §3.10 lost
+                # marker instead") — that was the defect, written down as a
+                # requirement.
+                on_disc = client.content_store.get(
+                    tree.get(tree.normalize_uri(on_disconnect_path(server.peer_id)))
+                )
+                assert on_disc.data["on_error"] == {
+                    "uri": backoff_path(server.peer_id),
+                    "operation": "advance",
+                }, (
+                    f"the on-disconnect continuation must route a failed "
+                    f"reconnect to the backoff seam, got "
+                    f"{on_disc.data.get('on_error')!r}"
+                )
+                # Ruling 4's trap is unintended advancement, so the seam must
+                # be the §11 managed namespace and never an inbox resident.
+                assert not backoff_path(server.peer_id).startswith("system/inbox/")
 
                 # Both ends observe connected (§A3 establish writes).
                 status = await _wait_for(lambda: _read_status(client, server_kp))
@@ -231,11 +258,14 @@ class TestReconnectLifecycle:
     """The rung-3 anchor vector: establish → kill the remote → the floor
     demotes → the graph reconnects through backoff retries against the
     restarted peer → status returns to connected and restore-subscriptions
-    ran (§7.2 first half: the seeded dead subscription is dropped). The
-    failed attempts leave §3.10 lost-error markers keyed by reason
-    ``connection_failed`` — the marker-proposal §4 reconnect-chain evidence."""
+    ran (§7.2 first half: the seeded dead subscription is dropped).
 
-    def test_kill_restart_reconnects_and_leaves_markers(self):
+    The failed attempts leave NO markers (arch rulings 2 + 3): a peer that is
+    merely away is the expected path through this graph, not an anomaly. This
+    class previously asserted the reverse and doubled as the marker-proposal §4
+    reconnect-chain evidence; that reading is retired — see the body."""
+
+    def test_kill_restart_reconnects_and_leaves_no_markers(self):
         async def run():
             server_kp, client_kp = Keypair.generate(), Keypair.generate()
             fixed_port = _free_port()
@@ -297,34 +327,41 @@ class TestReconnectLifecycle:
                 )
                 assert demoted, "no demotion after killing the remote"
 
-                # The graph retries against a dead address: failed reconnect
-                # dispatches land as lost-error markers (no-on_error forward
-                # non-2xx, reason connection_failed — the single-rule
-                # code-as-reason convention).
-                markers = await _wait_for(
-                    lambda: [
-                        u for u in _lost_marker_uris(client)
-                        if "/connection_failed/" in u
-                    ],
-                    timeout=10.0,
-                )
-                assert markers, (
-                    "failed reconnects left no connection_failed lost marker"
-                )
-                # Marker coordinate shape (§4 key-convergence input for the
-                # cohort pass): reason = connection_failed (code-as-reason);
-                # step_index falls back to the continuation-keyed synthesized
-                # form because Python's LOCAL notification delivery is an
-                # internal dispatch carrying no request_id (the F1 pin's
-                # sanctioned fallback: "synthesized key only when the EXECUTE
-                # carried none").
-                marker_ent = client.content_store.get(
-                    client.entity_tree.get(markers[0])
-                )
-                assert marker_ent.data["reason"] == "connection_failed"
-                assert marker_ent.data["code"] == "connection_failed"
-                assert marker_ent.data["step_index"] == (
-                    f"cont-forward-{on_disconnect_path(server.peer_id)}"
+                # The graph retries against a dead address, and that MUST NOT
+                # leave a marker trail (arch rulings 2 + 3).
+                #
+                # This vector used to assert the opposite — it doubled as the
+                # Python shape for PROPOSAL-CONTINUATION-LOST-ERROR-MARKER-MUST
+                # §4, on the reading that "the reconnect-failure path MUST leave
+                # lost-error markers (no-on_error forward non-2xx)". That
+                # reading is RETIRED, on the merits: a reconnect failing against
+                # an offline peer is the expected path through this graph, so a
+                # marker per attempt (~1,440 nodes/day for a peer merely away)
+                # recorded the lifecycle WORKING as if it were breaking. The
+                # missing on_error was the defect, not the subject. §4 needs a
+                # natural subject — a chain that fails with no on_error BY
+                # DESIGN. Go retired the identical reading in their own
+                # lifecycle vectors for the same reason.
+                #
+                # Both rulings are load-bearing here and neither suffices alone:
+                # ruling 3's on_error only MOVED the marker from the
+                # on-disconnect continuation to the backoff one (measured — the
+                # step key changed from hash(on_disconnect_path) to
+                # hash(backoff_path)), because the backoff continuation forward-
+                # dispatches maintain-peer and ruling 2's 200 is what stops THAT
+                # dispatch being a no-on_error non-2xx.
+                await asyncio.sleep(1.0)  # several retries at 50-100ms
+                markers = [
+                    u for u in _lost_marker_uris(client)
+                    if "/connection_failed/" in u
+                ]
+                assert markers == [], (
+                    f"a peer that is merely away left {len(markers)} "
+                    f"connection_failed marker(s): {markers[:3]}. The failed "
+                    f"reconnect must ROUTE through on_error to the backoff seam "
+                    f"(ruling 3) and maintain-peer must answer 200 while the "
+                    f"retry is armed (ruling 2) — the marker is for exceptional "
+                    f"failure, not for the lifecycle doing its job."
                 )
 
                 # Restart the server: same keypair, same port — the retry

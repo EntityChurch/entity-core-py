@@ -25,11 +25,13 @@ cohort-wide):
   dispatches the internal ``reconnect`` operation (the connect-if-needed
   seam — the pseudocode's ``system/protocol/connect hello`` target is the
   responder side of the handshake and cannot dial; spec-issue 4).
-- ``system/network/peers/{peer}/on-reconnect-backoff`` — one-shot
+- ``system/network/peers/{peer}/on-reconnect-backoff`` — STANDING
   continuation re-EXECUTing ``maintain-peer``; advanced by the handler
   after the computed §2.2 backoff delay (spec-issue 5). Lives in the §11
   managed namespace, NOT under ``system/inbox/*`` — the marker-proposal §5
-  discipline (spec-issue 1).
+  discipline (spec-issue 1). Standing per arch ruling 1: as a one-shot it
+  could only re-arm from inside the dispatch it triggered, and the consume
+  ran after and deleted the path (see ``_install_backoff_continuation``).
 - ``system/inbox/network/{peer}/on-reconnect`` — standing continuation,
   advanced by a second lifecycle subscription on the same status path
   (spec-issue 2 — the pseudocode's single subscription never fires this
@@ -113,6 +115,32 @@ def _inbox_prefix(peer_id: str) -> str:
 
 def _managed_prefix(peer_id: str) -> str:
     return f"system/network/peers/{peer_id}/"
+
+
+def _local_identity_hash(keypair: Any) -> bytes:
+    """Hash of the local peer's identity entity — the author/subscriber the
+    handler's own self-authored dispatches must present (mirrors
+    ``Peer._get_local_identity_hash``)."""
+    return create_identity_entity(keypair).compute_hash()
+
+
+def _upstream_error(result: Any) -> tuple[str, str]:
+    """Extract ``(code, message)`` from a failed sub-dispatch result.
+
+    Lets a caller re-raise the upstream failure under its own status
+    instead of flattening it to ``internal_error`` — the distinction
+    between "this handler broke" and "the sub-dispatch was refused" is
+    what makes a cross-impl probe diagnosable.
+    """
+    payload = result.result
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, dict) and (data.get("code") or data.get("message")):
+            return (
+                str(data.get("code") or "internal_error"),
+                str(data.get("message") or result.error or ""),
+            )
+    return "internal_error", str(result.error or payload or "")
 
 
 def _backoff_delay_s(backoff: dict[str, Any] | None, attempt: int) -> float:
@@ -218,7 +246,11 @@ class NetworkExtension(Extension):
             peer_id=peer_id,
             remote_hash=remote_hash,
             session_id=session_id,
-            chain_id=f"network/maintain/{session_id}",
+            # §3.11: chain_id MUST be a single path segment — it *is* a segment
+            # of the §3.10.6 marker path .../lost/{chain_id}/{step_index}/...,
+            # so a multi-segment value forks the marker tree. §4.1's literal
+            # "network/maintain/{sid}" is ruled non-conformant. Value is opaque.
+            chain_id=f"network-maintain-{session_id}",
             params=params,
         )
         self._sessions[peer_id] = sess
@@ -276,9 +308,8 @@ class NetworkExtension(Extension):
         graph on failure): that holds for the FIRST imperative call. On a
         re-entry for an existing session (the backoff continuation
         re-EXECUTing maintain-peer after a failed reconnect), a connect
-        failure must NOT strand the retry loop — the graph is re-armed
-        (one-shot backoff continuation re-installed, next delayed advance
-        scheduled) before the 502 returns.
+        failure must NOT strand the retry loop — the next delayed advance of
+        the standing backoff continuation is scheduled before the 502 returns.
         """
         peer = self._peer
         if peer is None:
@@ -348,7 +379,38 @@ class NetworkExtension(Extension):
                         "maintain-peer %s: re-arm backoff failed: %s",
                         peer_id[:16], arm_err,
                     )
-            elif not existed:
+                # Arch ruling 2: 200, not 502 — the contract is MAINTAIN, not
+                # connect-now. The retry is armed, so an unreachable peer is
+                # this operation succeeding at what it promises. 502 is
+                # retained below for reconnect:false, where "connect now" IS
+                # the whole contract and no later retry can succeed.
+                #
+                # Coupled with ruling 3's on_error (see
+                # _install_reconnect_continuations): the backoff continuation
+                # forward-dispatches maintain-peer, so a 502 here was a
+                # no-on_error forward non-2xx and bound a lost marker PER
+                # RETRY. Ruling 3 alone only moved that marker from the
+                # on-disconnect continuation to this one — the two rulings are
+                # one change, and together they empty the marker tree for a
+                # peer that is merely away.
+                #
+                # No `status` field on the result: that would rebuild the
+                # connected/disconnected mirror §3.13 already owns.
+                logger.debug(
+                    "maintain-peer %s: unreachable, retry armed — 200 "
+                    "(maintain, not connect-now): %s",
+                    peer_id[:16], e,
+                )
+                return ok_response(
+                    "system/network/maintain-result",
+                    {
+                        "peer_id": peer_id,
+                        "session_id": sess.session_id,
+                        "subscriptions": list(sess.subscription_ids),
+                        "chain_id": sess.chain_id,
+                    },
+                )
+            if not existed:
                 # First imperative call failed — no session, no graph (§4.1).
                 self._drop_session(peer_id)
             return error_response(
@@ -402,7 +464,7 @@ class NetworkExtension(Extension):
         self, ctx: HandlerContext, sess: _MaintainSession
     ) -> None:
         """Write the on-disconnect standing continuation (inbox resident —
-        the lifecycle subscription's delivery target) and the one-shot
+        the lifecycle subscription's delivery target) and the standing
         backoff continuation (managed-namespace resident — advanced only by
         the handler's delayed self-advance, never via system/inbox/*).
 
@@ -426,6 +488,22 @@ class NetworkExtension(Extension):
                 "resource": {"targets": [NETWORK_HANDLER_PATTERN]},
                 "params": reconnect_params,
                 "dispatch_capability": ctx.handler_grant_hash,
+                # Arch ruling 3: a reconnect failing against an offline peer is
+                # the EXPECTED path through this graph, not an anomaly. With no
+                # on_error it fell through to a §3.10 lost marker PER ATTEMPT
+                # (~1,440 nodes/day for a peer merely away), recording the
+                # lifecycle working as if it were breaking. Routing it to the
+                # retry seam is the graph describing its own recovery, and the
+                # marker returns to catching exceptional failure.
+                #
+                # Ruling 4 permits this: the error is MEANT to drive the next
+                # step. The marker-proposal §5 "never system/inbox/*" does not
+                # bite either — backoff_path is the §11 managed namespace, not
+                # an inbox resident.
+                "on_error": {
+                    "uri": backoff_path(sess.peer_id),
+                    "operation": "advance",
+                },
             },
         )
         self._install_backoff_continuation(ctx, sess)
@@ -433,10 +511,32 @@ class NetworkExtension(Extension):
     def _install_backoff_continuation(
         self, ctx: HandlerContext, sess: _MaintainSession
     ) -> None:
-        """(Re-)install the one-shot §4.1 backoff continuation that
-        re-EXECUTEs maintain-peer with the session's original request.
-        One-shot: each advance consumes it; maintain-peer re-entry
-        re-installs it while the failure persists."""
+        """Install the STANDING §4.1 backoff continuation that re-EXECUTEs
+        maintain-peer with the session's original request.
+
+        Standing (``remaining_executions`` absent) per arch ruling 1. This was
+        a one-shot that re-installed itself on each maintain-peer re-entry, and
+        it could not work — the defect is ORDERING, not timing:
+
+            timer fires -> advance READS the continuation (remaining = 1)
+              -> dispatches maintain-peer
+                  -> connect fails -> re-installs the one-shot at this path
+              -> advance applies the remaining it read (1 -> 0), DELETES the path
+            next timer fires -> advance finds nothing -> {advanced: false} / 200
+
+        The re-install lands *inside* the dispatch; the consume runs *after* it
+        and deletes the path out from under the next advance. So the loop
+        managed exactly 2 dials against a peer that stayed dead, then stopped
+        silently — no marker, no error, a 200. Measured identically from inside
+        (2 dials / 2.002s) and by Go's black-box probe on our wire (2 dials /
+        25.037s).
+
+        A standing continuation is never decremented and never deleted
+        (`_advance_forward` gates all of that on ``remaining is not None``), so
+        the path survives every advance. Retry pacing is the handler's timer;
+        the continuation is only the dispatch vehicle, which is why standing is
+        the coherent shape here rather than a bookkeeping counter.
+        """
         self._bind_continuation(
             ctx,
             backoff_path(sess.peer_id),
@@ -445,7 +545,6 @@ class NetworkExtension(Extension):
                 "operation": "maintain-peer",
                 "resource": {"targets": [NETWORK_HANDLER_PATTERN]},
                 "params": dict(sess.params),
-                "remaining_executions": 1,
                 "dispatch_capability": ctx.handler_grant_hash,
             },
         )
@@ -514,7 +613,21 @@ class NetworkExtension(Extension):
             ctx.emit_pathway.put_content_only(ent)
 
         status_path = liveness.peer_status_path(remote_hash)
-        result = await ctx.execute(
+        # Self-authored dispatch: pin the author to the LOCAL peer.
+        #
+        # This subscribe is the handler's own bookkeeping — the deliver
+        # target is this peer's own inbox and the deliver_token above is
+        # self-granted (granter == grantee == local peer), so the subscriber
+        # that EXTENSION-SUBSCRIPTION §3.1's SB1 creator-authority check
+        # sees MUST be this peer. A plain `ctx.execute` would instead
+        # inherit the *inbound caller's* identity (the V7 §6.8 propagation
+        # default seeded by the dispatcher), which is absent from the
+        # self-granted token's authority chain — so every remote-driven
+        # maintain-peer 403s `embedded_cap_unauthorized` here while
+        # local-driven ones pass. release-peer already unsubscribes these as
+        # the local identity (§4.2), so local-peer authorship is also what
+        # keeps subscribe/unsubscribe ownership symmetric.
+        result = await ctx.execute_with_capability(
             "system/subscription",
             "subscribe",
             {
@@ -530,12 +643,27 @@ class NetworkExtension(Extension):
                 },
             },
             resource_targets=[status_path],
+            # Author: the §3.1 SB1 creator-authority check reads
+            # ctx.remote_identity_hash.
+            propagated_author_peer_id=ctx.local_peer_id,
+            propagated_author_identity_hash=_local_identity_hash(self._keypair),
+            # Caller cap: §5.3 records subscriber_identity from
+            # ctx.caller_capability["grantee"] — a *different* source than
+            # the SB1 check above. The handler grant is self-granted
+            # (granter == grantee == local identity), so riding it here is
+            # what makes these subscriptions genuinely self-owned rather
+            # than owned by whichever remote happened to drive maintain-peer
+            # (which would then bind release-peer to that same caller).
+            propagated_caller_capability=ctx.handler_grant,
         )
         if not result.ok:
+            # Surface the upstream status/code rather than collapsing every
+            # failure into a 500 — an authorization refusal is a 403, and
+            # masking it as internal_error hides the actual cause.
+            code, message = _upstream_error(result)
             return error_response(
-                500, "internal_error",
-                f"lifecycle subscribe for {deliver_uri} returned "
-                f"{result.status}: {result.error or result.result}",
+                result.status, code,
+                f"lifecycle subscribe for {deliver_uri} failed: {message}",
             )
         sub_id = None
         if isinstance(result.result, dict):
@@ -554,9 +682,13 @@ class NetworkExtension(Extension):
     def _arm_backoff_retry(
         self, ctx: HandlerContext, sess: _MaintainSession
     ) -> None:
-        """Re-install the one-shot backoff continuation and schedule its
-        delayed advance per the session's §2.2 backoff config."""
-        self._install_backoff_continuation(ctx, sess)
+        """Schedule the next delayed advance of the standing backoff
+        continuation, per the session's §2.2 backoff config.
+
+        No re-install: the continuation is standing (ruling 1), so it survives
+        its own advance. The re-install this used to do was the one-shot's
+        self-re-arm — the very write that lost the race with the consume.
+        """
         self._schedule_backoff_advance(sess)
 
     def _schedule_backoff_advance(self, sess: _MaintainSession) -> None:
@@ -762,16 +894,23 @@ class NetworkExtension(Extension):
 
         # Remove the lifecycle subscriptions (self-owned — the unsubscribe
         # rides the handler grant, whose grantee is the local identity, the
-        # same identity that subscribed).
+        # same identity that subscribed). The pinning must mirror
+        # _subscribe_lifecycle exactly: §3.2 checks the caller cap's grantee
+        # against the recorded subscriber_identity, so letting the dispatcher
+        # seed the *inbound caller's* cap here would 403 not_subscription_owner
+        # whenever release-peer is driven by anyone but the original subscriber.
         if sess is not None:
             for sub_id in sess.subscription_ids:
-                result = await ctx.execute(
+                result = await ctx.execute_with_capability(
                     "system/subscription",
                     "unsubscribe",
                     {
                         "type": "system/subscription/cancel",
                         "data": {"subscription_id": sub_id},
                     },
+                    propagated_author_peer_id=ctx.local_peer_id,
+                    propagated_author_identity_hash=_local_identity_hash(self._keypair),
+                    propagated_caller_capability=ctx.handler_grant,
                 )
                 if not result.ok:
                     logger.warning(

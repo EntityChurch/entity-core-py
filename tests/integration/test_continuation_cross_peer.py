@@ -211,3 +211,59 @@ async def test_out_of_scope_denied_no_silent_escalation(peer_b):
     finally:
         conn.close()
         await conn.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_chain_depth_rides_the_cross_peer_wire(peer_b):
+    """PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1 / anchor 3 — proven on a
+    real Python↔Python wire, not a mocked dispatcher.
+
+    A continuation advancement's ``system/bounds`` (with ``chain_depth``) MUST
+    survive to the receiver's ingress so the tested value is the *global* chain
+    length, inherited across the boundary, not reset per peer. Before Delta 1
+    the remote branch dropped bounds and this envelope arrived bounds-less.
+
+    This is the wire half of proposal §8 anchor 1; the full two-peer causal
+    ping-pong terminating at the ceiling is the cross-impl validate-peer
+    convergence pass (deferred, same scoping Go used for its anchor 1/2).
+    """
+    from entity_core.protocol.bounds import Bounds
+
+    kp_a = Keypair.generate()
+    conn = await Connection.connect("127.0.0.1", 19077, kp_a)
+    try:
+        captured = []
+        orig = peer_b._store_included_entities
+
+        def _spy(env):
+            captured.append(env)
+            return orig(env)
+
+        peer_b._store_included_entities = _spy
+
+        await conn.execute(
+            uri=f"entity://{peer_b.peer_id}/system/tree",
+            operation="get",
+            params={"type": "primitive/any", "data": {"path": "data/probe"}},
+            bounds=Bounds(
+                chain_id="chain-xpeer", chain_depth=7, ttl=64, budget=100000
+            ),
+        )
+
+        exec_envs = [
+            e for e in captured
+            if e.root.get("type") == "system/protocol/execute"
+        ]
+        assert exec_envs, "no EXECUTE envelope captured at B"
+        wire_bounds = exec_envs[-1].root["data"].get("bounds")
+        assert wire_bounds is not None, (
+            "bounds dropped on the cross-peer wire — Delta 1 regression "
+            "(the remote branch must not drop system/bounds for a chain dispatch)"
+        )
+        assert wire_bounds["chain_depth"] == 7, (
+            f"chain_depth did not survive the wire: {wire_bounds!r}"
+        )
+        assert wire_bounds["chain_id"] == "chain-xpeer"
+    finally:
+        conn.close()
+        await conn.wait_closed()

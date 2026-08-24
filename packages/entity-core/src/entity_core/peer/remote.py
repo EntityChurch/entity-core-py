@@ -40,6 +40,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any, Protocol
 
+from entity_core.protocol.bounds import Bounds
 from entity_core.protocol.messages import ExecuteResponse
 
 if TYPE_CHECKING:
@@ -100,6 +101,7 @@ class RemoteEndpoint(Protocol):
         deliver_token_chain: list[dict[str, Any]] | None = None,
         capability_override: dict[str, Any] | None = None,
         capability_chain_override: list[dict[str, Any]] | None = None,
+        bounds: "Bounds | None" = None,
         included: list[dict[str, Any]] | None = None,
     ) -> ExecuteResponse: ...
 

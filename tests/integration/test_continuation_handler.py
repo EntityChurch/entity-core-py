@@ -5,6 +5,7 @@ import pytest
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.context import HandlerContext, ExecuteResult
 from entity_core.protocol.entity import Entity
+from entity_core.utils.path import is_safe_path_segment
 from entity_core.storage.emit import EmitPathway, EmitContext
 from entity_core.storage.content_store import ContentStore
 from entity_core.storage.entity_tree import EntityTree
@@ -15,6 +16,7 @@ from entity_handlers.continuation import (
     CONTINUATION_TYPE,
     CONTINUATION_JOIN_TYPE,
     CONTINUATION_SUSPENDED_TYPE,
+    _synthesized_step_key,
 )
 
 
@@ -1403,16 +1405,35 @@ class TestContinuationInstall:
         # Advancement still returns (best-effort; no reactive behavior).
         assert resp["status"] == 200
         # v1.20 §3.10.1 path: .../{kind}/{chain_id}/{step_index}/{reason}/{marker_hash}
-        # — chain_id falls back to "unknown" here; reason is the canonical
-        # engine code `on_error_dispatch_failed` (Appendix A); the {marker_hash}
-        # terminal varies per-occurrence so we scan the prefix.
-        prefix = emit_pathway.entity_tree.normalize_uri(
-            "system/runtime/chain-errors/lost/unknown/"
-            "cont-error-system/inbox/v19-a1/on_error_dispatch_failed/"
+        # — reason is the canonical engine code `on_error_dispatch_failed`
+        # (Appendix A); the {marker_hash} terminal varies per-occurrence so we
+        # scan the prefix.
+        #
+        # {chain_id} was pinned to the literal "unknown" until §3.6 step 6 was
+        # implemented: this advance's trigger carries no chain, so pre-step-6
+        # the dispatch ran chainless and the binder's `or "unknown"` fallback
+        # supplied the coordinate. That sentinel was never the contract — it
+        # was the symptom cross-impl marker-coordinate reconciliation chased
+        # (Rust pinned "internal", Go the request id). Step 6 generates a chain
+        # on absence, so the marker keys on a real one; the id is opaque and
+        # freshly generated per advance, hence scan-and-assert rather than a
+        # literal.
+        base = emit_pathway.entity_tree.normalize_uri(
+            "system/runtime/chain-errors/lost/"
         )
-        matches = emit_pathway.entity_tree.list_prefix(prefix)
+        matches = [
+            uri for uri in emit_pathway.entity_tree.list_prefix(base)
+            if "/on_error_dispatch_failed/" in uri
+        ]
         assert matches, (
-            f"A.1 lost marker not bound under {prefix} (v1.20 path scheme)"
+            f"A.1 lost marker not bound under {base}<chain_id>/<step_index>/"
+            f"on_error_dispatch_failed/ (v1.20 path scheme)"
+        )
+        chain_segment = matches[0][len(base):].split("/")[0]
+        assert chain_segment != "unknown", (
+            "§3.6 step 6 regression: the marker keyed on the binder's "
+            "`or \"unknown\"` fallback, meaning the advance dispatched with "
+            "chain_id absent. Step 6 must generate on absence."
         )
         marker_uri = matches[0]
         marker_hash = emit_pathway.entity_tree.get(marker_uri)
@@ -1423,8 +1444,21 @@ class TestContinuationInstall:
         assert marker.data["status"] == 503
         # Impl-specific extras per §3.10.6 "impls MAY add additional fields".
         assert marker.data["on_error_uri"] == "system/inbox/errs"
-        # §3.10.6: `step_index` (was `original_request_id`).
-        assert marker.data["step_index"] == "cont-error-system/inbox/v19-a1"
+        # §3.10.6 `step_index` + arch ruling 14: a step with no request_id gets
+        # a SINGLE-SEGMENT synthesized key, with the natural key in the body.
+        # This previously interpolated a tree path into a one-segment slot, so
+        # our own sanitizer quarantined our own legitimate coordinate — the
+        # measurement that made the spelling ruling urgent. Hashing the path
+        # restores the index; `continuation_path` keeps the semantic readable.
+        step_key = _synthesized_step_key("error", "system/inbox/v19-a1")
+        assert marker.data["step_index"] == step_key
+        assert is_safe_path_segment(step_key)
+        assert f"/{step_key}/" in marker_uri, (
+            f"the synthesized key must reach the PATH unquarantined: {marker_uri}"
+        )
+        assert marker.data["continuation_path"] == "system/inbox/v19-a1", (
+            "ruling 14's natural key must survive in the body"
+        )
 
     @pytest.mark.asyncio
     async def test_lost_error_marker_logs_emit_status_failure(

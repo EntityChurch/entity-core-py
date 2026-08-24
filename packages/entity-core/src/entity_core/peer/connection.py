@@ -52,6 +52,7 @@ from entity_core.handlers.connect import (
 )
 from entity_core.peer.session import Session
 from entity_core.protocol.auth import create_authenticated_request
+from entity_core.protocol.bounds import Bounds
 from entity_core.protocol.envelope import Envelope
 from entity_core.utils.ecf import (
     ALG_ECFV1_SHA256,
@@ -153,6 +154,7 @@ class Connection:
         capability_override: dict[str, Any] | None = None,
         capability_chain_override: list[dict[str, Any]] | None = None,
         durability_request: dict[str, Any] | None = None,
+        bounds: "Bounds | None" = None,
         included: list[dict[str, Any]] | None = None,
     ) -> ExecuteResponse:
         """Send an EXECUTE request and wait for response.
@@ -214,6 +216,11 @@ class Connection:
             deliver_to=deliver_to_spec,
             deliver_token=deliver_token_hash,
             durability_request=durability_request_obj,
+            # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1: a continuation
+            # advancement's cross-peer EXECUTE carries system/bounds so
+            # chain_depth (and chain_id/ttl/budget) ride the wire and are
+            # inherited at ingress. None for ordinary dispatch (unchanged).
+            bounds=bounds,
         )
 
         if authenticated:

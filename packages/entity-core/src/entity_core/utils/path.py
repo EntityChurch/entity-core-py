@@ -156,6 +156,76 @@ def validate_path_chars(path: str) -> str | None:
     return None
 
 
+def is_safe_path_segment(segment: str | None) -> bool:
+    """Whether ``segment`` is usable as a SINGLE path segment (V7 §1.4).
+
+    Safe means: non-empty, slash-free, neither ``.`` nor ``..``, and free of
+    ASCII control characters. Note this is a *segment* predicate — it is
+    deliberately stricter than :func:`clean_path`, which only rejects a
+    **leading** ``./`` or ``../``. An interior ``..`` is the dangerous form: a
+    normalizer RESOLVES it rather than rejecting it, so ``sink/{X}/..`` is
+    inside the sink by string prefix while naming somewhere else.
+    """
+    if not segment:
+        return False
+    if "/" in segment:
+        return False
+    if segment in (".", ".."):
+        return False
+    return validate_path_chars(segment) is None
+
+
+def sanitize_path_segment(segment: str | None, sentinel: str) -> str:
+    """Return ``segment`` if it is path-safe, else collapse it to ``sentinel``.
+
+    For any value that is interpolated into a tree path but originates OUTSIDE
+    the local peer's control — a wire-supplied ``bounds.chain_id`` or
+    ``request_id``, a remote handler's error ``code``. Such a value MUST NOT be
+    trusted as a path component: the §3.10.3 ``rejected`` marker in particular is
+    bound *because* the sender's capability check failed, so an unauthorized
+    caller reaches that binding site by construction and no capability is
+    required to choose where the entity lands.
+
+    Unsafe values **collapse to a fixed sentinel** (arch ruling 13 as amended,
+    `ROUTING-2026-07-17-arch-rulings-round2.md` §1) — they are not dropped, and
+    NOT hashed. This reverses our earlier hashed ``invalid-<sha256[:16]>`` form,
+    for three reasons, of which the third is the one that decides it:
+
+    1. **Distinctness was never at risk.** §3.4/§3.10.1 puts each distinct
+       occurrence at its own ``{marker_hash}`` terminal segment. Two hostile
+       values collapsing to the same intermediate node still produce distinct
+       terminals (different bodies → different hashes). Collapsing loses no
+       occurrence — the property our hash construction was protecting was
+       already carried one segment down.
+    2. **Hashing is a one-way loss.** An operator reading a hashed coordinate
+       cannot answer "what did the attacker send?" — in the one marker whose
+       whole purpose is to observe a hostile failure. The body must recover it
+       (see :func:`_bind_chain_error_marker`).
+    3. **Hashing re-opened the hole the injection fix closed.** Each distinct
+       hostile value hashes to a distinct node, so an attacker mints unbounded
+       path nodes — the tree-pollution vector, one layer up, bounded only by GC.
+       A sentinel bounds it to ONE quarantine node per coordinate. See
+       ``test_sanitize_does_not_let_an_attacker_mint_nodes``.
+
+    ``sentinel`` is per-coordinate (``unspecified_chain_id`` /
+    ``unspecified_step_index`` / §3.10.5's landed ``unspecified_error``) so a
+    quarantined marker still says WHICH coordinate was hostile without putting
+    the hostile value on the path. Callers MUST preserve the original in the
+    entity *body* — where an untrusted value is safe to carry — and MUST
+    sanitize before building that body so a marker's recorded coordinate
+    matches where it is bound.
+
+    Safe values pass through **byte-identical**, so this changes no conformant
+    coordinate and cannot de-converge a peer.
+
+    Mirrors ``store.SanitizePathSegment`` in entity-core-go, whose sentinel
+    spellings we adopt for convergence (read as interop context; not copied).
+    """
+    if is_safe_path_segment(segment):
+        return segment  # type: ignore[return-value]
+    return sentinel
+
+
 def invariant_signature_path(signer_peer_id: str, target_hash: bytes) -> str:
     """The V7 §3.5 invariant pointer path for a signature.
 

@@ -34,6 +34,13 @@ class Bounds:
         cascade_depth: Current cascade depth in the emit pathway. Propagated
             across peer boundaries via subscription notification bounds.
             See SYSTEM-COMPOSITION.md §3.4.
+        chain_depth: Continuation causal-chain length (§3.9). Like cascade_depth
+            it rides in bounds on the wire and is inherited across the peer
+            boundary — the value tested at the ceiling is the *global* chain
+            length, not a per-peer counter. Non-negative integer; incremented
+            only at a causal advancement dispatch (EXTENSION-CONTINUATION §5 /
+            PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION). TTL/budget refill does
+            NOT reset it (§6.2). Absent = a fresh external trigger roots at 0.
     """
 
     TYPE_NAME = "system/bounds"
@@ -44,6 +51,7 @@ class Bounds:
     parent_chain_id: str | None = None
     visited: list[TreePath] | None = None
     cascade_depth: int | None = None
+    chain_depth: int | None = None
 
     def apply_defaults(self) -> Bounds:
         """Apply peer defaults for missing bounds fields.
@@ -85,6 +93,7 @@ class Bounds:
             parent_chain_id=self.parent_chain_id,
             visited=list(self.visited) if self.visited else None,
             cascade_depth=self.cascade_depth,
+            chain_depth=self.chain_depth,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +114,8 @@ class Bounds:
             result["visited"] = self.visited
         if self.cascade_depth is not None:
             result["cascade_depth"] = self.cascade_depth
+        if self.chain_depth is not None:
+            result["chain_depth"] = self.chain_depth
         return result
 
     @classmethod
@@ -126,4 +137,5 @@ class Bounds:
             parent_chain_id=d.get("parent_chain_id"),
             visited=d.get("visited"),
             cascade_depth=d.get("cascade_depth"),
+            chain_depth=d.get("chain_depth"),
         )

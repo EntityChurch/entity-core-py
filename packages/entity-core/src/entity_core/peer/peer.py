@@ -260,6 +260,27 @@ class PeerConnectionState:
 REENTRY_REQUEST_TIMEOUT_SECONDS: float = 60.0
 
 
+def _wire_bounds_for_dispatch(bounds: "Bounds | None") -> "Bounds | None":
+    """PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1 / §5 — which cross-peer
+    dispatches carry ``system/bounds`` on the wire.
+
+    Bounds ride the wire ONLY for a continuation advancement: the dispatch whose
+    bounds carry a ``chain_depth`` (stamped at the §5 increment site,
+    ``_step6_chain_context``). ``chain_depth`` presence is the O1 signal — not
+    the trigger type. A causal advancement inherited a depth here; a standing
+    continuation on a fresh trigger rooted at 0 and stamped depth 1; both carry
+    their bounds so the receiver inherits the *global* count.
+
+    Ordinary remote dispatch has no ``chain_depth`` → returns ``None`` → the
+    wire EXECUTE is byte-identical to before (bounds dropped). This is Go's
+    ``TestOrdinaryRemoteDispatchAddsNoBounds`` convergence anchor: no bounds are
+    invented for a dispatch that was never part of a bounded chain.
+    """
+    if bounds is not None and bounds.chain_depth is not None:
+        return bounds
+    return None
+
+
 @dataclass
 class ReentryChannel:
     """V7 §6.11(b) / GUIDE-CONFORMANCE §7a.2a — outbound-over-inbound seam.
@@ -294,6 +315,7 @@ class ReentryChannel:
         capability: dict[str, Any] | None,
         capability_chain: list[dict[str, Any]] | None = None,
         resource_targets: list[str] | None = None,
+        bounds: "Bounds | None" = None,
         included: list[dict[str, Any]] | None = None,
     ) -> ExecuteResponse:
         """Send one authenticated EXECUTE over the inbound wire; await reply.
@@ -318,7 +340,9 @@ class ReentryChannel:
             ResourceTarget.from_dict({"targets": resource_targets})
             if resource_targets else None
         )
-        execute = Execute.create(uri, operation, params, resource=resource_target)
+        execute = Execute.create(
+            uri, operation, params, resource=resource_target, bounds=bounds,
+        )
         auth_request = create_authenticated_request(
             self.keypair,
             execute,
@@ -1423,6 +1447,7 @@ class Peer:
         *,
         dispatch_capability_entity: dict[str, Any] | None = None,
         dispatch_capability_chain: list[dict[str, Any]] | None = None,
+        bounds: "Bounds | None" = None,
         included: dict[bytes, dict[str, Any]] | None = None,
         reentry: "ReentryChannel | None" = None,
     ) -> ExecuteResult:
@@ -1462,6 +1487,12 @@ class Peer:
         if resource_targets:
             resource = {"targets": resource_targets}
 
+        # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1 / §5 gate — see
+        # _wire_bounds_for_dispatch: system/bounds ride the wire ONLY for a
+        # continuation advancement (chain_depth present). Ordinary remote
+        # dispatch stays byte-identical (bounds dropped).
+        wire_bounds = _wire_bounds_for_dispatch(bounds)
+
         # Resolve a dialable outbound connection. Pool first: a peer reachable
         # via a transport profile (incl. a genuinely bidirectional one that
         # also dialed us) keeps its pooled outbound path unchanged.
@@ -1485,6 +1516,7 @@ class Peer:
                         capability=dispatch_capability_entity,
                         capability_chain=dispatch_capability_chain,
                         resource_targets=resource_targets,
+                        bounds=wire_bounds,
                         included=list(included.values()) if included else None,
                     )
                 except Exception as re:
@@ -1513,6 +1545,7 @@ class Peer:
                 uri, operation, params, resource=resource,
                 capability_override=dispatch_capability_entity,
                 capability_chain_override=dispatch_capability_chain,
+                bounds=wire_bounds,
                 # V7 §3.3 v7.51: forward the request envelope's included to the
                 # wire — a dispatcher routing locally-originated entities to a
                 # remote peer MUST NOT drop them.
@@ -3728,6 +3761,13 @@ class Peer:
                 uri, operation, params, resource_targets,
                 dispatch_capability_entity=dispatch_capability_entity,
                 dispatch_capability_chain=dispatch_capability_chain,
+                # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1: a continuation
+                # advancement's cross-peer EXECUTE MUST carry system/bounds so
+                # chain_depth is inherited (and the global count is tested, not a
+                # per-peer one). Gated on chain_depth presence in _remote_execute
+                # so ordinary remote dispatch stays byte-identical (no bounds
+                # invented — Go's TestOrdinaryRemoteDispatchAddsNoBounds).
+                bounds=bounds,
                 # V7 §3.3 v7.51: forward the request envelope's included to the
                 # remote peer — MUST NOT drop it before the wire.
                 included=included,

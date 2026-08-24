@@ -42,6 +42,7 @@ from entity_core.protocol.messages import (
     ExecuteResponse,
     ResourceTarget,
 )
+from entity_core.protocol.bounds import Bounds
 from entity_core.protocol.auth import create_authenticated_request
 from entity_core.utils.ecf import (
     ALG_ECFV1_SHA256,
@@ -439,6 +440,7 @@ class HttpConnection:
         deliver_token_chain: list[dict[str, Any]] | None = None,
         capability_override: dict[str, Any] | None = None,
         capability_chain_override: list[dict[str, Any]] | None = None,
+        bounds: "Bounds | None" = None,
         included: list[dict[str, Any]] | None = None,
     ) -> ExecuteResponse:
         """POST an authenticated EXECUTE and return the EXECUTE-RESPONSE.
@@ -481,6 +483,9 @@ class HttpConnection:
             resource=resource_target,
             deliver_to=deliver_to_spec,
             deliver_token=deliver_token_hash,
+            # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1: carry
+            # system/bounds for a continuation advancement (None otherwise).
+            bounds=bounds,
         )
         auth_request = create_authenticated_request(
             self.keypair, execute, wire_capability, wire_capability_chain,

@@ -82,9 +82,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import hashlib
+import secrets
 import time
 from typing import Any
 
+from entity_core.protocol.bounds import Bounds
 from entity_core.capability.delegation import (
     ChainCollectStatus,
     check_creator_authority,
@@ -95,7 +98,7 @@ from entity_core.protocol.entity import Entity
 from entity_core.protocol.delivery import DeliverySpec
 from entity_core.storage.emit import EmitContext
 from entity_core.utils.ecf import Hash, is_hash_ref
-from entity_core.utils.path import invariant_signature_path
+from entity_core.utils.path import invariant_signature_path, sanitize_path_segment
 from entity_handlers.manifest import error_response as _error_response
 
 logger = logging.getLogger(__name__)
@@ -105,6 +108,32 @@ logger = logging.getLogger(__name__)
 # rules: UTF-8; no null bytes; no empty; no embedded `/`. Conservative
 # subset (matches cross-impl convergence on `[a-zA-Z0-9_.-]+`).
 _PATH_SAFE_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
+
+
+def _synthesized_step_key(kind: str, continuation_path: str) -> str:
+    """The §3.4 / F1 synthesized ``{step_index}`` for a step carrying no request id.
+
+    Arch ruling 14: **single-segment synthesized key, natural key in the body.**
+    Our LOCAL notification delivery is an internal dispatch with no wire
+    ``request_id``, so the marker sites fall back to a synthesized key. The F1
+    pin sanctioned the *shape* ``cont-{kind}-{continuation_path}`` — but did so
+    BEFORE §3.11 ruled the coordinate single-segment, and a continuation path is
+    a tree path, so the sanctioned shape interpolated 3+ segments into a
+    one-segment slot and forked the marker tree. Hashing the path fixes that:
+
+        cont-error-system/inbox/v19-a1  ->  cont-error-<sha256(path)[:16]>
+
+    The natural key survives in the marker body as ``continuation_path``
+    (see :func:`_bind_lost_marker`), so this loses nothing — it is an index.
+
+    This hash is NOT the ruling-13 case and does not re-open node-minting: the
+    input is a path the LOCAL peer authored and a writer needs a capability to
+    install a continuation, so the node count is bounded by authorization, not
+    by an attacker's imagination. Ruling 13 forbids hashing precisely where the
+    input is unbounded, remote, and unauthorized — the opposite of this.
+    """
+    digest = hashlib.sha256(continuation_path.encode("utf-8")).hexdigest()[:16]
+    return f"cont-{kind}-{digest}"
 
 
 def _sanitize_reason(code: str | None) -> str:
@@ -117,7 +146,7 @@ def _sanitize_reason(code: str | None) -> str:
     """
     if code and _PATH_SAFE_RE.match(code):
         return code
-    return "unspecified_error"
+    return REASON_UNSPECIFIED
 
 
 def _extract_response_code(result_payload: Any) -> str | None:
@@ -147,6 +176,20 @@ def _extract_response_code(result_payload: Any) -> str | None:
 # handler codes belong to each handler's own appendix.
 LOST_ERROR_MARKER_TYPE = "system/runtime/chain-error-lost"
 
+# Quarantine sentinels for a coordinate that fails path-safety (arch ruling 13
+# as amended, ROUTING-2026-07-17 §1/§3: collapse to a fixed sentinel, never a
+# hash; the original is recovered from the marker body, never the path).
+#
+# One sentinel PER COORDINATE, not one shared, so a quarantined marker still
+# says which coordinate was hostile without the hostile value on the path.
+# `unspecified_error` is landed spec (§3.10.5) and was never ours to choose;
+# the other two follow its pattern and are entity-core-go's reported spelling
+# (ROUTING-2026-07-17-go-round2-response.md §2) — adopted for convergence
+# rather than independently invented, and pending arch pinning.
+REASON_UNSPECIFIED = "unspecified_error"
+CHAIN_ID_UNSPECIFIED = "unspecified_chain_id"
+STEP_INDEX_UNSPECIFIED = "unspecified_step_index"
+
 # Appendix A engine codes (canonical home; v1.19 / v1.20).
 ENGINE_CODE_ON_ERROR_DISPATCH_FAILED = "on_error_dispatch_failed"
 ENGINE_CODE_MERGE_VALUE_NOT_MAP = "merge_value_not_map"
@@ -163,6 +206,14 @@ TRANSPORT_CODE_PROTOCOL_ERROR = "protocol_error"      # 502 (also §3.10.5 missi
 CODE_CAPABILITY_DENIED = "capability_denied"
 
 CONTINUATION_HANDLER_PATTERN = "system/continuation"
+
+# PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4 / EXTENSION-CONTINUATION §3.9:
+# the causal-chain ceiling. Peer-local and implementation-defined (§8.4 O3 — no
+# pinned interop floor: the tested value is *global* by inheritance, so peers
+# with different maxima still terminate, the lower one governs). 64 mirrors
+# entity-core-go's DefaultMaxChainDepth for cohort parity.
+DEFAULT_MAX_CHAIN_DEPTH = 64
+CHAIN_DEPTH_EXCEEDED_REASON = "chain_depth_exceeded"
 
 # Type names
 CONTINUATION_TYPE = "system/continuation"
@@ -479,6 +530,132 @@ async def _handle_advance(
         )
 
 
+def _step6_chain_context(ctx: HandlerContext) -> HandlerContext:
+    """§3.6 step 6: seed the dispatch's ``chain_id`` and ``chain_depth``.
+
+    ``chain_id: context.chain_id or generate_id()`` — a continuation whose
+    trigger carried no chain (a timer advance, an inbox delivery that is not
+    itself a chain dispatch) MUST still dispatch under *some* chain id. Without
+    this the dispatch goes out with ``chain_id`` absent and every downstream
+    marker binder falls down its own fallback ladder onto a meaningless key
+    (here: ``"unknown"``) — the cross-impl marker-coordinate divergence, whose
+    root cause is this step, not the fallbacks. The sentinels stay: they are
+    the correct behavior for the genuinely-absent case, they just stop firing.
+
+    ``chain_depth: (context.chain_depth or 0) + 1`` — the causal-chain length
+    (PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4/§5), the continuation-axis
+    mirror of ``cascade_depth``. This is the **sole incrementing site**. The
+    O1 signal the cohort converges on is inherited-bounds *presence*, NOT the
+    trigger type:
+
+    - **Causal advancement** — the triggering advancement's ``bounds.chain_depth``
+      is present in ``ctx.bounds`` (seeded at ingress from the wire, or carried
+      same-peer through the synchronous dispatch), so this dispatch inherits and
+      ``+1``s it. A synchronous self-redispatch accumulates and eventually trips
+      the ceiling brake (``_advance_forward``).
+    - **Standing continuation on a fresh external trigger** — a timer tick, a
+      ``system/peer/status`` write, or an inbox delivery (async, fresh bounds)
+      arrives with **no** ``chain_depth``, so ``(None or 0) + 1`` roots this
+      firing at 1 and it never accumulates across firings. NETWORK retry-forever
+      stays unbounded on the depth axis while ``chain_id`` stays stable for
+      correlation — depth and identity are independent axes.
+
+    TTL/budget refill (step 6 proper — deferred, rung 4) does NOT reset
+    ``chain_depth`` (§6.2); the two live on different axes.
+
+    Generated ids are a single path segment (§3.11) — ``chain_id`` is a segment
+    of the §3.10.6 marker path, so a multi-segment value forks the marker tree.
+
+    Seeds the advance's own context in place: the dispatch and every marker
+    bound around it MUST key on one chain, and ``ctx`` is built per-dispatch by
+    the caller for exactly this operation. ``bounds`` is copied before seeding
+    so the caller's Bounds object (potentially the inbound request's) is not
+    touched. Both carriers are seeded — ``chain_id`` feeds the child's context,
+    ``bounds.chain_id``/``bounds.chain_depth`` feed the emit pathway's cascade
+    tracking, the §3.10.3 rejected-marker gate, and the cross-peer wire
+    (Delta 1) — because they are read from different sources downstream and
+    MUST agree.
+    """
+    chain_id = ctx.chain_id or f"chain-{secrets.token_hex(8)}"
+    ctx.chain_id = chain_id
+
+    # §5 increment: read the inherited depth BEFORE mutating. Absence roots at
+    # 0 (a fresh external trigger); presence means a causal advancement.
+    inherited_depth = (
+        ctx.bounds.chain_depth
+        if ctx.bounds is not None and ctx.bounds.chain_depth is not None
+        else 0
+    )
+    # Copy before stamping so the caller's Bounds (often the inbound request's)
+    # is untouched — both carriers ride on the copy.
+    new_bounds = ctx.bounds.copy() if ctx.bounds is not None else Bounds()
+    new_bounds.chain_id = chain_id
+    new_bounds.chain_depth = inherited_depth + 1
+    ctx.bounds = new_bounds
+    return ctx
+
+
+def _chain_depth_exceeded(ctx: HandlerContext) -> bool:
+    """§4 brake: has this advancement's (already-seeded) chain_depth passed the
+    ceiling? Read the post-``_step6_chain_context`` value on ``ctx.bounds``.
+
+    The tested value is the *global* chain length — it was inherited across the
+    wire (Delta 1), not reset per peer — so a cross-peer causal ping-pong
+    terminates at the same global count a single-peer runaway does.
+    """
+    depth = (
+        ctx.bounds.chain_depth
+        if ctx.bounds is not None and ctx.bounds.chain_depth is not None
+        else 0
+    )
+    return depth > DEFAULT_MAX_CHAIN_DEPTH
+
+
+def _suspend_chain_depth_exceeded(
+    cont_data: dict[str, Any],
+    continuation_path: str,
+    ctx: HandlerContext,
+) -> dict[str, Any]:
+    """§3.9 / §4: the causal chain hit the ceiling — suspend instead of dispatch.
+
+    Persists a ``system/continuation/suspended`` entity (operator-resumable via
+    the resume op, which roots ``chain_depth`` at 0 per §7 so it does not
+    immediately re-suspend) and returns a terminal 429. Go returns
+    ``429 bounds_exceeded`` at this seam; the ``reason``/``code`` string is
+    ``chain_depth_exceeded`` per the proposal §8 anchor. This is what makes the
+    self-referential runaway *terminate* rather than recurse to stack overflow.
+    """
+    chain_id = ctx.chain_id or CHAIN_ID_UNSPECIFIED
+    suspended_path = f"system/continuation/suspended/{chain_id}"
+    full_uri = ctx.emit_pathway.entity_tree.normalize_uri(suspended_path)
+    suspended = Entity(
+        type=CONTINUATION_SUSPENDED_TYPE,
+        data={
+            "target": cont_data.get("target"),
+            "operation": cont_data.get("operation"),
+            "resource": cont_data.get("resource"),
+            "params": cont_data.get("params") or {},
+            "reason": CHAIN_DEPTH_EXCEEDED_REASON,
+            "chain_id": chain_id,
+            "suspended_at": int(time.time() * 1000),
+        },
+    )
+    emit_ctx = EmitContext.from_handler_grant(ctx, "advance")
+    ctx.emit_pathway.emit(full_uri, suspended, emit_ctx)
+    logger.info(
+        "continuation chain_depth exceeded ceiling %d (chain_id=%s) — suspended "
+        "at %s", DEFAULT_MAX_CHAIN_DEPTH, chain_id, suspended_path,
+    )
+    return _error_response(
+        429,
+        CHAIN_DEPTH_EXCEEDED_REASON,
+        f"continuation chain_depth exceeded ceiling {DEFAULT_MAX_CHAIN_DEPTH}",
+        reason=CHAIN_DEPTH_EXCEEDED_REASON,
+        chain_id=chain_id,
+        suspended_path=suspended_path,
+    )
+
+
 async def _advance_forward(
     cont_data: dict[str, Any],
     result: Any,
@@ -506,6 +683,17 @@ async def _advance_forward(
     Returns:
         Response dict with status and result.
     """
+    # §3.6 step 6: seed the chain before anything reads it — the dispatch and
+    # every marker bound around it MUST key on the same chain id, and the §5
+    # increment stamps this advancement's chain_depth.
+    ctx = _step6_chain_context(ctx)
+
+    # §4 brake: a causal chain that has climbed past the ceiling suspends here
+    # instead of dispatching — the sole thing that makes a self-referential /
+    # cross-peer runaway terminate rather than recurse without bound.
+    if _chain_depth_exceeded(ctx):
+        return _suspend_chain_depth_exceeded(cont_data, continuation_path, ctx)
+
     effective_status = status or 200
     target = cont_data.get("target")
     operation = cont_data.get("operation")
@@ -528,7 +716,7 @@ async def _advance_forward(
         on_error = DeliverySpec.from_dict(on_error_data)
         try:
             await ctx.deliver_async(
-                f"cont-error-{continuation_path}",
+                _synthesized_step_key("error", continuation_path),
                 effective_status,
                 result,
                 on_error,
@@ -553,7 +741,7 @@ async def _advance_forward(
             request_id_for_marker = (
                 ctx.request_id
                 if getattr(ctx, "request_id", None)
-                else f"cont-error-{continuation_path}"
+                else _synthesized_step_key("error", continuation_path)
             )
             _bind_lost_marker(
                 ctx,
@@ -606,7 +794,7 @@ async def _advance_forward(
             request_id_for_marker = (
                 ctx.request_id
                 if getattr(ctx, "request_id", None)
-                else f"cont-merge-{continuation_path}"
+                else _synthesized_step_key("merge", continuation_path)
             )
             # §3.10.2 + Appendix A: assembly-phase observation; the
             # `value_type` impl-specific extra carries the spec's
@@ -723,7 +911,7 @@ async def _advance_forward(
             on_error = DeliverySpec.from_dict(on_error_data)
             try:
                 await ctx.deliver_async(
-                    f"cont-error-{continuation_path}",
+                    _synthesized_step_key("error", continuation_path),
                     transport_status,
                     {"error": str(e), "continuation_path": continuation_path,
                      "code": transport_code},
@@ -735,7 +923,7 @@ async def _advance_forward(
                 request_id_for_marker = (
                     ctx.request_id
                     if getattr(ctx, "request_id", None)
-                    else f"cont-error-{continuation_path}"
+                    else _synthesized_step_key("error", continuation_path)
                 )
                 _bind_lost_marker(
                     ctx,
@@ -757,7 +945,7 @@ async def _advance_forward(
             request_id_for_marker = (
                 ctx.request_id
                 if getattr(ctx, "request_id", None)
-                else f"cont-forward-{continuation_path}"
+                else _synthesized_step_key("forward", continuation_path)
             )
             _bind_lost_marker(
                 ctx,
@@ -794,7 +982,7 @@ async def _advance_forward(
         deliver_to = DeliverySpec.from_dict(deliver_to_data)
         try:
             await ctx.deliver_async(
-                f"cont-chain-{continuation_path}",
+                _synthesized_step_key("chain", continuation_path),
                 dispatch_result.status,
                 dispatch_result.result,
                 deliver_to,
@@ -835,7 +1023,7 @@ async def _advance_forward(
         request_id_for_marker = (
             ctx.request_id
             if getattr(ctx, "request_id", None)
-            else f"cont-forward-{continuation_path}"
+            else _synthesized_step_key("forward", continuation_path)
         )
         _bind_lost_marker(
             ctx,
@@ -887,6 +1075,10 @@ async def _advance_join(
     Returns:
         Response dict with status and result.
     """
+    # §3.6 step 6 — same seeding as the forward path; the join's terminal
+    # dispatch is a chain dispatch too.
+    ctx = _step6_chain_context(ctx)
+
     target = cont_data.get("target")
     operation = cont_data.get("operation")
     expected = cont_data.get("expected", [])
@@ -925,6 +1117,13 @@ async def _advance_join(
     if set(received.keys()) == set(expected):
         # All slots filled - dispatch to target
         logger.debug(f"Join continuation complete: {continuation_path}")
+
+        # §4 brake: the join's terminal dispatch is a chain hop too — suspend if
+        # the causal chain has climbed past the ceiling. Guarded here (at the
+        # terminal dispatch), NOT at accumulation: filling a slot is a fresh
+        # delivery, not a causal advancement.
+        if _chain_depth_exceeded(ctx):
+            return _suspend_chain_depth_exceeded(cont_data, continuation_path, ctx)
 
         # W9: Resolve dispatch_capability — required for dispatching continuations
         dispatch_cap_hash = cont_data.get("dispatch_capability")
@@ -986,7 +1185,7 @@ async def _advance_join(
                 on_error = DeliverySpec.from_dict(on_error_data)
                 try:
                     await ctx.deliver_async(
-                        f"cont-error-{continuation_path}",
+                        _synthesized_step_key("error", continuation_path),
                         transport_status,
                         {"error": str(e), "continuation_path": continuation_path,
                          "code": transport_code},
@@ -998,7 +1197,7 @@ async def _advance_join(
                         ctx,
                         code=ENGINE_CODE_ON_ERROR_DISPATCH_FAILED,
                         status=500,
-                        request_id=f"cont-error-{continuation_path}",
+                        request_id=_synthesized_step_key("error", continuation_path),
                         continuation_path=continuation_path,
                         on_error_uri=getattr(on_error, "uri", None),
                         target_uri=target,
@@ -1009,7 +1208,7 @@ async def _advance_join(
                 request_id_for_marker = (
                     ctx.request_id
                     if getattr(ctx, "request_id", None)
-                    else f"cont-join-{continuation_path}"
+                    else _synthesized_step_key("join", continuation_path)
                 )
                 _bind_lost_marker(
                     ctx,
@@ -1040,7 +1239,7 @@ async def _advance_join(
             deliver_to = DeliverySpec.from_dict(deliver_to_data)
             try:
                 await ctx.deliver_async(
-                    f"cont-chain-{continuation_path}",
+                    _synthesized_step_key("chain", continuation_path),
                     dispatch_result.status,
                     dispatch_result.result,
                     deliver_to,
@@ -1495,18 +1694,29 @@ def _bind_chain_error_marker(
     """
     if timestamp_ms is None:
         timestamp_ms = int(time.time() * 1000)
-    chain_id = getattr(ctx, "chain_id", None) or "unknown"
+    # Neither coordinate is necessarily locally-minted: the subscription engine
+    # reaches this binder with a chain_id taken straight from wire-supplied
+    # notification bounds, and `code` is a remote handler's own error code.
+    # Sanitized before the body is built so the recorded coordinate matches
+    # where the marker is actually bound.
+    raw_chain_id = getattr(ctx, "chain_id", None) or "unknown"
+    chain_id = sanitize_path_segment(raw_chain_id, CHAIN_ID_UNSPECIFIED)
+    step_index_value = sanitize_path_segment(request_id, STEP_INDEX_UNSPECIFIED)
     sanitized_reason = _sanitize_reason(code)
     marker_path = "<unknown>"
     try:
         marker_data: dict[str, Any] = {
-            # §3.10.6 reserved across both kinds (denormalized for in-body
-            # inspection without path parsing).
+            # §3.10.6 reserved across both kinds. THE BODY IS THE RECORD; THE
+            # PATH IS AN INDEX (ROUTING-2026-07-17 §2): each field holds the
+            # ORIGINAL value, and the path holds the sanitized form. This is
+            # §3.10.5's landed shape generalized — path {reason} =
+            # `unspecified_error` while body `code` = the raw code — and it is
+            # what makes a quarantined coordinate forensically recoverable.
             "reason": sanitized_reason,
             "code": code,  # raw code; equals reason when path-safe
             "status": status,
             "timestamp": timestamp_ms,
-            "chain_id": chain_id,
+            "chain_id": raw_chain_id,
             "step_index": request_id,
         }
         if extra_body:
@@ -1514,7 +1724,7 @@ def _bind_chain_error_marker(
         marker = Entity(type=LOST_ERROR_MARKER_TYPE, data=marker_data)
         marker_hash = marker.compute_hash()
         marker_path = (
-            f"system/runtime/chain-errors/{kind}/{chain_id}/{request_id}/"
+            f"system/runtime/chain-errors/{kind}/{chain_id}/{step_index_value}/"
             f"{sanitized_reason}/{marker_hash.hex()}"
         )
         uri = ctx.emit_pathway.entity_tree.normalize_uri(marker_path)
@@ -1576,16 +1786,27 @@ def bind_dispatcher_rejected_marker(
 
     if timestamp_ms is None:
         timestamp_ms = int(time.time() * 1000)
-    chain_id_value = chain_id or "unknown"
+    # Both coordinates are WIRE-SUPPLIED here and this bind happens BECAUSE the
+    # sender's cap check failed — an unauthorized caller reaches this site by
+    # construction, so neither value may be trusted as a path component.
+    # Sanitized before the body is built so the recorded coordinate matches
+    # where the marker is actually bound.
+    raw_chain_id = chain_id or "unknown"
+    chain_id_value = sanitize_path_segment(raw_chain_id, CHAIN_ID_UNSPECIFIED)
+    step_index_value = sanitize_path_segment(request_id, STEP_INDEX_UNSPECIFIED)
     sanitized_reason = _sanitize_reason(code)
     marker_path = "<unknown>"
     try:
         marker_data: dict[str, Any] = {
+            # Body = originals, path = sanitized (ROUTING-2026-07-17 §2). This
+            # is the marker whose whole purpose is to observe a hostile
+            # failure, so these two fields ARE the forensic record: they are
+            # the only surviving evidence of what the sender actually sent.
             "reason": sanitized_reason,
             "code": code,
             "status": status,
             "timestamp": timestamp_ms,
-            "chain_id": chain_id_value,
+            "chain_id": raw_chain_id,
             "step_index": request_id,
         }
         # §3.10.6 rejected-kind reserved fields.
@@ -1599,7 +1820,7 @@ def bind_dispatcher_rejected_marker(
         marker_hash = marker.compute_hash()
         marker_path = (
             f"system/runtime/chain-errors/rejected/{chain_id_value}/"
-            f"{request_id}/{sanitized_reason}/{marker_hash.hex()}"
+            f"{step_index_value}/{sanitized_reason}/{marker_hash.hex()}"
         )
         uri = emit_pathway.entity_tree.normalize_uri(marker_path)
         # Dispatcher-level binding authority — protocol context, NOT
@@ -1737,6 +1958,14 @@ async def _handle_resume(
     # Delete suspended entity first
     emit_ctx = EmitContext.from_handler_grant(ctx, "resume")
     ctx.emit_pathway.delete(full_uri, emit_ctx)
+
+    # §7: resume roots chain_depth at 0. Resume is an operator-authorized fresh
+    # dispatch (often *caused by* a chain_depth_exceeded suspension); if it
+    # inherited the suspending chain's depth it would immediately re-suspend.
+    # Fresh operator intent = fresh root, same as a fresh external trigger.
+    if ctx.bounds is not None and ctx.bounds.chain_depth is not None:
+        ctx.bounds = ctx.bounds.copy()
+        ctx.bounds.chain_depth = None
 
     # Re-dispatch the original request
     try:
