@@ -24,6 +24,7 @@ from typing import Any
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
 from entity_core.protocol.framing import HashValidationError, validate_entity_hash
+from entity_core.storage.content_store import ContentStore
 from entity_core.storage.emit import EmitContext
 from entity_core.storage.entity_tree import EntityTree
 from entity_core.types.deletion_marker import is_deletion_marker

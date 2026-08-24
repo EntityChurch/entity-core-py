@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from entity_core.capability.checking import matches_pattern
+from entity_core.protocol.entity import Entity
 from entity_core.capability.token import (
     CapabilityScope,
     MultiGranter,

@@ -2121,9 +2121,30 @@ async def _handle_checkout(
     # Keep the prefix-scoping check explicit (avoid stray var warnings).
     _ = full_prefix
 
+    # §4.5 `checkout-result` is {status, target_version, head, branch?} — two
+    # fields, because under auto-version ON they differ: applying the bindings
+    # mints versions, so the post-op head is a NEW descendant of the requested
+    # target with a matching root (§4.4.12 "Result structure"). Re-read the head
+    # rather than reporting the target twice; the pre-apply write above is only
+    # the ordering half of the no-orphan invariant.
+    #
+    # This carried a single `version` field until 2026-08-17 — the shape
+    # `entity-core-go` still emits, and one `entity-core-rust` keeps only as a
+    # documented compat alias beside the spec pair. Nothing caught it: go's
+    # `validate-peer` checkout probe reads `Status` and stops, and no local test
+    # asserted the result shape at all. Found by building the SDK wrapper
+    # against §4.5.
+    final_head_entity = _get_entity_at_path(ctx, _head_path(ph))
+    final_head = (
+        final_head_entity.data.get("hash")
+        if final_head_entity and final_head_entity.type == "system/hash"
+        else version_hash
+    )
+
     checkout_data: dict[str, Any] = {
         "status": "checked_out",
-        "version": version_hash,
+        "target_version": version_hash,
+        "head": final_head,
         "branch": active_branch,
     }
     if checkout_warnings:

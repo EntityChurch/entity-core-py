@@ -9,12 +9,18 @@ members = ["packages/*"]
 [tool.uv.sources]
 entity-core = { workspace = true }
 entity-handlers = { workspace = true }
+entity-sdk = { workspace = true }
 entity-cli = { workspace = true }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["packages/entity-core/src", "packages/entity-handlers/src", "packages/entity-cli/src"]
+pythonpath = [
+    "packages/entity-core/src",
+    "packages/entity-handlers/src",
+    "packages/entity-sdk/src",
+    "packages/entity-cli/src",
+]
 markers = [
     "slow: marks tests that run a memory-hard Argon2id derivation (encryption self-mode KATs)",
 ]
@@ -30,8 +36,13 @@ ignore = ["E501"]  # Line length handled by formatter
 [tool.mypy]
 python_version = "3.11"
 strict = true
-mypy_path = ["packages/entity-core/src", "packages/entity-handlers/src", "packages/entity-cli/src"]
-packages = ["entity_core", "entity_handlers", "entity_cli"]
+mypy_path = [
+    "packages/entity-core/src",
+    "packages/entity-handlers/src",
+    "packages/entity-sdk/src",
+    "packages/entity-cli/src",
+]
+packages = ["entity_core", "entity_handlers", "entity_sdk", "entity_cli"]
 
 [dependency-groups]
 dev = [
@@ -42,5 +53,6 @@ dev = [
     "jsonschema>=4.26.0",
     "entity-core",
     "entity-handlers",
+    "entity-sdk",
     "entity-cli",
 ]

@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "entity-core>=0.8.0",
     "entity-handlers>=0.8.0",
+    "entity-sdk>=0.8.0",
 ]
 
 [project.scripts]

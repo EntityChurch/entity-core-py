@@ -8,6 +8,7 @@ members = [
     "entity-core",
     "entity-core-workspace",
     "entity-handlers",
+    "entity-sdk",
 ]
 
 [[package]]
@@ -202,12 +203,14 @@ source = { editable = "packages/entity-cli" }
 dependencies = [
     { name = "entity-core" },
     { name = "entity-handlers" },
+    { name = "entity-sdk" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "entity-core", editable = "packages/entity-core" },
     { name = "entity-handlers", editable = "packages/entity-handlers" },
+    { name = "entity-sdk", editable = "packages/entity-sdk" },
 ]
 
 [[package]]
@@ -241,6 +244,7 @@ dev = [
     { name = "entity-cli" },
     { name = "entity-core" },
     { name = "entity-handlers" },
+    { name = "entity-sdk" },
     { name = "jsonschema" },
     { name = "mypy" },
     { name = "pytest" },
@@ -255,6 +259,7 @@ dev = [
     { name = "entity-cli", editable = "packages/entity-cli" },
     { name = "entity-core", editable = "packages/entity-core" },
     { name = "entity-handlers", editable = "packages/entity-handlers" },
+    { name = "entity-sdk", editable = "packages/entity-sdk" },
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "mypy", specifier = ">=1.0.0" },
     { name = "pytest", specifier = ">=7.0.0" },
@@ -278,6 +283,17 @@ requires-dist = [
     { name = "google-re2", specifier = ">=1.1.20251105" },
     { name = "zeroconf", specifier = ">=0.131.0" },
 ]
+
+[[package]]
+name = "entity-sdk"
+version = "0.8.0"
+source = { editable = "packages/entity-sdk" }
+dependencies = [
+    { name = "entity-core" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "entity-core", editable = "packages/entity-core" }]
 
 [[package]]
 name = "google-re2"

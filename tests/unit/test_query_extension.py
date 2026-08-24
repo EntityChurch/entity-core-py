@@ -12,6 +12,7 @@ Tests cover:
 
 import pytest
 
+from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
 from entity_core.storage.content_store import ContentStore
 from entity_core.storage.emit import (

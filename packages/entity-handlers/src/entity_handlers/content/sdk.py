@@ -79,7 +79,8 @@ class _PeerAimedDispatcher:
 
     Backs :func:`at_peer`. Reuses :class:`HandlerContextDispatcher`'s routing
     discipline so cross-peer ``HandlerContext.execute`` continues to land in
-    the existing :meth:`Peer._execute_internal` → ``_remote_execute`` path.
+    the existing :meth:`Peer._dispatch_local_execute` →
+    :meth:`Peer._remote_execute` path.
     """
 
     inner: Dispatcher

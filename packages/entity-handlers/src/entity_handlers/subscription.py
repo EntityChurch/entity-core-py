@@ -1436,7 +1436,7 @@ class SubscriptionExtension(Extension):
 
     def _bind_sender_side_rejected_mirror(
         self,
-        sub: "Subscription",
+        sub: SubscriptionEntity,
         event: ChangeEvent,
         result: Any,
         notification_bounds: Any,

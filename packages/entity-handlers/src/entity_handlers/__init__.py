@@ -13,6 +13,8 @@ Extensions:
 - SubscriptionExtension: Manages subscription notifications
 """
 
+from typing import TYPE_CHECKING
+
 from entity_handlers.tree import tree_handler, TREE_HANDLER_PATTERN
 from entity_handlers.revision import revision_handler, REVISION_HANDLER_PATTERN
 from entity_handlers.clock import (
@@ -409,6 +411,12 @@ __all__ = [
     "register_standard_handlers",
     "register_standard_handlers_with_subscriptions",
 ]
+
+if TYPE_CHECKING:
+    # Tier-downward and annotation-only: entity-handlers may name the kernel's
+    # builder in a signature without importing it at runtime, which would make
+    # every `import entity_handlers` drag in entity_core.peer.
+    from entity_core.peer.builder import PeerBuilder
 
 
 def register_standard_handlers(builder: "PeerBuilder") -> "PeerBuilder":

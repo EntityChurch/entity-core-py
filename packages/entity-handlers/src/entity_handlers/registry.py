@@ -366,10 +366,53 @@ def _find_signature_for(ctx: HandlerContext, target_hash: bytes) -> Entity | Non
     return None
 
 
+def _bundled(ctx: HandlerContext, h: bytes) -> Entity | None:
+    """The entity at ``h`` from the request envelope's ``included`` map.
+
+    **V7 §3.3 (v7.51) request-side included-preservation.** A `register-request`
+    carries its layer-1 proof — the `system/peer` identity and the
+    `system/signature` — bundled in `included`. On the *wire* path those are
+    persisted on receipt (`_store_included_entities`, V7 §1.5) and so are
+    reachable from the content store. On an **in-process dispatch there is no
+    receive step**, and the bundle exists only as `ctx.included`. A lookup that
+    reads the content store alone therefore answers "no proof supplied" for a
+    perfectly well-formed request, and the caller sees `401 signature_invalid`
+    — an authentication verdict on a request nobody failed to sign.
+
+    That is why `ctx.included` is the map the other handlers already read
+    (`capability.py`, `relay.py`, `identity.py`'s SI-11 ingestion); registry was
+    the outlier, which is invisible while every caller is a CLI reaching a peer
+    over a connection.
+
+    **Strict entity fidelity (IMPLEMENTATION-SPEC §1.8): validate, then trust.**
+    The map is keyed by hash but the key is the *sender's* claim, so an entity
+    is returned only if it actually hashes to the key it was filed under.
+    Skipping that would let a bundle name one entity and deliver another.
+    """
+    raw = (ctx.included or {}).get(h)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        ent = Entity.from_dict(raw)
+    except Exception:
+        return None
+    if ent.compute_hash() != h:
+        return None
+    return ent
+
+
+def _entity_anywhere(ctx: HandlerContext, h: bytes) -> Entity | None:
+    """Content store first, then the request's ``included`` bundle."""
+    ent = ctx.emit_pathway.content_store.get(h)
+    if ent is not None:
+        return ent
+    return _bundled(ctx, h)
+
+
 def _resolve_pubkey(ctx: HandlerContext, signer_hash: bytes) -> tuple[bytes, str] | None:
     """Resolve a signer identity hash to ``(public_key, key_type)`` via the
-    ``system/peer`` entity in the content store."""
-    peer = ctx.emit_pathway.content_store.get(signer_hash)
+    ``system/peer`` entity — content store or the request bundle."""
+    peer = _entity_anywhere(ctx, signer_hash)
     if peer is None or peer.type != "system/peer":
         return None
     pub = peer.data.get("public_key")
@@ -385,7 +428,7 @@ def _signer_peer_id(ctx: HandlerContext, signer_hash: bytes | None) -> str | Non
     the pinned registry (``backend_id``)."""
     if signer_hash is None:
         return None
-    ent = ctx.emit_pathway.content_store.get(signer_hash)
+    ent = _entity_anywhere(ctx, signer_hash)
     if ent is None or ent.type != "system/peer":
         return None
     try:
@@ -999,12 +1042,20 @@ def _find_signature_anywhere(ctx: HandlerContext, target_hash: bytes) -> Entity 
     resolve-path lookup: invariant pointer + target-matching scan), then the
     content store. A live `register-request` carries its signature in the
     request envelope's ``included`` (stored on receipt per V7 §1.5), so it
-    lands in the content store, not the tree."""
+    lands in the content store, not the tree — **except on an in-process
+    dispatch, where there is no receive step and the bundle is only
+    ``ctx.included``.** See :func:`_bundled`."""
     sig = _find_signature_for(ctx, target_hash)
     if sig is not None:
         return sig
     for _h, ent in ctx.emit_pathway.content_store.iter_all():
         if ent.type != "system/signature":
+            continue
+        if _normalize_hash(ent.data.get("target")) == target_hash:
+            return ent
+    for h in (ctx.included or {}):
+        ent = _bundled(ctx, h)
+        if ent is None or ent.type != "system/signature":
             continue
         if _normalize_hash(ent.data.get("target")) == target_hash:
             return ent

@@ -93,8 +93,8 @@ class HandlerContextDispatcher:
     Routes through ``ctx.execute`` for default (handler-grant) dispatch, or
     ``ctx.execute_with_capability`` when ``request.capability`` is set. URIs
     that target a different peer (``entity://{remote_peer}/...``) are handled
-    by the underlying ``_remote_execute`` path inside
-    :meth:`Peer._execute_internal` — so this adapter naturally covers
+    by the underlying :meth:`Peer._remote_execute` path reached from
+    :meth:`Peer._dispatch_local_execute` — so this adapter naturally covers
     handler-internal local dispatch AND handler-driven cross-peer dispatch,
     no peer-aimed-rewrite required.
 

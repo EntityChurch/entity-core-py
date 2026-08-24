@@ -32,7 +32,9 @@ import pytest
 from entity_core.capability.delegation import (
     DelegationResult,
     _check_chain_format_code_freeze,
+    _link_content_hash,
 )
+from entity_core.protocol.entity import Entity
 from entity_core.capability.peer_canon import (
     PolicyEntryCanonState,
     canonicalize_cap_pattern_peer_refs,
@@ -402,3 +404,46 @@ def test_cap_freeze_1_chain_spanning_format_codes_refused() -> None:
         },
     ]
     assert _check_chain_format_code_freeze(same_format_chain) is None
+
+
+def test_cap_freeze_1_link_without_content_hash_recomputes_rather_than_abstaining() -> None:
+    """V7 v7.66 §5.3 — a link that omits ``content_hash`` gets its hash
+    recomputed (``Entity.compute_hash``, format 0x00); it is not malformed.
+
+    Regression: ``_link_content_hash``'s documented recompute branch named an
+    ``Entity`` the module never imported, so every such link raised
+    ``NameError`` straight into the function's own ``except Exception`` and
+    returned ``None``. The freeze check then *abstained* on exactly the links
+    whose format code it had to derive itself — a security check silently not
+    running, with no moment at which it looked wrong.
+
+    It survived because every other test in this file hands the checker an
+    explicit ``content_hash``, which takes the ``_normalize_hash`` branch
+    above the recompute. The uncovered branch was the one that ran in the
+    field.
+    """
+    bare_link = {"type": "system/capability/token", "data": {}}
+
+    h = _link_content_hash(bare_link)
+    assert h is not None, "recompute fallback must produce a hash, not abstain"
+    assert len(h) == 33
+    assert h[0] == 0x00, "recompute yields ECFv1-SHA256"
+    assert h == Entity(type="system/capability/token", data={}).compute_hash()
+
+    # And the freeze check must now *see* that link: paired with a 0x99 link
+    # this is a cross-format chain, which §5.3 refuses. Before the fix this
+    # returned None — the chain passed.
+    result = _check_chain_format_code_freeze([
+        bare_link,
+        {
+            "type": "system/capability/token",
+            "data": {},
+            "content_hash": bytes([0x99]) + b"\x02" * 32,
+        },
+    ])
+    assert result is not None
+    assert result.valid is False
+    assert result.error_code == "cap_chain_format_code_freeze"
+
+    # A genuinely malformed link still abstains rather than raising.
+    assert _link_content_hash({"no": "type-or-data"}) is None

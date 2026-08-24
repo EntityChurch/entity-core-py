@@ -9,6 +9,19 @@ Usage:
     entity-core put HOST:PORT/path --type TYPE --data JSON
     entity-core rm HOST:PORT/path
     entity-core exec HOST:PORT/path OPERATION [PARAMS]
+
+**This module is the presentation tier and holds no protocol knowledge.** It
+parses arguments, calls ``entity_sdk``, and formats what comes back. It
+constructs no envelopes, issues no raw ``execute``, and builds no
+``entity://`` URIs — a gate enforces all three
+(``tests/unit/test_package_layering.py::test_presentation_constructs_no_protocol``).
+
+That constraint is not tidiness. Every one of those things used to live here,
+inlined at seventeen call sites, which is precisely why this repo had no L1 SDK
+for as long as it did: the knowledge was real, and it was in the one package
+nothing is allowed to depend on. If a command cannot be written without
+reaching for the protocol, the missing piece is an ``entity-sdk`` affordance and
+the gate says so at the moment it is worked around.
 """
 
 from __future__ import annotations
@@ -35,6 +48,15 @@ from entity_core.crypto.identity_file import load_identity, list_identities
 from entity_core.peer.connection import Connection
 from entity_core.peer import PeerBuilder
 from entity_core.protocol.messages import ExecuteResponse
+from entity_sdk import (
+    EntityClient,
+    EntityError,
+    IssuerPolicy,
+    client_for_connection,
+    content_hash,
+    register,
+    set_issuer_policy,
+)
 # Canonical TYPE-SYSTEM §3-§10 core type paths. Single source of truth lives in
 # entity_core.types.canonical; re-imported here so the `compare-types` command
 # and interop type-parity tests (`from entity_cli.main import CORE_TYPE_PATHS`)
@@ -58,7 +80,10 @@ class TypeComparisonResult:
 
 
 async def fetch_remote_type(conn: Connection, type_path: str) -> dict | None:
-    """Fetch a type definition from remote peer via tree handler.
+    """Fetch a type definition from a remote peer.
+
+    Takes a ``Connection`` rather than a client because the interop type-parity
+    tests call it directly with one; it wraps it and delegates.
 
     Args:
         conn: Active connection to remote peer.
@@ -67,23 +92,12 @@ async def fetch_remote_type(conn: Connection, type_path: str) -> dict | None:
     Returns:
         Type data dict if found, None if not found or error.
     """
-    remote_peer_id = conn.session.remote_peer_id
-
-    # Use tree handler with typed params entity
-    response = await conn.execute(
-        uri=f"entity://{remote_peer_id}/system/tree",
-        operation="get",
-        params={
-            "type": "system/tree/get-request",
-            "data": {"path": f"system/types/{type_path}"},
-        },
-    )
-
-    if response.status == 200:
-        result = response.result
-        if isinstance(result, dict):
-            return result.get("data")
-    return None
+    client = client_for_connection(conn)
+    try:
+        entity = await client.get(f"system/types/{type_path}")
+    except EntityError:
+        return None
+    return entity.get("data") if isinstance(entity, dict) else None
 
 
 def compare_type_data(local_data: dict, remote_data: dict) -> list[str]:
@@ -148,6 +162,18 @@ def compare_type_data(local_data: dict, remote_data: dict) -> list[str]:
             f"constraints: local={local_constraints} remote={remote_constraints}"
         )
 
+    # Everything else. The five keys above are the TYPE-SYSTEM ones worth a
+    # tailored message; a key outside that set still changes the type's hash,
+    # so leaving it unexamined makes `compare-types` report MISMATCH with an
+    # empty reason list — the least useful output a divergence hunter can give.
+    # Unknown keys are exactly what a cross-impl probe is looking for.
+    known = {"name", "extends", "layout", "fields", "constraints"}
+    for key in sorted((local_data.keys() | remote_data.keys()) - known):
+        if local_data.get(key) != remote_data.get(key):
+            differences.append(
+                f"{key}: local={local_data.get(key)!r} remote={remote_data.get(key)!r}"
+            )
+
     return differences
 
 
@@ -166,8 +192,6 @@ async def compare_types_with_peer(
     Returns:
         List of TypeComparisonResult for each type.
     """
-    from entity_core.utils.ecf import compute_ecf_hash
-
     results = []
 
     for type_path in type_paths:
@@ -191,12 +215,10 @@ async def compare_types_with_peer(
         local_hash = local_entity.compute_hash()
         result.local_hash = local_hash
 
-        remote_hashable = {"type": "system/type", "data": remote_data}
-        remote_hash = compute_ecf_hash(remote_hashable)
-        result.remote_hash = remote_hash
+        result.remote_hash = content_hash("system/type", remote_data)
 
         # Compare
-        if local_hash == remote_hash:
+        if local_hash == result.remote_hash:
             result.match = True
             result.differences = []
         else:
@@ -280,13 +302,9 @@ async def open_connection(
 ) -> AsyncIterator[tuple[Connection, str]]:
     """Connect to a peer, yield (conn, remote_peer_id), auto-close.
 
-    Args:
-        host: Remote host.
-        port: Remote port.
-        identity: Identity name for authentication.
-
-    Yields:
-        Tuple of (Connection, remote_peer_id).
+    Kept for callers that genuinely need the raw connection (``cmd_start``'s
+    peer-to-peer wiring, the interop tests). Commands should use
+    :func:`open_client` instead.
     """
     keypair = _load_keypair(identity)
     conn = await Connection.connect(host, port, keypair)
@@ -297,141 +315,148 @@ async def open_connection(
         await conn.wait_closed()
 
 
+@asynccontextmanager
+async def open_client(
+    host: str,
+    port: int,
+    identity: str = "framework-admin",
+) -> AsyncIterator[EntityClient]:
+    """Connect to a peer and yield a ready :class:`EntityClient`.
+
+    Paths resolve against the **remote** peer's namespace, which is what a CLI
+    argument like ``ls host:port/docs/`` means — *their* ``docs/``.
+    """
+    keypair = _load_keypair(identity)
+    conn = await Connection.connect(host, port, keypair)
+    try:
+        yield client_for_connection(conn)
+    finally:
+        conn.close()
+        await conn.wait_closed()
+
+
+def _fail(exc: EntityError) -> None:
+    """Report a dispatched-operation failure and exit non-zero.
+
+    The SDK raises typed §12 exceptions carrying the status, the error code and
+    the message. Rendering happens here; deciding what the status *means* — and
+    which of them are failures at all, since 207 and 202 are not — happened in
+    the SDK, once.
+    """
+    rendered = display_error({"code": exc.code or "error", "message": exc.message or ""})
+    print(f"{rendered} (status {exc.status})", file=sys.stderr)
+    sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Entity tree subcommands
 # ---------------------------------------------------------------------------
 
+async def _read_entity(client: EntityClient, path: str) -> Any:
+    """Read the entity at ``path``, falling back to dispatch at the path.
+
+    A tree read only sees **bound** paths. Plenty of useful reads are not
+    bindings at all — ``system/status`` is computed by a handler on each
+    request, so it has no tree entry and `get` returns ``None`` for it. In that
+    case, dispatching *at the path* lets V7 §6.6 longest-prefix resolution find
+    whichever handler serves it.
+
+    Both routes were already in use before the SDK landed — `cat` did tree-then
+    -path, while `info` and `get` went straight to path dispatch — which meant
+    three commands with three slightly different notions of "read". One helper,
+    used by all three, is the same behaviour without the drift.
+    """
+    entity = await client.get(path)
+    if entity is not None:
+        return entity
+    return await client.execute(path, "get")
+
+
 async def cmd_ls(args: argparse.Namespace) -> None:
     """List entities at a path (tree listing)."""
     host, port, path = parse_target(args.target)
-    # ls auto-appends / if missing
     if path and not path.endswith("/"):
         path += "/"
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        # Use tree handler with typed params entity
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/system/tree",
-            operation="get",
-            params={
-                "type": "system/tree/get-request",
-                "data": {"path": path},
-            },
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            entries = await client.list(path)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        result = response.result
-        if isinstance(result, dict) and result.get("type") == "tree/listing":
-            print(display_entity(result))
-        else:
-            # Not a listing — show whatever came back
-            print(display_entity(result) if isinstance(result, dict) else result)
+    print(f"{path or '/'}")
+    if not entries:
+        print("(empty)")
+        return
+    for entry in entries:
+        name = entry.name + "/" if entry.has_children else entry.name
+        suffix = f"  {_truncate_hash(entry.content_hash, 30)}" if entry.content_hash else ""
+        print(f"{name}{suffix}")
 
 
 async def cmd_cat(args: argparse.Namespace) -> None:
     """Display entity content with type-aware formatting."""
     host, port, path = parse_target(args.target)
-    # cat reads entity, so no trailing slash
+    # cat reads an entity, so no trailing slash
     path = path.rstrip("/")
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        # Try tree handler first with typed params entity
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/system/tree",
-            operation="get",
-            params={
-                "type": "system/tree/get-request",
-                "data": {"path": path},
-            },
-        )
-        # If tree handler returns 404, try direct path (for dynamic endpoints)
-        if response.status == 404:
-            response = await conn.execute(
-                uri=f"entity://{remote_peer}/{path}",
-                operation="get",
-            )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            entity = await _read_entity(client, path)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        result = response.result
-        if isinstance(result, dict):
-            print(display_entity(result))
-        else:
-            print(result)
+    print(display_entity(entity) if isinstance(entity, dict) else entity)
 
 
 async def cmd_info(args: argparse.Namespace) -> None:
     """Show entity metadata only (type, hash, refs)."""
     host, port, path = parse_target(args.target)
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/{path}",
-            operation="get",
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            entity = await _read_entity(client, path)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        result = response.result
-        if isinstance(result, dict):
-            print(display_info(result))
-        else:
-            print(result)
+    print(display_info(entity) if isinstance(entity, dict) else entity)
 
 
 async def cmd_get(args: argparse.Namespace) -> None:
     """Get raw entity in CBOR diagnostic notation (machine-readable)."""
     host, port, path = parse_target(args.target)
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/{path}",
-            operation="get",
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            entity = await _read_entity(client, path)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        print(to_diag(response.result, indent=2))
+    print(to_diag(entity, indent=2))
 
 
 async def cmd_put(args: argparse.Namespace) -> None:
     """Store an entity at a path."""
     host, port, path = parse_target(args.target)
 
-    # Parse --data as JSON
     try:
         data = json.loads(args.data) if args.data else {}
     except json.JSONDecodeError as e:
         print(f"Invalid JSON for --data: {e}", file=sys.stderr)
         sys.exit(1)
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/{path}",
-            operation="write",
-            params={
-                "entity": {
-                    "type": args.type,
-                    "data": data,
-                },
-            },
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            content_hash = await client.put(path, args.type, data)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        # Storage handler returns a flat {hash, uri}; after §3.4 wire
-        # wrapping the payload lives at result_data.
-        result = response.result_data
-        if isinstance(result, dict) and "hash" in result:
-            print(f"Stored: {result['hash']}")
-        else:
-            print(to_diag(response.result, indent=2))
+    print(f"Stored: {content_hash.hex()}")
 
 
 async def cmd_registry_issue_binding(args: argparse.Namespace) -> None:
@@ -472,16 +497,14 @@ async def cmd_registry_issue_binding(args: argparse.Namespace) -> None:
         (f"system/signature/{bh.hex()}", sig),                            # invariant pointer (V7 §5.2)
         (f"system/registry/binding/by-name/{name}", binding),             # by-name index (§2.2)
     ]
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
+    async with open_client(host, port, args.identity) as client:
         for path, entity in artifacts:
-            resp = await conn.execute(
-                uri=f"entity://{remote_peer}/{path}",
-                operation="write",
-                params={"entity": {"type": entity.type, "data": entity.data}},
-            )
-            if resp.status != 200:
-                _print_error(resp)
-                sys.exit(1)
+            try:
+                await client.put(path, entity.type, entity.data)
+            except EntityError as exc:
+                _fail(exc)
+                return
+
     print(f"Issued peer-issued binding {name!r} → {args.target_peer_id}")
     print(f"  binding_hash: {bh.hex()}")
     print(f"  signed by registry: {keypair.peer_id}")
@@ -496,22 +519,21 @@ async def cmd_registry_set_policy(args: argparse.Namespace) -> None:
     than pre-empt, so the ratified server-side rule is the one under test.
     """
     host, port, _ = parse_target(args.target)
-    data = {
-        "mode": args.mode,
-        "allowlist": json.loads(args.allowlist) if args.allowlist else None,
-        "name_constraints": args.name_constraints,
-        "default_ttl": args.default_ttl,
-    }
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        resp = await conn.execute(
-            uri=f"entity://{remote_peer}/system/registry",
-            operation="set-issuer-policy",
-            params={"type": "system/registry/issuer-policy", "data": data},
-        )
-        if resp.status != 200:
-            _print_error(resp)
-            sys.exit(1)
-    print(f"Issuer policy set on {remote_peer}: mode={args.mode}")
+    policy = IssuerPolicy(
+        mode=args.mode,
+        allowlist=json.loads(args.allowlist) if args.allowlist else None,
+        name_constraints=args.name_constraints,
+        default_ttl=args.default_ttl,
+    )
+    async with open_client(host, port, args.identity) as client:
+        remote_peer = client.local_peer_id
+        try:
+            stored = await set_issuer_policy(client, policy)
+        except EntityError as exc:
+            _fail(exc)
+            return
+
+    print(f"Issuer policy set on {remote_peer}: mode={stored.mode}")
 
 
 async def cmd_registry_register(args: argparse.Namespace) -> None:
@@ -522,66 +544,44 @@ async def cmd_registry_register(args: argparse.Namespace) -> None:
     signature + identity in `included`. The registry applies its issuer-policy
     and, on approval, signs + publishes the binding.
     """
-    import os
-    import time
-    import unicodedata
-    from entity_core.protocol.auth import create_identity_entity, create_signature_entity
-    from entity_core.protocol.entity import Entity
-
     host, port, _ = parse_target(args.target)
-    name = unicodedata.normalize("NFC", args.name)
-    if "/" in name or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in name):
-        print(f"Invalid name {args.name!r} (no '/' or control chars)", file=sys.stderr)
-        sys.exit(1)
-
     keypair = _load_keypair(args.identity)
     transports = json.loads(args.transports) if args.transports else []
-    request_data = {
-        "name": name,
-        "target_peer_id": keypair.peer_id,  # layer-1: requester proves it holds this key
-        "transports": transports,
-        "requested_ttl": args.ttl,
-        "nonce": os.urandom(16),
-        "issued_at": int(time.time() * 1000),
-    }
-    request = Entity(type="system/registry/register-request", data=request_data)
-    rh = request.compute_hash()
-    identity = create_identity_entity(keypair)
-    sig = create_signature_entity(keypair, rh, identity.compute_hash())
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        resp = await conn.execute(
-            uri=f"entity://{remote_peer}/system/registry",
-            operation="register-request",
-            params={"type": "system/registry/register-request", "data": request_data},
-            included=[identity.to_dict(), sig.to_dict()],
-        )
-        if resp.status != 200:
-            _print_error(resp)
-            sys.exit(1)
-        result = resp.result if isinstance(resp.result, dict) else {}
-    status = (result.get("data") or {}).get("status") if "data" in result else result.get("status")
-    print(f"register-request {name!r} → {keypair.peer_id}: {status or result}")
+    async with open_client(host, port, args.identity) as client:
+        try:
+            result = await register(
+                client,
+                keypair,
+                args.name,
+                transports=transports,
+                requested_ttl=args.ttl,
+            )
+        except EntityError as exc:
+            _fail(exc)
+            return
+
+    print(f"register-request {args.name!r} → {keypair.peer_id}: {result.status}")
+    if result.bound and result.binding_hash:
+        print(f"  binding_hash: {result.binding_hash.hex()}")
+    elif result.pending and result.pending_hash:
+        # 202 is accepted-pending, not a refusal — say so, and hand back the
+        # poll handle rather than leaving the operator to guess at a next step.
+        print(f"  queued for review; poll pending_hash: {result.pending_hash.hex()}")
 
 
 async def cmd_rm(args: argparse.Namespace) -> None:
     """Remove a tree entry."""
     host, port, path = parse_target(args.target)
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/{path}",
-            operation="delete",
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            await client.remove(path)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        result = response.result
-        if isinstance(result, dict):
-            print(to_diag(result, indent=2))
-        else:
-            print(result if result else "Deleted.")
+    print("Deleted.")
 
 
 async def cmd_tree(args: argparse.Namespace) -> None:
@@ -590,67 +590,52 @@ async def cmd_tree(args: argparse.Namespace) -> None:
     if path and not path.endswith("/"):
         path += "/"
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        lines: list[str] = []
-        root_label = f"entity://{remote_peer}/{path}" if path else f"entity://{remote_peer}/"
-        lines.append(root_label)
-        await _tree_walk(conn, remote_peer, path, lines, prefix="")
-        print("\n".join(lines))
+    async with open_client(host, port, args.identity) as client:
+        lines = [f"{client.local_peer_id}:/{path}"]
+        try:
+            await _tree_walk(client, path, lines, prefix="")
+        except EntityError as exc:
+            _fail(exc)
+            return
+
+    print("\n".join(lines))
 
 
 async def _tree_walk(
-    conn: Connection,
-    remote_peer: str,
+    client: EntityClient,
     path: str,
     lines: list[str],
     prefix: str,
 ) -> None:
     """Recursively walk the entity tree and append formatted lines.
 
-    Args:
-        conn: Active connection.
-        remote_peer: Remote peer ID.
-        path: Current path (with trailing /).
-        lines: Accumulator for output lines.
-        prefix: Indentation prefix for this level (e.g. "│   ").
+    One `list` per level — §3.3 `list` is single-level by conformance
+    requirement, so the recursion is the caller's job and always was. The
+    difference now is that the projection to `(name, path, hash, has_children)`
+    happens once in the SDK instead of being re-derived from the raw listing
+    map here.
     """
-    response = await conn.execute(
-        uri=f"entity://{remote_peer}/{path}",
-        operation="get",
-    )
-    if response.status != 200:
-        return
+    entries = await client.list(path)
 
-    result = response.result
-    if not isinstance(result, dict) or result.get("type") != "tree/listing":
-        return
-
-    entries = result.get("data", {}).get("entries", {})
-    names = sorted(entries.keys())
-
-    for i, name in enumerate(names):
-        info = entries[name]
-        is_last = (i == len(names) - 1)
+    for i, entry in enumerate(entries):
+        is_last = i == len(entries) - 1
         connector = "└── " if is_last else "├── "
-        has_children = info.get("has_children", False)
-        hash_val = info.get("hash")
 
-        if has_children:
-            display_name = name + "/"
+        if entry.has_children:
+            display_name = entry.name + "/"
             suffix = ""
-        elif hash_val:
-            display_name = name
-            suffix = f"  {_truncate_hash(hash_val, 30)}"
+        elif entry.content_hash:
+            display_name = entry.name
+            suffix = f"  {_truncate_hash(entry.content_hash, 30)}"
         else:
-            display_name = name
+            display_name = entry.name
             suffix = ""
 
         lines.append(f"{prefix}{connector}{display_name}{suffix}")
 
-        if has_children:
+        if entry.has_children:
             child_prefix = prefix + ("    " if is_last else "│   ")
-            child_path = path + name + "/"
-            await _tree_walk(conn, remote_peer, child_path, lines, child_prefix)
+            await _tree_walk(client, path + entry.name + "/", lines, child_prefix)
 
 
 def _truncate_hash(hash_val: str | dict | bytes, max_len: int) -> str:
@@ -680,7 +665,6 @@ async def cmd_exec(args: argparse.Namespace) -> None:
     """Execute an arbitrary operation."""
     host, port, path = parse_target(args.target)
 
-    # Parse optional params as JSON
     params: dict[str, Any] = {}
     if args.params:
         try:
@@ -689,75 +673,36 @@ async def cmd_exec(args: argparse.Namespace) -> None:
             print(f"Invalid JSON for params: {e}", file=sys.stderr)
             sys.exit(1)
 
-    async with open_connection(host, port, args.identity) as (conn, remote_peer):
-        response = await conn.execute(
-            uri=f"entity://{remote_peer}/{path}",
-            operation=args.operation,
-            params=params if params else None,
-        )
-        if response.status != 200:
-            _print_error(response)
-            sys.exit(1)
+    async with open_client(host, port, args.identity) as client:
+        try:
+            result = await client.execute(path, args.operation, params or None)
+        except EntityError as exc:
+            _fail(exc)
+            return
 
-        result = response.result
-        if isinstance(result, dict):
-            print(display_entity(result))
-        else:
-            print(result)
+    print(display_entity(result) if isinstance(result, dict) else result)
 
 
 # ---------------------------------------------------------------------------
-# Error display helper
+# Result display helper
 # ---------------------------------------------------------------------------
 
-def _print_error(response: ExecuteResponse) -> None:
-    """Print an error response to stderr."""
-    result = response.result
-    if isinstance(result, dict) and ("code" in result or "message" in result):
-        print(display_error(result), file=sys.stderr)
-    else:
-        print(f"Error (status {response.status}): {result}", file=sys.stderr)
+def _print_result(label: str, result: Any) -> None:
+    """Print a successful result under a label.
 
-
-# ---------------------------------------------------------------------------
-# Legacy print helper (used by connect command)
-# ---------------------------------------------------------------------------
-
-def _print_response(path: str, response: ExecuteResponse) -> None:
-    """Pretty print an execute response (legacy connect command)."""
-    print(f"\n--- {path} ---")
-    print(f"Status: {response.status}")
-
-    if response.status != 200:
-        print(f"Error: {response.result}")
-        return
-
-    result = response.result
+    There is no matching ``_print_error``: the SDK raises typed §12 exceptions
+    rather than handing back a response for the caller to inspect, so the
+    error path is :func:`_fail` and status interpretation is not this tier's
+    job.
+    """
+    print(f"\n=== {label} ===")
     if isinstance(result, dict):
-        if result.get("type") == "tree/listing":
-            data = result.get("data", {})
-            print(f"Type: tree/listing")
-            print(f"Path: {data.get('path')}")
-            print(f"Count: {data.get('count')}")
-            entries = data.get("entries", {})
-            for name, info in sorted(entries.items()):
-                hash_val = info.get("hash")
-                children = info.get("has_children", False)
-                hash_str = f"{hash_val[:30]}..." if hash_val else "(no entity)"
-                suffix = " [+]" if children else ""
-                print(f"  {name}: {hash_str}{suffix}")
-        elif "type" in result:
-            print(f"Type: {result.get('type')}")
-            print(f"Data: {to_diag(result.get('data'), indent=2)}")
-        else:
-            print(to_diag(result, indent=2))
+        print(display_entity(result))
+    elif result is None:
+        print("(no result)")
     else:
         print(result)
 
-
-# ---------------------------------------------------------------------------
-# Unchanged commands: start, connect, list-identities, compare-types
-# ---------------------------------------------------------------------------
 
 def cmd_list_identities() -> None:
     """List available identities."""
@@ -1243,7 +1188,6 @@ async def cmd_connect(args: argparse.Namespace) -> None:
     host, port_str = args.address.rsplit(":", 1)
     port = int(port_str)
 
-    # Load identity
     try:
         identity = load_identity(args.identity)
         keypair = identity.keypair
@@ -1259,38 +1203,30 @@ async def cmd_connect(args: argparse.Namespace) -> None:
         if conn.capability is None:
             print("Warning: No capability received from peer")
 
-        remote_peer = conn.session.remote_peer_id
+        client = client_for_connection(conn)
 
+        probes: list[tuple[str, str, str]] = []
         if args.status:
-            response = await conn.execute(
-                uri=f"entity://{remote_peer}/system/status",
-                operation="get",
-            )
-            _print_response("system/status", response)
-
+            probes.append(("system/status", "system/status", "get"))
         if args.get:
-            path = args.get
-            response = await conn.execute(
-                uri=f"entity://{remote_peer}/{path}",
-                operation="get",
-            )
-            _print_response(path, response)
-
+            probes.append((args.get, args.get, "get"))
         if args.read:
-            path = args.read
-            response = await conn.execute(
-                uri=f"entity://{remote_peer}/{path}",
-                operation="get",
-            )
-            _print_response(path, response)
-
+            probes.append((args.read, args.read, "get"))
         if args.execute:
             path, operation = args.execute
-            response = await conn.execute(
-                uri=f"entity://{remote_peer}/{path}",
-                operation=operation,
-            )
-            _print_response(f"{path} ({operation})", response)
+            probes.append((f"{path} ({operation})", path, operation))
+
+        for label, path, operation in probes:
+            try:
+                _print_result(label, await client.execute(path, operation))
+            except EntityError as exc:
+                print(f"\n=== {label} ===")
+                print(
+                    display_error(
+                        {"code": exc.code or "error", "message": exc.message or ""}
+                    ),
+                    file=sys.stderr,
+                )
 
         conn.close()
         await conn.wait_closed()
