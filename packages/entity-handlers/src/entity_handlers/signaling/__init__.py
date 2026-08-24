@@ -100,7 +100,7 @@ from entity_handlers.signaling.coordination import (
     to_blob,
 )
 from entity_handlers.signaling.data import (
-    TYPE_ADVERTISEMENT,
+    TYPE_ADVERTISE_RESULT,
     TYPE_COLLECT_REQUEST,
     TYPE_COLLECT_RESULT,
     TYPE_OFFER_REQUEST,
@@ -205,7 +205,7 @@ __all__ = [
     "TYPE_OFFER_RESULT",
     "TYPE_COLLECT_REQUEST",
     "TYPE_COLLECT_RESULT",
-    "TYPE_ADVERTISEMENT",
+    "TYPE_ADVERTISE_RESULT",
     "Limits",
     "Advertisement",
     # client

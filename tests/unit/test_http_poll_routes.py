@@ -720,6 +720,31 @@ async def test_a5_pin_bijection_entity_foo_dot_bin_doubles_suffix():
 
 
 @pytest.mark.asyncio
+async def test_t4_listing_nonexistent_prefix_404():
+    """§6.5.6 T4: an in-scope but NON-EXISTENT prefix ⇒ 404.
+
+    `prefix_in_scope` answers "may this render", not "is anything
+    here" — a namespace-wide grant puts every path under it in scope,
+    including paths the tree has never held. Falling through to the
+    empty-listing render answered 200 + entries={} + count=0, which is
+    the response §6.5.6 reserves for a prefix that EXISTS and is empty.
+    """
+    peer = _make_peer()
+    namespace = "system/content/public"
+    h = peer.content_store.put(_make_blob_entity(b"seed"))
+    _bind_inside_namespace_path(peer, namespace, "dir/a", h)
+
+    def probe(host, port):
+        return _do_request(
+            method="GET", host=host, port=port,
+            path=f"/{peer.peer_id}/{namespace}/never-bound-here.list",
+        )
+
+    code, _, body = await _run_against_isolated_poll(peer, namespace, probe)
+    assert code == 404, body
+
+
+@pytest.mark.asyncio
 async def test_a5_pin_bijection_listing_foo_list():
     """Listing form `foo.list` → 200 system/tree/listing in ECF."""
     peer = _make_peer()
@@ -749,26 +774,38 @@ async def test_a5_pin_bijection_listing_foo_list():
 
 @pytest.mark.asyncio
 async def test_a5_pin_bijection_listing_empty_in_scope_returns_200():
-    """Empty in-scope listing ⇒ 200 + entries={} + count=0 (§6.5.6 Q2)."""
+    """Empty **published** in-scope listing ⇒ 200 + entries={} + count=0.
+
+    §6.5.6 (Amendment 5): "An **in-scope** prefix with no children
+    returns `200` + `entries={}` + `count=0` (… an empty **published**
+    directory is legitimately observable)" — one sentence after "An
+    out-of-scope or **non-existent** prefix returns `404`".
+
+    This test used to bind a sentinel at `anchor/sentinel` and then
+    probe the SIBLING prefix `empty`, which the tree had never held,
+    and assert 200. That drops the published precondition and collapses
+    the two rules into one: under a namespace-wide cap every path is
+    in-scope, so if in-scope-ness alone earns a 200 then no prefix is
+    ever "non-existent" and T4 has nothing left to govern. The peer
+    over-served every probe under its own namespace and the suite
+    called it green (Go's cross-impl run caught it as
+    `tree_listing_nonexistent_404` returning 200).
+
+    The published-and-childless case is the §6.4.2 leaf-as-listing
+    shape: something IS bound at the prefix, it just has no children.
+    """
     peer = _make_peer()
     namespace = "system/content/public"
-    # Establish the namespace as in-scope by binding *something* under it
-    # so the prefix exists (otherwise the prefix itself is not in scope
-    # by the namespace cap — and that case is the next test below).
     h = peer.content_store.put(_make_blob_entity(b"x"))
-    _bind_inside_namespace_path(peer, namespace, "anchor/sentinel", h)
+    inner = _bind_inside_namespace_path(peer, namespace, "empty", h)
 
     def probe(host, port):
         return _do_request(
             method="GET", host=host, port=port,
-            path=f"/{peer.peer_id}/{namespace}/empty.list",
+            path=f"/{peer.peer_id}/{inner}.list",
         )
 
     code, _, body = await _run_against_isolated_poll(peer, namespace, probe)
-    # Per Q2 / §6.5.6: an in-scope prefix with no children returns 200
-    # + entries={} count=0. The cap permits `system/content/public/*`
-    # so `empty` is in scope (its children would be too if there were
-    # any).
     assert code == 200, body
     decoded = ecf_decode(body)
     assert decoded["data"]["entries"] == {}

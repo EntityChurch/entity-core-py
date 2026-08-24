@@ -863,6 +863,35 @@ async def cmd_start(args: argparse.Namespace) -> None:
               "handlers (system/validate/*). For conformance runs only — "
               "do NOT use in production.")
 
+    # PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §2: pin registries the §4 chain
+    # will actually consult. Comma-separated `peer_id@endpoint`, matching
+    # Go's entity-peer --peer-issued-registry.
+    peer_issued = getattr(args, "peer_issued_registry", None)
+    if peer_issued:
+        for spec in peer_issued.split(","):
+            spec = spec.strip()
+            if not spec:
+                continue
+            registry_peer_id, sep, endpoint = spec.partition("@")
+            if not sep or not registry_peer_id or not endpoint:
+                print(f"Error: --peer-issued-registry expects peer_id@url, got {spec!r}")
+                return 1
+            builder.with_peer_issued_registry(registry_peer_id, endpoint)
+            print(f"Peer-issued registry pinned: {registry_peer_id[:20]}... -> {endpoint}")
+
+    # EXTENSION-SIGNALING §4/§5 rendezvous node. OFF by default — a peer is a
+    # signaling CLIENT by default and only a deployed introducer serves (Go's
+    # `-signaling-node` is off for the same reason). The caller's grant must
+    # cover system/signaling:{offer,collect,advertise}, so pair it with
+    # --open-access or a seed policy.
+    if getattr(args, "signaling_node", False):
+        builder.with_signaling_node_handler(
+            endpoint=getattr(args, "signaling_endpoint", "") or "",
+            lobby_constant=getattr(args, "signaling_lobby", None),
+        )
+        print("Signaling: serving the §4/§5 rendezvous node "
+              "(system/signaling offer/collect/advertise)")
+
     # V7 §6.9a (F27) peer-authority-bootstrap. The owner cap defaults to
     # this peer's own identity; --operator names a distinct owner.
     operator_name = getattr(args, "operator", None)
@@ -946,6 +975,9 @@ async def cmd_start(args: argparse.Namespace) -> None:
                         root_name,
                         prefix=tree_prefix,
                         filesystem_root=fs_path,
+                        publish_descriptors=bool(
+                            getattr(args, "publish_descriptors", False)
+                        ),
                     )
                     print(
                         f"Files root '{root_name}': {fs_path} → {tree_prefix}"
@@ -988,6 +1020,12 @@ async def cmd_start(args: argparse.Namespace) -> None:
             f"Published signed root: seq={pr_entity.data['seq']} "
             f"root_hash={pr_entity.data['root_hash'].hex()[:16]}…"
         )
+        # PROPOSAL-PEER-MANIFEST §4: "on every tree-root change", not once.
+        # A peer that advertises a signed root and never republishes serves
+        # a closure frozen at boot — every entity written afterwards is
+        # permanently outside the served set, which for a static-origin
+        # deployment is a publisher that can never publish anything.
+        peer.enable_root_republish()
 
     # Chunk D HTTP-live listener (per EXTENSION-NETWORK §6.5.2c + v1.4
     # Amendment 3). Binds alongside the TCP listener; both share the
@@ -1461,6 +1499,52 @@ def build_parser() -> argparse.ArgumentParser:
              "where a distinct operator administers the peer.",
     )
     start_parser.add_argument(
+        "--peer-issued-registry",
+        metavar="PEER_ID@URL",
+        dest="peer_issued_registry",
+        default=None,
+        help="PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §2: pin one or more "
+             "peer-issued registries (comma-separated `peer_id@tree_url_prefix`). "
+             "Installs the trust root AND a §4 resolver-chain entry — registering "
+             "a backend is not the same as consulting one, and a pin with no "
+             "chain entry answers chain_exhausted having dialed nothing. Same "
+             "flag name and spelling as Go's entity-peer --peer-issued-registry.",
+    )
+    start_parser.add_argument(
+        "--signaling-node",
+        action="store_true",
+        dest="signaling_node",
+        default=False,
+        help="EXTENSION-SIGNALING §4/§5: serve the system/signaling rendezvous "
+             "node (offer/collect/advertise) — the opaque per-key blob store "
+             "for NAT introduction and the §7 punch. OFF by default (a peer is "
+             "a signaling CLIENT by default; only a deployed introducer "
+             "serves). The caller's grant must cover "
+             "system/signaling:{offer,collect,advertise}, so pair it with "
+             "--open-access or a seed policy. Same flag name and default as "
+             "Go's entity-peer -signaling-node.",
+    )
+    start_parser.add_argument(
+        "--signaling-endpoint",
+        metavar="HOST:PORT",
+        dest="signaling_endpoint",
+        default=None,
+        help="EXTENSION-SIGNALING §4.5: the endpoint this node advertises. "
+             "Defaults to where the peer actually listens. §3.1.1 weights are "
+             "computed over these bytes exactly as published, so a value here "
+             "is never normalized.",
+    )
+    start_parser.add_argument(
+        "--signaling-lobby",
+        metavar="CONSTANT",
+        dest="signaling_lobby",
+        default=None,
+        help="EXTENSION-SIGNALING §4.5: this deployment's `lobby` override, "
+             "published in advertise. Omit to use `lobby:default` — it is a "
+             "derivation input (§3.1 hashes it verbatim), so overriding it "
+             "moves every peer's lobby bucket.",
+    )
+    start_parser.add_argument(
         "--seed-policy",
         metavar="FILE",
         dest="seed_policy",
@@ -1490,6 +1574,16 @@ def build_parser() -> argparse.ArgumentParser:
              "lets validate-peer's local_files category run against a "
              "Python peer with a writable test root. "
              "Example: --files 'test:/tmp/files:local/files/test/'",
+    )
+    start_parser.add_argument(
+        "--publish-descriptors",
+        dest="publish_descriptors",
+        action="store_true",
+        help="Arm DOMAIN-LOCAL-FILES v1.3 §10.5 V3 on every --files root: a "
+             "file read writes system/content/descriptor/{hash} into the "
+             "tree. Cross-impl alias for Go peer-manager's "
+             "--publish-descriptors. Without it the V3 behavioural check "
+             "reports 'not exercised' — a check quietly not running.",
     )
     # --- EXTENSION-DISCOVERY v1.0 flags (cross-impl-aligned) ---
     start_parser.add_argument(

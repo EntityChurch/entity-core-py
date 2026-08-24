@@ -14,6 +14,7 @@ from entity_core.protocol.entity import Entity
 # error_response lives in _common (shared with the handler modules); re-exported
 # here for the modules that import it from manifest.
 from entity_handlers._common import error_response  # noqa: F401
+from entity_handlers.reachability import OP_CHECK_REACHABILITY, OP_OBSERVE_ADDRESS
 
 
 def build_handler_manifest(
@@ -248,6 +249,19 @@ NETWORK_HANDLER_MANIFEST = build_handler_manifest(
         },
         "restore-subscriptions": {
             "input_type": "primitive/any",
+        },
+        # §6.7 reachability facts (Amendment 13). Advertising them is what
+        # makes the section OFFERED under the §12.3 ruling — a consumer
+        # discovers support from the OPERATION'S RESPONSE, and offering the
+        # section is also what makes this peer owe the three §6.7 types.
+        # Neither takes an input type: both read the accept-side transport
+        # source, and a declared input would invite the body-supplied address
+        # that §6.7.1 MUST 1 and §6.7.2's MUST both forbid.
+        OP_OBSERVE_ADDRESS: {
+            "output_type": "system/network/observe-address-result",
+        },
+        OP_CHECK_REACHABILITY: {
+            "output_type": "system/network/check-reachability-result",
         },
     },
     internal_scope=[
@@ -889,6 +903,36 @@ RELAY_HANDLER_MANIFEST = build_handler_manifest(
     },
 )
 
+# EXTENSION-SIGNALING §4.0 — the rendezvous node. Exactly three operations;
+# `advertise` takes no input type (§4.0 declares it `null`). The internal scope
+# is §4.0's verbatim block: the node's own state is in-memory (a bucket is
+# ephemeral and worthless after a restart), so nothing here writes a blob to
+# the tree — the block is what §4.0 pins, kept as pinned.
+SIGNALING_HANDLER_MANIFEST = build_handler_manifest(
+    name="signaling",
+    pattern="system/signaling",
+    operations={
+        "offer": {
+            "input_type": "system/signaling/offer-request",
+            "output_type": "system/signaling/offer-result",
+        },
+        "collect": {
+            "input_type": "system/signaling/collect-request",
+            "output_type": "system/signaling/collect-result",
+        },
+        "advertise": {
+            "output_type": "system/signaling/advertise-result",
+        },
+    },
+    internal_scope=[
+        {
+            "handlers": {"include": ["system/tree"]},
+            "resources": {"include": ["system/signaling/*"]},
+            "operations": {"include": ["get", "put"]},
+        },
+    ],
+)
+
 ALL_HANDLER_MANIFESTS = [
     SYSTEM_HANDLER_MANIFEST,
     STORAGE_HANDLER_MANIFEST,
@@ -917,4 +961,5 @@ ALL_HANDLER_MANIFESTS = [
     REGISTRY_HANDLER_MANIFEST,  # EXTENSION-REGISTRY v1.0 (substrate + local-name backend)
     DISCOVERY_HANDLER_MANIFEST,  # EXTENSION-DISCOVERY v1.0 (substrate + mDNS backend)
     RELAY_HANDLER_MANIFEST,  # EXTENSION-RELAY v1.0 (Mode F forward + Mode S store-and-poll)
+    SIGNALING_HANDLER_MANIFEST,  # EXTENSION-SIGNALING §4/§5 (the node role)
 ]

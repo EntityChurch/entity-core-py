@@ -531,6 +531,69 @@ def test_read_rejects_leaf_symlink(tmp_path):
     assert resp["result"]["data"]["code"] == "path_traversal_rejected"
 
 
+def test_read_rejects_dangling_leaf_symlink(tmp_path):
+    """§10.5 V4: a leaf symlink whose target does NOT exist here is
+    still ``403 path_traversal_rejected`` — not ``404``.
+
+    ``test_read_rejects_leaf_symlink`` above only covers a link whose
+    target resolves, and that case reached the ``O_NOFOLLOW`` open and
+    answered 403 by accident of ordering. The interesting shape is the
+    one the cross-impl validator plants: the peer runs in a container,
+    the link points at a host path, and nothing at that path exists
+    inside the peer's filesystem view. ``os.path.exists`` follows the
+    link, reports False, and the handler answered ``404
+    file_not_found`` — masking the traversal with an existence answer.
+    A caller cannot tell "absent" from "defended", and 404 is also
+    exactly what an impl with NO leaf-symlink defense returns.
+    """
+    env = _make_env(tmp_path)
+    # Point outside the root at a path that does not exist at all.
+    inside_link = Path(env.fs_root) / "dangling.txt"
+    os.symlink(tmp_path / "nowhere" / "absent.secret", inside_link)
+
+    resp = _run(_exec(env, "read", target=f"{env.prefix}dangling.txt"))
+    assert resp["status"] == 403
+    assert resp["result"]["data"]["code"] == "path_traversal_rejected"
+
+
+def test_list_rejects_escaping_leaf_symlink(tmp_path):
+    """§8.3 applies to every operation, not just read.
+
+    ``list`` had the same ``os.path.exists`` ordering, so a symlinked
+    directory escaping the root answered by existence rather than by
+    the traversal rule.
+    """
+    env = _make_env(tmp_path)
+    outside_dir = tmp_path / "outside-tree"
+    outside_dir.mkdir()
+    (outside_dir / "secret.md").write_bytes(b"x")
+    os.symlink(outside_dir, Path(env.fs_root) / "escape-dir")
+
+    resp = _run(_exec(env, "list", target=f"{env.prefix}escape-dir"))
+    assert resp["status"] == 403
+    assert resp["result"]["data"]["code"] == "path_traversal_rejected"
+
+
+def test_leaf_symlink_inside_root_is_not_a_traversal(tmp_path):
+    """Containment is the test, not "is a symlink".
+
+    A leaf symlink resolving to a path INSIDE the root does not escape
+    anything, so ``resolve_fs_path`` must not raise on it. The read
+    path still refuses it at ``O_NOFOLLOW`` — this pins that the
+    refusal comes from the leaf-open policy, not from a traversal
+    verdict that would also condemn in-root links for other callers.
+    """
+    from entity_handlers.local_files.config import resolve_fs_path
+
+    env = _make_env(tmp_path)
+    (Path(env.fs_root) / "real.md").write_bytes(b"inside\n")
+    os.symlink(Path(env.fs_root) / "real.md", Path(env.fs_root) / "alias.md")
+
+    root = next(iter(env.extension.roots.values()))
+    # Does not raise — the target is inside the root.
+    resolve_fs_path(root, f"{env.prefix}alias.md")
+
+
 def test_read_path_traversal_rejected(tmp_path):
     env = _make_env(tmp_path)
     # ../ escape: the canonical resolution lands outside the root,

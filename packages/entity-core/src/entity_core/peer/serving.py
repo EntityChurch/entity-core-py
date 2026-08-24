@@ -432,6 +432,21 @@ def render_tree_listing(
     prefix_with_slash = normalized if normalized.endswith("/") else normalized + "/"
     uris = entity_tree.list_prefix(prefix_with_slash)
 
+    # T4 existence gate. `prefix_in_scope` answers "may this prefix be
+    # rendered", not "is there anything here" — a cap granting a whole
+    # subtree makes EVERY path under it in-scope, including ones the
+    # tree has never held. Without this gate a non-existent prefix fell
+    # through to the empty-listing render and answered 200 + entries={}
+    # + count=0, which is the response §6.5.6 reserves for a prefix that
+    # exists and is empty. Over-serving is its own defect: it hands a
+    # caller a presence oracle in the inverse direction (every probe
+    # confirms), and it makes "empty" and "absent" indistinguishable in
+    # the direction the spec cares about. A prefix exists iff the tree
+    # holds a binding AT it (the §6.4.2 leaf-as-listing case) or any
+    # binding UNDER it.
+    if not uris and entity_tree.get(normalized) is None:
+        return None
+
     seen: set[str] = set()
     raw_children: list[tuple[str, bytes | None, bool]] = []
     for uri in uris:

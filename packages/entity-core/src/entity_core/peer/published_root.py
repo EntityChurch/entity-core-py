@@ -48,6 +48,32 @@ from entity_core.protocol.entity import Entity
 
 PUBLISHED_ROOT_TYPE = "system/peer/published-root"
 
+#: ``EmitContext.handler_pattern`` stamped on the republisher's own two
+#: writes (the published-root binding and its signature invariant pointer).
+#: The republisher hook checks for this tag and ignores the resulting
+#: events — those writes land in the same tree it is watching, so without
+#: the tag every publish would trigger the next one forever. Same value and
+#: same mechanism as Go's ``publishedroot.PublisherHandlerPattern``, so the
+#: two impls' debug logs line up when a cross-impl run is being read.
+PUBLISHER_HANDLER_PATTERN = "publishedroot/publisher"
+
+#: The prefix this peer's published trie keys are relative to
+#: (EXTENSION-TREE §3.3a, ruled 2026-08-08). ``"/"`` designates the
+#: **universal tree**: we key the trie by ``event.uri`` /
+#: ``entity_tree.all_bindings()``, both of which are the full normalized
+#: ``/{peer_id}/system/...`` path, so the §3.3 trim is a **no-op** and the
+#: relative_key IS the absolute path. That is a legal §3.3 shape, not a
+#: missing trim — Go declares ``"system/"`` and Rust ``"/{peer_id}/"``, and
+#: all three key correctly for their own declared prefix.
+#:
+#: This value is load-bearing and not cosmetic: a consumer reconstructs
+#: ``prefix + relative_key`` and resolves it on our tree-face, so declaring a
+#: prefix that does not describe the actual keys yields a path we do not
+#: have. It is single-sourced here because the declaration and the keying
+#: must move together — the failure mode is a root that verifies and then
+#: walks to nothing.
+PUBLISHED_ROOT_PREFIX = "/"
+
 
 class PublishedRootError(Exception):
     """Raised when a published-root fails verification.
@@ -82,6 +108,7 @@ def build_published_root(
     seq: int,
     published_at: int,
     *,
+    prefix: str = PUBLISHED_ROOT_PREFIX,
     predecessor: bytes | None = None,
     algorithm: int | None = None,
 ) -> tuple[Entity, Entity]:
@@ -96,12 +123,25 @@ def build_published_root(
         root_hash: the current tree root the publisher commits to (bytes).
         seq: monotonic freshness counter (reject `seq < cached` on read).
         published_at: ms-since-epoch timestamp.
+        prefix: §3.3a — the prefix the trie keys are relative to. Defaults to
+            :data:`PUBLISHED_ROOT_PREFIX`, which is what this peer's keying
+            actually is; a caller overriding it is asserting a different
+            keying and MUST key that way.
         predecessor: prior published-root content hash for chain audit.
         algorithm: active content_hash_format (v7.69 §4.5a); None → default.
+
+    Raises:
+        PublishedRootError: if ``prefix`` does not end with ``/`` (§3.3a MUST).
     """
+    if not prefix.endswith("/"):
+        raise PublishedRootError(
+            "invalid_published_root",
+            f"prefix {prefix!r} does not end with '/' (§3.3a MUST)",
+        )
     data: dict[str, object] = {
         "peer_id": keypair.peer_id,
         "root_hash": root_hash,
+        "prefix": prefix,
         "seq": seq,
         "published_at": published_at,
     }
@@ -115,24 +155,143 @@ def build_published_root(
     return pr_entity, signature_entity
 
 
-def closure_scope_for_published_root(entity_tree: "Any", content_store: "Any") -> "Any":
-    """Build a ``ClosureScope`` serving the current published-root's signed
-    closure — the trie nodes + bound entities reachable from ``root_hash``,
-    plus the published-root entity and its signature.
+class PublishedRootRepublisher:
+    """Internal emit hook: re-mint the signed root on every root change.
 
-    This is the publisher-side half of the C2 signed-root walk: it makes a
-    static http-poll mirror serve exactly the set a consumer needs to fetch
-    the root, verify its signature, and walk the hash-chain from it.
+    `PROPOSAL-PEER-MANIFEST` §4 requires a fresh signed
+    ``system/peer/published-root`` **on every tree-root change**, with `seq`
+    advancing and `predecessor` chaining. Python minted exactly once, at
+    startup, so `seq` stayed 0 and the manifest never changed after boot.
 
-    Raises :class:`PublishedRootError` if ``publish_root()`` hasn't run.
+    Two guards keep it from chasing its own tail:
+
+    * **Self-write tag.** ``publish_root()`` stamps
+      :data:`PUBLISHER_HANDLER_PATTERN` on its own two emits; events
+      carrying it are ignored. They land in the same tree this hook
+      watches, so untagged they would re-fire it indefinitely.
+    * **Coalescing.** A burst of writes (a handler binding several
+      entities, a cascade) should produce **one** republish, not one per
+      binding. Under a running event loop the hook only marks work pending
+      and ``call_soon`` runs the publish once the current callback chain
+      unwinds; the trie rebuild is O(bindings), so per-write publishing
+      would put it on the critical path of every write. With no loop
+      running (unit tests, synchronous embedding) it publishes inline,
+      which keeps the same observable contract.
+
+    ``on_change_sync`` never raises: it runs inline inside ``emit()``, and
+    a publish failure must not fail the operator's write. Failures are
+    logged.
     """
+
+    def __init__(self, peer: Any) -> None:
+        self._peer = peer
+        self._publishing = False
+        self._scheduled = False
+        self._dirty = False
+        self._root = self._seed_root()
+
+    def _seed_root(self) -> bytes | None:
+        """Take the trie root the last publish committed to, if any."""
+        pr_hash = self._peer.entity_tree.get("system/peer/published-root")
+        if pr_hash is None:
+            return None
+        pr = self._peer.content_store.get(pr_hash)
+        if pr is None or pr.type != PUBLISHED_ROOT_TYPE:
+            return None
+        root = pr.data.get("root_hash")
+        return bytes(root) if isinstance(root, bytes) else None
+
+    def on_change_sync(self, event: Any) -> int | None:
+        ctx = getattr(event, "context", None)
+        if ctx is not None and getattr(ctx, "handler_pattern", None) == (
+            PUBLISHER_HANDLER_PATTERN
+        ):
+            return None
+        if self._publishing:
+            return None
+        self._apply(event)
+        self._schedule()
+        return None
+
+    def _apply(self, event: Any) -> None:
+        """Fold one binding change into the running trie root.
+
+        EXTENSION-TREE v3.8 §3.4.2: an incremental ``trie_put`` /
+        ``trie_remove`` sequence is hash-equivalent to ``build_trie`` over
+        the equivalent binding set (pinned in
+        ``tests/unit/test_trie_incremental.py``), so the root published
+        here is the same root a full rebuild would produce — at O(log N)
+        per change instead of O(N log N).
+
+        The republisher's own two bindings never reach this method (the
+        self-write tag filters them upstream), so the committed set is the
+        tree minus the published-root and its signature. That is the set
+        the closure already assumed: both are published *after* the trie is
+        built, which is why ``ClosureScope`` carries them as
+        ``also_serve_hashes`` rather than finding them inside the walk.
+        """
+        from entity_core.storage.emit import ChangeKind
+        from entity_core.storage.trie import empty_trie, trie_put, trie_remove
+
+        cs = self._peer.content_store
+        if self._root is None:
+            self._root = empty_trie(cs)
+        try:
+            if event.kind is ChangeKind.DELETED:
+                self._root = trie_remove(self._root, event.uri, cs)
+            elif event.hash is not None:
+                self._root = trie_put(self._root, event.uri, event.hash, cs)
+            else:
+                return
+        except Exception:  # pragma: no cover - defensive
+            import logging
+
+            logging.getLogger(__name__).exception(
+                "incremental trie update failed for %s; falling back to a "
+                "full rebuild on the next publish",
+                getattr(event, "uri", "?"),
+            )
+            self._root = None
+        self._dirty = True
+
+    def _schedule(self) -> None:
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.publish_now()
+            return
+        if self._scheduled:
+            return
+        self._scheduled = True
+        loop.call_soon(self.publish_now)
+
+    def publish_now(self) -> None:
+        """Run a pending republish immediately (also the ``call_soon`` target)."""
+        import logging
+
+        self._scheduled = False
+        if self._publishing or not self._dirty:
+            return
+        self._publishing = True
+        try:
+            self._peer.publish_root(root_hash=self._root)
+            self._dirty = False
+        except Exception:  # pragma: no cover - defensive
+            logging.getLogger(__name__).exception(
+                "published-root republish failed",
+            )
+        finally:
+            self._publishing = False
+
+
+def _closure_scope_for_pr_hash(
+    entity_tree: Any, content_store: Any, pr_hash: bytes
+) -> Any:
+    """Build a static ``ClosureScope`` over one specific published-root."""
     from entity_core.peer.serving import ClosureScope
 
-    pr_hash = entity_tree.get("system/peer/published-root")
-    if pr_hash is None:
-        raise PublishedRootError(
-            "no_published_root", "no published-root bound; call publish_root() first",
-        )
     pr = content_store.get(pr_hash)
     if pr is None or pr.type != PUBLISHED_ROOT_TYPE:
         raise PublishedRootError("no_published_root", "published-root not in content store")
@@ -148,6 +307,89 @@ def closure_scope_for_published_root(entity_tree: "Any", content_store: "Any") -
     )
 
 
+class LivePublishedRootScope:
+    """A ``ScopePredicate`` that tracks the **current** published-root.
+
+    §6.5.6 Amendment 10 closure timing, ruled (a) recompute-on-root-change
+    **MUST** (arch ``c78b3dc``): the served closure tracks
+    ``published-root.root_hash`` *as it stands now*. An entity bound since
+    the last publish becomes servable **at the republish** — so the scope
+    cannot be a snapshot taken when the listener was built.
+
+    ``ClosureScope`` walks its closure once at construction and caches it,
+    which is right for a pinned root (``--serve-closure-root <hex>``) and
+    wrong for ``@published``: it froze the served set at startup. Combined
+    with a publisher that only minted once, every entity written after boot
+    was permanently outside the served set — a publisher that could never
+    publish anything.
+
+    This wrapper re-derives the closure when — and only when — the
+    published-root binding changes hash. Steady-state cost is one tree
+    lookup per query; the trie walk happens once per republish.
+
+    If the published-root binding disappears after construction, the last
+    known closure is retained rather than failing open or throwing from a
+    serving path: the old closure is a set the publisher genuinely signed,
+    so serving it is conservative, whereas an exception mid-request would
+    surface as a 500 on a route the spec pins at 200/404.
+    """
+
+    def __init__(self, entity_tree: Any, content_store: Any) -> None:
+        self._entity_tree = entity_tree
+        self._content_store = content_store
+        pr_hash = entity_tree.get("system/peer/published-root")
+        if pr_hash is None:
+            raise PublishedRootError(
+                "no_published_root",
+                "no published-root bound; call publish_root() first",
+            )
+        self._pr_hash = bytes(pr_hash)
+        self._inner = _closure_scope_for_pr_hash(
+            entity_tree, content_store, self._pr_hash
+        )
+
+    def _current(self) -> Any:
+        pr_hash = self._entity_tree.get("system/peer/published-root")
+        if pr_hash is None:
+            return self._inner
+        pr_hash = bytes(pr_hash)
+        if pr_hash != self._pr_hash:
+            try:
+                self._inner = _closure_scope_for_pr_hash(
+                    self._entity_tree, self._content_store, pr_hash
+                )
+            except PublishedRootError:
+                return self._inner
+            self._pr_hash = pr_hash
+        return self._inner
+
+    def in_scope(self, h: bytes) -> bool:
+        return self._current().in_scope(h)
+
+    def in_scope_path(self, path: str) -> bool:
+        return self._current().in_scope_path(path)
+
+    def prefix_in_scope(self, prefix: str) -> bool:
+        return self._current().prefix_in_scope(prefix)
+
+    def describe(self) -> str:
+        return f"closure:@published:{self._current().root_hash.hex()[:16]}"
+
+
+def closure_scope_for_published_root(entity_tree: Any, content_store: Any) -> Any:
+    """Serve the signed closure of the peer's **current** published-root.
+
+    The publisher-side half of the C2 signed-root walk: it makes a static
+    http-poll mirror serve exactly the set a consumer needs to fetch the
+    root, verify its signature, and walk the hash-chain from it — and it
+    follows the root as the publisher republishes (see
+    :class:`LivePublishedRootScope`).
+
+    Raises :class:`PublishedRootError` if ``publish_root()`` hasn't run.
+    """
+    return LivePublishedRootScope(entity_tree, content_store)
+
+
 def verify_published_root(
     pr_entity: Entity,
     signature_entity: Entity | None,
@@ -160,7 +402,13 @@ def verify_published_root(
     consumer MUST NOT walk the tree from an unverified root, §1.1).
 
     Checks (in order):
-      1. entity is a well-formed ``system/peer/published-root``.
+      1. entity is a well-formed ``system/peer/published-root`` — including
+         `prefix`, REQUIRED per §3.3a and MUST end with ``/``. A root without
+         it is not merely under-described: the consumer holds `relative_key`s
+         and no operand to reconstruct an absolute path with, so the
+         hash-chain walk this verification exists to authorize cannot be
+         performed. Fail closed rather than guess a prefix — guessing is how
+         one impl's convention becomes everyone's default.
       2. publisher pubkey derivable from `peer_id` (canonical V7 §1.5 form).
       3. signature entity present, targets the root's content hash.
       4. signature verifies cryptographically against the publisher pubkey.
@@ -180,11 +428,19 @@ def verify_published_root(
     data = pr_entity.data
     peer_id = data.get("peer_id")
     root_hash = data.get("root_hash")
+    prefix = data.get("prefix")
     seq = data.get("seq")
     if not isinstance(peer_id, str):
         raise PublishedRootError("invalid_published_root", "peer_id missing or not a string")
     if not isinstance(root_hash, bytes):
         raise PublishedRootError("invalid_published_root", "root_hash missing or not bytes")
+    if not isinstance(prefix, str) or not prefix.endswith("/"):
+        raise PublishedRootError(
+            "invalid_published_root",
+            "prefix missing, not a string, or does not end with '/' "
+            "(§3.3a REQUIRED — without it the trie keys have no operand to "
+            "reconstruct absolute paths from)",
+        )
     if not isinstance(seq, int):
         raise PublishedRootError("invalid_published_root", "seq missing or not an int")
 

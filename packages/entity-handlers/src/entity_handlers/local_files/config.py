@@ -109,14 +109,43 @@ def resolve_fs_path(root: RootMapping, tree_path: str) -> tuple[str, str]:
     resolved = os.path.join(canonical_parent, os.path.basename(fs_path))
 
     canonical_root_with_sep = canonical_root.rstrip(os.sep) + os.sep
-    if not (
-        resolved == canonical_root
-        or resolved.startswith(canonical_root_with_sep)
-    ):
+
+    def _inside(path: str) -> bool:
+        return path == canonical_root or path.startswith(
+            canonical_root_with_sep
+        )
+
+    if not _inside(resolved):
         raise PermissionError(
             f"path traversal rejected: {tree_path!r} escapes root "
             f"{root.filesystem_root!r}"
         )
+
+    # The leaf itself. Canonicalizing only the parent leaves a symlink
+    # AT the final component unexpanded, and the containment test above
+    # then measures the link's own name — which is inside the root by
+    # construction — instead of its target. The read path's
+    # ``O_NOFOLLOW`` catches that at open time, but only for a symlink
+    # whose target RESOLVES: callers stat the path first, and
+    # ``os.path.exists`` follows the link, so a symlink pointing at a
+    # path that does not exist here (the ordinary shape when the root is
+    # a container mount and the target is a host path) reports 404
+    # file_not_found and never reaches the open. §8.3 MUST + §865 pin
+    # the answer at 403 ``path_traversal_rejected``, and the two are
+    # different claims: 404 says "no such file", 403 says "this escapes
+    # the mount and I am refusing it". Expand the leaf here so every
+    # caller — read, write, list, delete, and the reverse-sync path —
+    # gets the traversal answer before it gets an existence answer.
+    if os.path.islink(resolved):
+        try:
+            leaf_target = os.path.realpath(resolved)
+        except OSError:
+            leaf_target = resolved
+        if not _inside(leaf_target):
+            raise PermissionError(
+                f"path traversal rejected: {tree_path!r} is a symlink to "
+                f"{leaf_target!r}, outside root {root.filesystem_root!r}"
+            )
 
     return fs_path, relative_path
 

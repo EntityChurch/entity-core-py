@@ -25,7 +25,7 @@ from entity_handlers.signaling import (
     OP_COLLECT,
     OP_OFFER,
     PATTERN,
-    TYPE_ADVERTISEMENT,
+    TYPE_ADVERTISE_RESULT,
     TYPE_COLLECT_REQUEST,
     TYPE_OFFER_REQUEST,
     Backoff,
@@ -85,18 +85,21 @@ def _collect_result(blobs: list[bytes]) -> dict[str, Any]:
 
 
 def _advertisement(lobby: str | None = None) -> dict[str, Any]:
-    data: dict[str, Any] = {
-        "endpoint": "node-a:4050",
-        "limits": {
-            "bucket_ttl_ms": 60_000,
-            "max_keys": 4096,
-            "max_message_bytes": 8192,
-            "max_messages_per_key": 32,
-        },
+    """The committed §4.5 `advertise-result`: `limits` carries the three
+    published bounds, and a `lobby` override rides INSIDE it as
+    `lobby_constant` bytes (§4.5 types it `primitive/bytes` — it is a
+    derivation input §3.1 hashes verbatim, not a label)."""
+    limits: dict[str, Any] = {
+        "max_blob_bytes": 8192,
+        "max_bucket_blobs": 32,
+        "ttl_seconds": 60,
     }
     if lobby is not None:
-        data["lobby"] = lobby
-    return {"type": TYPE_ADVERTISEMENT, "data": data}
+        limits["lobby_constant"] = lobby.encode("utf-8")
+    return {
+        "type": TYPE_ADVERTISE_RESULT,
+        "data": {"endpoint": "node-a:4050", "limits": limits},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -213,10 +216,9 @@ async def test_the_advertisement_decodes_endpoint_limits_and_lobby():
     stub = StubDispatcher([_ok(_advertisement())])
     ad = await SignalingClient(stub, NODE).advertise()
     assert ad.endpoint == "node-a:4050"
-    assert ad.limits.bucket_ttl_ms == 60_000
-    assert ad.limits.max_message_bytes == 8192
-    assert ad.limits.max_messages_per_key == 32
-    assert ad.limits.max_keys == 4096
+    assert ad.limits.ttl_seconds == 60
+    assert ad.limits.max_blob_bytes == 8192
+    assert ad.limits.max_bucket_blobs == 32
     # Absent → no override, and the client derives from the default constant.
     assert ad.lobby is None
     assert ad.lobby_constant == LOBBY_DEFAULT
@@ -239,7 +241,7 @@ async def test_a_lobby_override_is_carried_and_a_default_normalizes_away():
 def test_limits_is_a_bare_map_not_an_entity_wrapper():
     """It is a field typed as a specific struct, not as ``core/entity``."""
     ad = advertisement_from_result(_advertisement())
-    assert ad.limits.max_keys == 4096
+    assert ad.limits.max_blob_bytes == 8192
 
     wrapped = _advertisement()
     wrapped["data"]["limits"] = {

@@ -554,7 +554,32 @@ async def _peer_issued_resolve(
         if sig is not None and sig.type == "system/signature":
             ctx.emit_pathway.emit(f"system/signature/{binding_hash.hex()}", sig, emit_ctx)
 
-    # 3. cache the binding at the universal location (it becomes a precede).
+    # 3. the by-target revocation index (EXTENSION-REGISTRY §6a.6, normative)
+    # — an O(1) index lookup, not a scan.
+    #
+    # This probe is the ONLY thing that can tell a revoked binding from a good
+    # one: a revocation is a separate entity the registry publishes *after* the
+    # binding, so the binding body carries no trace of it and a revoked binding
+    # verifies, is in-date, and is signed by the pin. Skip the lookup and the
+    # peer serves a revoked name while every other check passes
+    # (REG-PEERISSUED-REVOKED-1). The revocation and its signature are pulled
+    # into the local store so §6a.4's fail-closed exclusion runs in `_validate`
+    # → `_is_revoked` — the same-authority check the precedes path already
+    # gets, not a second implementation of it at the remote seam.
+    rev_hash = await reader.tree_get(REVOCATION_BY_TARGET_PREFIX + binding_hash.hex())
+    if rev_hash is not None:
+        rev = await reader.content_get(rev_hash)
+        if rev is not None and rev.type == REVOCATION_TYPE:
+            ctx.emit_pathway.emit(
+                REVOCATION_BY_TARGET_PREFIX + binding_hash.hex(), rev, emit_ctx,
+            )
+            rev_sig_hash = await reader.tree_get(f"system/signature/{rev_hash.hex()}")
+            if rev_sig_hash is not None:
+                rev_sig = await reader.content_get(rev_sig_hash)
+                if rev_sig is not None and rev_sig.type == "system/signature":
+                    ctx.emit_pathway.emit(f"system/signature/{rev_hash.hex()}", rev_sig, emit_ctx)
+
+    # 4. cache the binding at the universal location (it becomes a precede).
     ctx.emit_pathway.emit(BINDING_PREFIX + binding_hash.hex(), fetched, emit_ctx)
 
     ta = _trust_anchor_for_kind("peer-issued", backend_id)

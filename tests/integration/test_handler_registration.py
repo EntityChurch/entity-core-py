@@ -101,7 +101,7 @@ class TestBuiltinManifests:
         """ALL_HANDLER_MANIFESTS contains all built-in manifests."""
         # 23 = prior 22 + capability handler (V7 §6.2 Resolution B; backs
         # the default `system/capability:request` connect grant)
-        assert len(ALL_HANDLER_MANIFESTS) == 27  # +system/network (A12 rung 3)
+        assert len(ALL_HANDLER_MANIFESTS) == 28  # +system/signaling (SIGNALING §4/§5 node role)
         names = [m.data["name"] for m in ALL_HANDLER_MANIFESTS]
         assert "system" in names
         assert "storage" in names
@@ -217,7 +217,7 @@ class TestPeerHandlerRegistration:
         # backs the default `system/capability:request` connect grant) +
         # system/registry (EXTENSION-REGISTRY v1.0). All bootstrap-registered
         # from ALL_HANDLER_MANIFESTS regardless of which handlers run.
-        assert len(patterns) == 27  # +system/network (A12 rung 3)
+        assert len(patterns) == 28  # +system/signaling (SIGNALING §4/§5 node role)
         assert "system" in patterns
         assert "*" in patterns
         assert "system/protocol/connect" in patterns
@@ -251,7 +251,7 @@ class TestPeerHandlerRegistration:
         prefix = peer.entity_tree.normalize_uri("system/handler/")
         uris = peer.entity_tree.list_prefix(prefix)
 
-        assert len(uris) == 27  # +system/network (A12 rung 3)
+        assert len(uris) == 28  # +system/signaling (SIGNALING §4/§5 node role)
         assert any("system/handler/system" in uri and "system/handler/system/" not in uri for uri in uris)
         assert any("system/handler/*" in uri for uri in uris)
         assert any("system/handler/system/protocol/connect" in uri for uri in uris)

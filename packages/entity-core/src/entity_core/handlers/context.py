@@ -169,6 +169,25 @@ class HandlerContext:
     # on peers that don't install it. Advertisement (§3) is seeded at
     # bootstrap, not surfaced via the inbox handler.
     durability_policy: "DurabilityPolicy | None" = None
+    # EXTENSION-NETWORK §6.7.1 — the accept-side transport source of the
+    # connection THIS request arrived on. Deliberately the bare fact and not a
+    # connection handle: §6.7.1 declines to widen the general handler context
+    # and asks for "a narrow, NETWORK-scoped accept-side path from the
+    # connection to this operation", and one immutable string is the narrowest
+    # shape that carries it. Go's equivalent is `HandlerContext.ConnectionState`
+    # (an opaque handle the network handler casts); we hand over only the field
+    # that handler would read, so no other handler can reach connection
+    # internals through it.
+    #
+    # Set ONLY on dispatch from an accepted connection. `None` for
+    # in-process/self dispatch and for reentry over a dialed connection —
+    # neither has an observed transport source, and §6.7's handlers answer 400
+    # rather than substitute one.
+    #
+    # MUST NOT be persisted (§6.7.1 MUST 2). It is read from the live
+    # connection and returned; it is not connection-state, not a transport
+    # profile, and not a peer attribute.
+    observed_source_address: str | None = None
     _execute_dispatcher: ExecuteDispatcher | None = None
     # EXTENSION-RELAY §3.1.1 terminal-hop hookpoint. A coroutine
     # ``(destination_peer_id: str, inner_entity) -> bool`` that delivers the

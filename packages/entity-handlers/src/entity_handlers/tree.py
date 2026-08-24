@@ -352,9 +352,18 @@ async def _handle_put(
                 f"expected_hash does not match current binding at {request_path}",
             )
 
-    # Remove binding if entity is null/absent
+    # Remove binding if entity is null/absent.
+    #
+    # Through the emit pathway, not `entity_tree.remove` — an unbind is a
+    # tree-root change like any other, and a raw tree mutation emits no
+    # ChangeEvent, so every consumer of the cascade misses it: subscribers
+    # never learn the path was unbound, and the published-root republisher
+    # (PROPOSAL-PEER-MANIFEST §4, "on every tree-root change") keeps
+    # advertising a root that still commits to the deleted binding.
     if entity_data is None:
-        ctx.emit_pathway.entity_tree.remove(full_uri)
+        ctx.emit_pathway.delete(
+            full_uri, EmitContext.from_handler_context(ctx, "put")
+        )
         return {
             "status": 200,
             "result": {

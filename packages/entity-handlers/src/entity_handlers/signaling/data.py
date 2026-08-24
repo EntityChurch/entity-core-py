@@ -44,7 +44,11 @@ TYPE_OFFER_REQUEST = "system/signaling/offer-request"
 TYPE_OFFER_RESULT = "system/signaling/offer-result"
 TYPE_COLLECT_REQUEST = "system/signaling/collect-request"
 TYPE_COLLECT_RESULT = "system/signaling/collect-result"
-TYPE_ADVERTISEMENT = "system/signaling/advertisement"
+#: EXTENSION-SIGNALING §4.5 / §12. Was ``system/signaling/advertisement`` with
+#: the pre-v1.0 PROPOSAL-CONNECTION-NODE limits shape until the 2026-08-08
+#: re-diff; see :class:`Limits` for why that could never have decoded a Go or
+#: Rust node's answer.
+TYPE_ADVERTISE_RESULT = "system/signaling/advertise-result"
 
 #: ``advertise`` takes no arguments, but an EXECUTE still carries a params entity
 #: and a node rejects empty ``data`` — so we send an empty CBOR map, the encoding
@@ -118,36 +122,57 @@ def collect_messages_from_result(result: Any) -> list[bytes]:
 
 @dataclass(frozen=True)
 class Limits:
-    """The node's advisory-to-peers, binding-on-the-node bounds (§1.1).
+    """`system/signaling/limits` — the node's advisory-to-peers,
+    binding-on-the-node bounds (§4.5).
 
     A **bare CBOR map** on the wire, not an entity wrapper. The node **refuses,
-    never evicts** — eviction would reproduce exactly the silent-never-meet shape,
-    with the evicted peer believing it is at the key and waiting.
+    never evicts** — eviction would reproduce exactly the silent-never-meet
+    shape, with the evicted peer believing it is at the key and waiting.
+
+    **These field names are the committed §4.5 ones, and the units are
+    load-bearing.** This decoder read the pre-v1.0 PROPOSAL-CONNECTION-NODE
+    shape (`bucket_ttl_ms` / `max_message_bytes` / `max_messages_per_key` /
+    `max_keys`, with `lobby` a top-level text field) until the 2026-08-08
+    re-diff against the committed corpus. Go and Rust both emit §4.5, so that
+    client could not decode either cohort node's `advertise` — it raised on the
+    first missing field, at step one of every meet. `ttl_seconds` versus the
+    drifted `bucket_ttl_ms` is additionally a 1000× reap race even where a
+    decode limped through.
+
+    `max_keys` is deliberately absent: it is a node-internal backstop, not one
+    of §4.5's published limits (same call as Rust's).
     """
 
-    bucket_ttl_ms: int
-    max_message_bytes: int
-    max_messages_per_key: int
-    max_keys: int
+    max_blob_bytes: int
+    max_bucket_blobs: int
+    ttl_seconds: int
+    #: `lobby_constant`, the node's `lobby` override, or ``None`` for "I use
+    #: the default". **Absent, never null** on the wire; a value equal to
+    #: :data:`LOBBY_DEFAULT` normalizes back to ``None`` so a decoded
+    #: advertisement compares equal to one from a node that never set it.
+    #: §4.5 types it `primitive/bytes` because it is a derivation input (§3.1
+    #: hashes it verbatim), not a label to display.
+    lobby_constant: str | None = None
 
 
 @dataclass(frozen=True)
 class Advertisement:
-    """What ``advertise`` answers: the node's endpoint, limits and lobby constant.
+    """`system/signaling/advertise-result` — the node's endpoint and limits.
 
     Attributes:
         endpoint: The advertised endpoint string. Weight is computed over these
             bytes **exactly as published** (§3.1.1), so it is never normalized.
-        limits: The node's bounds.
-        lobby: The node's ``lobby`` override, or ``None`` for "I use the
-            default". **Absent, never null** on the wire; a value equal to
-            :data:`LOBBY_DEFAULT` normalizes back to ``None`` so a decoded
-            advertisement compares equal to one from a node that never set it.
+        limits: The node's bounds, carrying the `lobby` override if any.
     """
 
     endpoint: str
     limits: Limits
-    lobby: str | None = None
+
+    @property
+    def lobby(self) -> str | None:
+        """The node's `lobby` override, or ``None``. §4.5 moved this inside
+        `limits`; kept as a property so call sites read the same."""
+        return self.limits.lobby_constant
 
     @property
     def lobby_constant(self) -> str:
@@ -162,20 +187,40 @@ def advertisement_from_result(result: Any) -> Advertisement:
     limits = data.get("limits")
     if not isinstance(limits, dict):
         raise SignalingDecodeError("missing/invalid map field limits")
-    lobby = data.get("lobby")
-    if lobby is not None and not isinstance(lobby, str):
-        raise SignalingDecodeError("invalid text field lobby")
     return Advertisement(
         endpoint=_field_text(data, "endpoint"),
-        # Absent → no override; a present-but-default value normalizes away.
-        lobby=None if lobby is None or lobby == LOBBY_DEFAULT else lobby,
         limits=Limits(
-            bucket_ttl_ms=_field_int(limits, "bucket_ttl_ms"),
-            max_message_bytes=_field_int(limits, "max_message_bytes"),
-            max_messages_per_key=_field_int(limits, "max_messages_per_key"),
-            max_keys=_field_int(limits, "max_keys"),
+            max_blob_bytes=_field_int(limits, "max_blob_bytes"),
+            max_bucket_blobs=_field_int(limits, "max_bucket_blobs"),
+            ttl_seconds=_field_int(limits, "ttl_seconds"),
+            lobby_constant=_lobby_override(limits),
         ),
     )
+
+
+def _lobby_override(limits: dict[str, Any]) -> str | None:
+    """Read `limits.lobby_constant` (§4.5): bytes, absent when not overridden.
+
+    Non-UTF-8 bytes decode to ``None`` rather than raising — it is an override
+    this peer cannot derive with, and MUST-ignore says skip the field, not the
+    message. A present-but-default value normalizes away.
+    """
+    raw = limits.get("lobby_constant")
+    if raw is None:
+        return None
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            value = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(raw, str):
+        # Tolerated on read: a node emitting text here is off-spec (§4.5 says
+        # bytes), but the value is still usable and dropping it would strand a
+        # deployment's whole lobby.
+        value = raw
+    else:
+        return None
+    return None if value == LOBBY_DEFAULT else value
 
 
 # ---------------------------------------------------------------------------

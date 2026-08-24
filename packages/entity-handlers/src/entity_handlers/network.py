@@ -76,6 +76,11 @@ from entity_core.protocol.auth import (
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
 from entity_handlers._common import error_response, ok_response
+from entity_handlers.reachability import (
+    OP_CHECK_REACHABILITY,
+    OP_OBSERVE_ADDRESS,
+    ReachabilityOps,
+)
 
 if TYPE_CHECKING:
     from entity_core.peer.peer import Peer
@@ -328,6 +333,10 @@ class NetworkExtension(Extension):
         self._execute = None
         self._keypair = None
         self._sessions: dict[str, _MaintainSession] = {}
+        # §6.7 — holds only the two per-requester rate limiters. No peer or
+        # storage seam: the facts are read from the live connection and
+        # returned, never persisted (§6.7.1 MUST 2).
+        self._reachability = ReachabilityOps()
 
     # -- Extension lifecycle --------------------------------------------------
 
@@ -399,6 +408,12 @@ class NetworkExtension(Extension):
             return await self._handle_reconnect(params_data, ctx)
         elif operation == "restore-subscriptions":
             return await self._handle_restore_subscriptions(params_data, ctx)
+        # §6.7 reachability facts. Both read the accept-side observed source
+        # off `ctx` and NOTHING off `params_data` — see reachability.py.
+        elif operation == OP_OBSERVE_ADDRESS:
+            return await self._reachability.handle_observe_address(ctx)
+        elif operation == OP_CHECK_REACHABILITY:
+            return await self._reachability.handle_check_reachability(ctx)
         return error_response(
             501,
             "unsupported_operation",

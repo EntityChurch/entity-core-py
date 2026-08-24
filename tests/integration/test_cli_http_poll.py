@@ -205,7 +205,15 @@ async def test_cli_publish_root_serves_verifiable_walk():
             # walk the trie from root_hash (CONTENT_GET of interior nodes).
             pr, bindings = await client.fetch()
             assert pr.type == "system/peer/published-root"
-            assert pr.data["seq"] == 0
+            # `seq` is whatever the publisher has reached, NOT 0. Since the
+            # republish fix (c896e66) the publisher re-mints on every tree
+            # change rather than once at startup, so any write landing before
+            # the consumer's fetch advances it — a `== 0` pin passes or fails
+            # on timing luck, and it also asserts exactly the once-at-startup
+            # behaviour that fix removed. What this test is actually about is
+            # the verifiable walk below.
+            assert isinstance(pr.data["seq"], int)
+            assert pr.data["seq"] >= 0
             # The signed root commits to real trie nodes (closure walked).
             assert isinstance(bindings, dict)
         finally:

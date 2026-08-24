@@ -177,6 +177,13 @@ class TestConnectedOnEstablish:
                 assert conn_ent.data["peer_id"] == client.peer_id
                 assert conn_ent.data["transport"] == "tcp"
                 assert conn_ent.data["status"] == "active"
+                # EXTENSION-NETWORK §6.7.1 MUST 2: the responder records NO
+                # address. `address` means "the endpoint I dial to reach this
+                # peer" — dialer-side state — and the accepted connection's
+                # ephemeral source port is not one. Writing it here yields a
+                # routable-looking value that routes nowhere, which §10 and
+                # `system/peer/status` would then consume as dialable.
+                assert conn_ent.data["address"] == ""
                 established_at = conn_ent.data["established_at"]
 
                 # Responder status entity carries the path ref too.

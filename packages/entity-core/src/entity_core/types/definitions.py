@@ -4958,6 +4958,16 @@ def type_system_peer_published_root() -> Entity:
     transport-profile `peer_id` to Base58) + REGISTRY F-PY-REG-5. The
     Base58 form is also what lets the consumer derive the publisher pubkey
     locally for verification. Flagged to the cohort for Go P1 convergence.
+
+    `prefix` is REQUIRED per EXTENSION-TREE §3.3a (arch `391c92b`, ruled
+    2026-08-08). `snapshot`/`extract`/`merge` take the prefix as an
+    operational parameter of the *request*; a published root has no request —
+    it is fetched by a consumer who was not present at publish time — so the
+    operand for §3.3's `absolute_prefix + relative_key` reconstruction has to
+    travel in the entity or the hash-chain walk is underspecified at its first
+    step. Required rather than optional-with-a-default, because any default
+    would silently promote one impl's key convention to "the answer you get
+    for saying nothing."
     """
     return Entity(
         type="system/type",
@@ -4966,6 +4976,7 @@ def type_system_peer_published_root() -> Entity:
             "fields": {
                 "peer_id": {"type_ref": "system/peer-id"},
                 "root_hash": {"type_ref": "system/hash"},
+                "prefix": {"type_ref": "system/tree/path"},
                 "seq": {"type_ref": "primitive/uint"},
                 "published_at": {"type_ref": "primitive/uint"},
                 "predecessor": {"type_ref": "system/hash", "optional": True},
@@ -5362,6 +5373,169 @@ def type_system_network_close_request() -> Entity:
             "fields": {
                 "peer_id": {"type_ref": "system/peer-id"},
                 "reason": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
+def type_system_network_observe_address_result() -> Entity:
+    """`system/network/observe-address-result` — §6.7.1 reflection output.
+
+    `observed_address` is the transport-layer source of the connection the
+    request arrived on. §6.7.1 MUST 1: it is NEVER a value echoed from the
+    request body. MUST 2: it is never persisted to `system/connection.address`,
+    a `system/peer/transport/*` profile, or `system/peer/status`.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/observe-address-result",
+            "fields": {
+                "observed_address": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
+def type_system_network_check_reachability_result() -> Entity:
+    """`system/network/check-reachability-result` — §6.7.2 dial-back output.
+
+    `address_tested` is echoed back so the requester can confirm WHICH address
+    was proved rather than inferring it — and the value is always the
+    responder's own observation, never one the requester supplied (the
+    load-bearing anti-DDoS-reflector MUST).
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/check-reachability-result",
+            "fields": {
+                "reachable": {"type_ref": "primitive/bool"},
+                "address_tested": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
+def type_system_network_candidate() -> Entity:
+    """`system/network/candidate` — §6.7.3 typed reachability candidate.
+
+    Session-scoped and ephemeral. §6.7.3 MUST: a candidate is NOT modelled as
+    a durable `system/peer/transport/{peer}/{profile-id}` profile — candidates
+    change per session and per NAT mapping, and one written as a durable
+    profile goes stale instantly and mis-routes every later dispatch that
+    reads it. Candidates travel inside coordination messages, never as
+    published tree state.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/network/candidate",
+            "fields": {
+                "address": {"type_ref": "primitive/string"},
+                "type": {"type_ref": "primitive/string"},
+                "substrate": {"type_ref": "primitive/string"},
+            },
+        },
+    )
+
+
+def type_system_signaling_offer_request() -> Entity:
+    """`system/signaling/offer-request` — §4.1 input of `offer`.
+
+    `rendezvous_key` is exactly 33 bytes and **opaque**: the node derives
+    nothing and knows nothing about §3's modes, comparing keys byte-wise.
+    `message` is an opaque blob whose framing is pinned peer-side (§6.2) — the
+    node never decodes it and never needs to.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/offer-request",
+            "fields": {
+                "rendezvous_key": {"type_ref": "primitive/bytes"},
+                "message": {"type_ref": "primitive/bytes"},
+            },
+        },
+    )
+
+
+def type_system_signaling_offer_result() -> Entity:
+    """`system/signaling/offer-result` — §4.1 output of `offer`."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/offer-result",
+            "fields": {"ok": {"type_ref": "primitive/bool"}},
+        },
+    )
+
+
+def type_system_signaling_collect_request() -> Entity:
+    """`system/signaling/collect-request` — §4.1 input of `collect`."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/collect-request",
+            "fields": {"rendezvous_key": {"type_ref": "primitive/bytes"}},
+        },
+    )
+
+
+def type_system_signaling_collect_result() -> Entity:
+    """`system/signaling/collect-result` — §4.1 output of `collect`.
+
+    Deposit order, **oldest first** (§5 pin 4) — two nodes scanning in
+    different orders answer *different peers* out of one shared `lobby`
+    bucket. Empty list when the key holds nothing; never an error.
+
+    The blobs themselves, never their hashes: a hash reply would need a fetch
+    surface the node structurally does not have (§1.2 — no bulk storage), and
+    an unwrapped client holds no entity machinery to resolve one.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/collect-result",
+            "fields": {
+                "messages": {"array_of": {"type_ref": "primitive/bytes"}},
+            },
+        },
+    )
+
+
+def type_system_signaling_limits() -> Entity:
+    """`system/signaling/limits` — §4.5 published bucket and TTL limits.
+
+    Clients read these rather than assuming them: a limit the client does not
+    know is a cross-implementation reject boundary, where one peer offers
+    64 KiB at a node that stops at 4 KiB and the failure presents as a
+    rendezvous miss. `lobby_constant` is present only if the deployment
+    overrides `lobby:default`, and is bytes because §3.1 hashes it verbatim.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/limits",
+            "fields": {
+                "max_blob_bytes": {"type_ref": "primitive/uint"},
+                "max_bucket_blobs": {"type_ref": "primitive/uint"},
+                "ttl_seconds": {"type_ref": "primitive/uint"},
+                "lobby_constant": {"type_ref": "primitive/bytes", "optional": True},
+            },
+        },
+    )
+
+
+def type_system_signaling_advertise_result() -> Entity:
+    """`system/signaling/advertise-result` — §4.5 output of `advertise`."""
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/signaling/advertise-result",
+            "fields": {
+                "endpoint": {"type_ref": "primitive/string"},
+                "limits": {"type_ref": "system/signaling/limits"},
             },
         },
     )
@@ -6998,6 +7172,20 @@ ALL_TYPE_DEFINITIONS = [
     type_system_network_status,
     type_system_network_peer_summary,
     type_system_network_close_request,
+    # NETWORK §6.7 reachability facts (Amendment 13). §12.3 makes §6.7
+    # OPTIONAL as a whole, and the 2026-08-07 ruling (arch c78b3dc) pins the
+    # consequence both ways: a peer declining the section does not owe these
+    # types — and a peer OFFERING it, as this one now does, owes all three.
+    type_system_network_observe_address_result,
+    type_system_network_check_reachability_result,
+    type_system_network_candidate,
+    # SIGNALING §4.1/§4.5 — the node role's operation types (§12).
+    type_system_signaling_offer_request,
+    type_system_signaling_offer_result,
+    type_system_signaling_collect_request,
+    type_system_signaling_collect_result,
+    type_system_signaling_limits,
+    type_system_signaling_advertise_result,
     # Storage-substitute extension types (CDN corridor v1; renamed
     # from CONTENT-SUBSTITUTE per RULINGS §3 — substitutes
     # the whole storage layer (tree + content) via the two-prefix profile)

@@ -122,6 +122,11 @@ class _BuilderState:
     grant_resolver: (
         "Callable[[str, bytes | None], list[Grant] | None] | None"
     ) = None
+    # PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §2 — pinned registries as
+    # (peer_id, endpoint) pairs. Registering a backend is NOT the same as
+    # consulting one, so each pin installs BOTH the trust root and a §4
+    # resolver-chain entry; see `with_peer_issued_registry`.
+    peer_issued_registries: list[tuple[str, str]] = field(default_factory=list)
     handlers: list[_HandlerConfig] = field(default_factory=list)
     extensions: list[_ExtensionConfig] = field(default_factory=list)
     remotes: list[_RemoteConfig] = field(default_factory=list)
@@ -243,6 +248,43 @@ class PeerBuilder:
                 "with_owner_identity expects a system/peer Entity or a "
                 f"content_hash (bytes), got {type(identity).__name__}"
             )
+        return self
+
+    def with_peer_issued_registry(
+        self, registry_peer_id: str, endpoint: str,
+    ) -> PeerBuilder:
+        """Pin a peer-issued registry (PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §2).
+
+        **Registering a backend is not the same as consulting one.** A pin with
+        no resolver-config entry leaves the §4 chain empty, the pinned registry
+        is never dialed, and every resolve answers `chain_exhausted` — which is
+        exactly what four of the six REG-PEERISSUED vectors expect, so the
+        surface would report green having measured nothing. This method
+        therefore installs BOTH halves:
+
+        1. **The trust root** — the registry's `system/peer` identity, derived
+           from its Base58 PeerID and written to the content store. §2.1 step 3
+           verifies a binding's signature against *the pinned key*, not merely
+           some in-store identity whose key happens to verify; the identity is
+           never fetched from the registry, because a trust root you download
+           from the thing it authenticates is not a trust root.
+        2. **A §4 resolver-chain entry** — `backend_kind: "peer-issued"` at a
+           priority below the local-name store, carrying `backend_id` (the
+           pinned peer-id, which is also what `peer_issued:{backend_id}` names
+           as the accepted trust anchor) and `hints.endpoint` (where the
+           `RegistryReader` reads from).
+
+        Args:
+            registry_peer_id: The registry's Base58 PeerID. Must be
+                identity-multihash form — the public key is read out of it, so
+                a SHA-256-form PeerID cannot be pinned this way.
+            endpoint: The registry's tree URL prefix (an http-poll origin for a
+                static coral-reef).
+
+        Returns:
+            Self for method chaining.
+        """
+        self._state.peer_issued_registries.append((registry_peer_id, endpoint))
         return self
 
     def with_seed_policy(
@@ -1498,6 +1540,80 @@ class PeerBuilder:
                 handler=extension.handler,
                 priority=118,  # Owns system/network; wins over system/* (100).
                 name="network",
+            )
+        )
+        self._state.extensions.append(_ExtensionConfig(extension))
+        return self
+
+    def with_signaling_node_handler(
+        self,
+        *,
+        endpoint: str = "",
+        ttl_seconds: int | None = None,
+        max_blob_bytes: int | None = None,
+        max_bucket_blobs: int | None = None,
+        lobby_constant: str | None = None,
+    ) -> PeerBuilder:
+        """Register the `system/signaling` rendezvous node (EXTENSION-SIGNALING
+        §4/§5) — `offer` / `collect` / `advertise`.
+
+        §2.1 makes this role OPTIONAL and the client role the conformance
+        surface; a peer without it answers 404 on `advertise`, which is
+        conformant. It is built here because §2.1 also names the cost of
+        declining: *"underspecification stays invisible — one implementation
+        cannot disagree with itself."*
+
+        **Deliberately NOT in `with_all_handlers()`** — a peer is a signaling
+        *client* by default and only a deployed introducer serves, which is
+        also Go's posture (`entity-peer -signaling-node`, off by default).
+        Serving means accepting opaque blobs at arbitrary keys from anyone the
+        peer's grant policy admits, so it is an operator's call, not a default.
+        The caller's grant must then cover
+        `system/signaling:{offer,collect,advertise}` (`--open-access` or a seed
+        policy) or `advertise` answers 403.
+
+        `endpoint` defaults to wherever the peer actually listens, resolved at
+        `build()`/start. Weights in §3.1.1 are computed over the advertised
+        bytes exactly as published, so the value is never normalized after.
+
+        The buckets are in-memory: a bucket is ephemeral and TTL-reaped, and
+        the peers that deposited into it have long since retried or given up by
+        the time a restart matters.
+
+        Requires the entity-handlers package to be installed.
+
+        Returns:
+            Self for method chaining.
+        """
+        from entity_handlers.signaling.constants import PATTERN as SIGNALING_PATTERN
+        from entity_handlers.signaling.node import (
+            DEFAULT_MAX_BLOB_BYTES,
+            DEFAULT_MAX_BUCKET_BLOBS,
+            DEFAULT_TTL_SECONDS,
+            SignalingNodeExtension,
+        )
+
+        patterns = {h.pattern for h in self._state.handlers}
+        if SIGNALING_PATTERN in patterns:
+            return self
+        extension = SignalingNodeExtension(
+            endpoint=endpoint,
+            ttl_seconds=DEFAULT_TTL_SECONDS if ttl_seconds is None else ttl_seconds,
+            max_blob_bytes=(
+                DEFAULT_MAX_BLOB_BYTES if max_blob_bytes is None else max_blob_bytes
+            ),
+            max_bucket_blobs=(
+                DEFAULT_MAX_BUCKET_BLOBS
+                if max_bucket_blobs is None else max_bucket_blobs
+            ),
+            lobby_constant=lobby_constant,
+        )
+        self._state.handlers.append(
+            _HandlerConfig(
+                pattern=SIGNALING_PATTERN,
+                handler=extension.handler,
+                priority=118,  # Owns system/signaling; wins over system/* (100).
+                name="signaling",
             )
         )
         self._state.extensions.append(_ExtensionConfig(extension))

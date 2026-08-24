@@ -413,12 +413,26 @@ class _FakeRegistryReader:
     def __init__(self, tree: dict[str, bytes], content: dict[bytes, Entity]) -> None:
         self._tree = tree
         self._content = {bytes(k): v for k, v in content.items()}
+        # Which paths were actually read. A vector that asserts only the status
+        # cannot tell a backend that performed the lookup from one that never
+        # did — four of the six negative vectors expect `chain_exhausted`, which
+        # is also what a backend that dialed nothing returns.
+        self.tree_reads: list[str] = []
 
     async def tree_get(self, path):
+        self.tree_reads.append(path)
         return self._tree.get(path)
 
     async def content_get(self, h):
         return self._content.get(bytes(h))
+
+    def publish(self, path: str, entity: Entity) -> bytes:
+        """Publish an entity into the registry's served tree at ``path``,
+        returning its hash — the registry peer's side of the wire."""
+        h = entity.compute_hash()
+        self._tree[path] = h
+        self._content[bytes(h)] = entity
+        return h
 
 
 def _peerissued_fixture(registry_kp, name, target, *, ttl=None, issued_at=1000, signer_kp=None):
@@ -503,24 +517,39 @@ async def test_reg_peerissued_verify_fail_1(peer, monkeypatch):
 @pytest.mark.asyncio
 async def test_reg_peerissued_revoked_1(peer, monkeypatch):
     """REG-PEERISSUED-REVOKED-1 — a valid binding with a verifying revocation
-    by the same registry authority → excluded."""
+    by the same registry authority → excluded.
+
+    The revocation is served **by the registry**, at the §6a.6 by-target index,
+    which is where a revocation actually lives: the registry publishes it after
+    the binding, and the resolving peer has never heard of it. An earlier
+    version of this vector pre-seeded the revocation into the local store, so
+    it measured only the precedes path and stayed green against a backend that
+    never probed the index at all — the binding is valid in every other
+    respect, so that backend served a revoked name.
+    """
     registry_kp = Keypair.generate()
     target = Keypair.generate().peer_id
     reader, binding = _peerissued_fixture(registry_kp, "gone.com", target)
     _pin_registry(peer, registry_kp)
     _peerissued_config(peer, registry_kp)
     monkeypatch.setattr(_registry_mod, "make_reader", lambda entry: reader)
-    # Revocation signed by the registry, placed locally (a precede).
+
+    bh = binding.compute_hash()
     rev = Entity(type=REVOCATION_TYPE, data={
-        "revokes": binding.compute_hash(), "revoked_at": 2000, "reason": "rotation",
+        "revokes": bh, "revoked_at": 2000, "reason": "rotation",
     })
-    rh = rev.compute_hash()
-    _emit(peer, f"system/registry/binding/revocation/{rh.hex()}", rev)
-    sig = create_signature_entity(registry_kp, rh, create_identity_entity(registry_kp).compute_hash())
-    _emit(peer, f"system/signature/{rh.hex()}", sig)
+    rh = reader.publish(f"system/registry/revocation/by-target/{bh.hex()}", rev)
+    reader.publish(
+        f"system/signature/{rh.hex()}",
+        create_signature_entity(registry_kp, rh, create_identity_entity(registry_kp).compute_hash()),
+    )
 
     r = await _call(peer, "resolve", {"name": "gone.com"})
     assert r["result"]["data"]["status"] == "chain_exhausted"
+    assert f"system/registry/revocation/by-target/{bh.hex()}" in reader.tree_reads, (
+        "the backend never probed the by-target revocation index — §6a.4's "
+        "fail-closed rule cannot fire on a revocation it never looked for"
+    )
 
 
 @pytest.mark.asyncio

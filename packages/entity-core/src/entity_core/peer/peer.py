@@ -38,6 +38,10 @@ from entity_core.handlers.connect import (
 )
 from entity_core.handlers.context import ExecuteResult, HandlerContext
 from entity_core.handlers.registry import HandlerRegistry
+from entity_core.peer.published_root import (
+    PUBLISHER_HANDLER_PATTERN,
+    PublishedRootRepublisher,
+)
 from entity_core.peer.reciprocal import is_reentry_grant
 from entity_core.peer.session import Session
 from entity_core.peer.session_entity import (
@@ -220,6 +224,117 @@ def _collect_wire_included(
     return out
 
 
+#: EXTENSION-REGISTRY §4 — where the resolver chain lives.
+_RESOLVER_CONFIG_PATH = "system/registry/resolver-config"
+
+
+def _install_peer_issued_registries(
+    peer: "Peer", registries: list[tuple[str, str]],
+) -> None:
+    """Pin peer-issued registries: the trust root **and** the §4 chain entry.
+
+    Split out because the two halves fail differently and only together mean
+    "pinned". With the identity but no chain entry the registry is never
+    dialed and every resolve is `chain_exhausted`; with the chain entry but no
+    identity every binding it serves fails `signature_failed`, since §2.1 step
+    3 verifies against the pinned key and there is nothing to verify against.
+
+    The local-name store keeps priority 0 — a peer's own names win over a
+    remote registry's — and pinned registries follow in declaration order.
+    """
+    from entity_core.crypto.identity import (
+        KEY_TYPE_BYTE_TO_ENTITY_DATA,
+        derive_peer_from_peer_id,
+    )
+    from entity_core.protocol.auth import create_peer_entity
+    from entity_core.storage.emit import EmitContext
+
+    ctx = EmitContext.bootstrap()
+    chain: list[dict[str, Any]] = [
+        {
+            "backend_kind": "local-name",
+            "priority": 0,
+            "backend_id": peer.peer_id,
+            "accepted_trust_anchors": ["local_name"],
+        },
+    ]
+    for index, (registry_peer_id, endpoint) in enumerate(registries, start=1):
+        derived = derive_peer_from_peer_id(registry_peer_id)
+        if derived is None:
+            # A SHA-256-form PeerID carries no public key, so there is nothing
+            # to pin. Refusing loudly beats installing a chain entry whose
+            # every answer would fail `signature_failed` for a reason that
+            # looks like the registry's fault.
+            raise ValueError(
+                f"cannot pin peer-issued registry {registry_peer_id!r}: the "
+                "PeerID is not identity-multihash form, so it carries no "
+                "public key to verify bindings against"
+            )
+        public_key, key_type_byte = derived
+        # `derive_peer_from_peer_id` returns the wire key-type BYTE; a
+        # `system/peer`'s `key_type` is the entity-data STRING. Putting the
+        # byte in would hash to a different identity than the one the registry
+        # authored, so the pin would silently match nothing.
+        key_type = KEY_TYPE_BYTE_TO_ENTITY_DATA.get(key_type_byte)
+        if key_type is None:
+            raise ValueError(
+                f"cannot pin peer-issued registry {registry_peer_id!r}: "
+                f"unknown key type byte {key_type_byte:#04x}"
+            )
+        identity = create_peer_entity(public_key, key_type)
+        # The trust root goes to the CONTENT store: it is looked up by hash
+        # (`_resolve_pubkey` / `_signer_peer_id`), not by path, and it is a
+        # local pin rather than published tree state.
+        peer.content_store.put(identity)
+        chain.append({
+            "backend_kind": "peer-issued",
+            "priority": index,
+            "backend_id": registry_peer_id,
+            "accepted_trust_anchors": [f"peer_issued:{registry_peer_id}"],
+            "hints": {"endpoint": endpoint},
+        })
+        logger.info(
+            "peer-issued registry pinned: %s -> %s",
+            registry_peer_id[:16], endpoint,
+        )
+    peer.emit_pathway.emit(
+        _RESOLVER_CONFIG_PATH,
+        Entity(
+            type="system/registry/resolver-config",
+            data={
+                "resolver_chain": chain,
+                "pinned_bindings": [],
+                "name_format_dispatch": [],
+            },
+        ),
+        ctx,
+    )
+
+
+def _peername_of(writer: asyncio.StreamWriter) -> str | None:
+    """The transport source of an accepted connection, as ``"host:port"``.
+
+    EXTENSION-NETWORK §6.7.1's whole mechanism: what the responder's transport
+    reported as the source of this connection *is* the requester's public NAT
+    mapping. IPv6 is bracketed so the string round-trips as a dialable
+    authority (``[2001:db8::1]:51820``) — §6.7.2 dials this value back, and an
+    unbracketed v6 literal is ambiguous at the colon.
+
+    ``None`` when the transport reports nothing usable; callers answer 400
+    rather than inventing an address.
+    """
+    try:
+        peername = writer.get_extra_info("peername")
+    except Exception:  # pragma: no cover - defensive; transport-dependent
+        return None
+    if not isinstance(peername, tuple) or len(peername) < 2:
+        return None
+    host, port = peername[0], peername[1]
+    if not isinstance(host, str) or not isinstance(port, int):
+        return None
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 @dataclass
 class PeerConnectionState:
     """State for an active connection."""
@@ -274,6 +389,24 @@ class PeerConnectionState:
     # and pays the bounded wait; a dial-by-address acceptor is asymmetric
     # and must not.
     established_via_rendezvous_key: bool = False
+    # EXTENSION-NETWORK §6.7.1 — the transport-layer source address this peer
+    # observed when it ACCEPTED this connection ("203.0.113.7:51820"), read
+    # once from the socket at accept and held for the connection's life.
+    #
+    # This is the whole of the narrow, NETWORK-scoped accept-side path §6.7.1
+    # calls for: the fact rides from the accepted connection to the handler,
+    # so `observe-address` / `check-reachability` read no address from the
+    # request body at all — which forecloses the body-supplied-address
+    # laundering seam structurally rather than by a validation check. Mirrors
+    # Go's `protocol.ConnectionState.ObservedAddress`.
+    #
+    # `None` on a DIALED connection: the observed source is a responder-side
+    # fact, and the dialer observes nothing about itself. §6.7.1 MUST 2 — it
+    # is never copied out of here into `system/connection.address`, a
+    # `system/peer/transport/*` profile, or `system/peer/status`; those mean
+    # "the endpoint I dial to reach this peer", and an ephemeral NAT source
+    # port written there is a routable-LOOKING value that routes nowhere.
+    observed_address: str | None = None
 
     def get_originating_ready(self) -> asyncio.Event:
         """Lazy in-loop accessor for the grant-received signal."""
@@ -556,6 +689,10 @@ class Peer:
         peer._inbound_semaphore_size = 64
         peer._inbound_semaphore_obj: asyncio.Semaphore | None = None
 
+        # PROPOSAL-PEER-MANIFEST §4 republisher, installed by
+        # `enable_root_republish()` when the operator asks for a signed root.
+        peer._root_republisher = None
+
         # Extensions list
         peer._extensions: list[Extension] = []
 
@@ -668,6 +805,11 @@ class Peer:
         peer._bootstrap_peer_authority(
             state.owner_identity_hash, state.seed_policy,
         )
+
+        # PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §2: pin each declared registry
+        # — the trust root AND the §4 chain entry that makes it consulted.
+        if state.peer_issued_registries:
+            _install_peer_issued_registries(peer, state.peer_issued_registries)
 
         # Initialize extensions
         if state.extensions:
@@ -1301,8 +1443,15 @@ class Peer:
             f"system/peer/transport/{peer_id_hex}/{profile_id}", entity, ctx
         )
 
-    def publish_root(self) -> Entity:
+    def publish_root(self, root_hash: bytes | None = None) -> Entity:
         """Mint + bind a signed ``system/peer/published-root`` (Phase P / C1).
+
+        ``root_hash`` lets a caller supply an already-computed trie root.
+        `PublishedRootRepublisher` maintains one incrementally, because the
+        default full rebuild is O(bindings) *and* persists an intermediate
+        node at every insertion step — fine once at startup, ruinous per
+        root change (measured: 300 writes → 22 s and 200 880 stored
+        entities, against 0.01 s and 1 508 with no republishing).
 
         The producer half of `PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE.md`
         §4. Computes the CHAMP trie root over this peer's current bindings,
@@ -1332,8 +1481,9 @@ class Peer:
         )
         from entity_core.storage.trie import build_trie
 
-        bindings = sorted(self.entity_tree.all_bindings())
-        root_hash = build_trie(bindings, self.content_store)
+        if root_hash is None:
+            bindings = sorted(self.entity_tree.all_bindings())
+            root_hash = build_trie(bindings, self.content_store)
 
         # Monotonic seq + predecessor chain from any prior published-root.
         prev_seq = -1
@@ -1355,7 +1505,15 @@ class Peer:
             int(time.time() * 1000),
             predecessor=predecessor,
         )
-        ctx = EmitContext.bootstrap()
+        # Self-tag both writes so `PublishedRootRepublisher` can tell its own
+        # bindings from an operator's. Without the tag the publisher's two
+        # emits look like ordinary root changes, re-fire the hook, and the
+        # seq counter runs away with no external traffic at all (Go measured
+        # ~55/s before they added the same guard) — and each spin invalidates
+        # the served closure before any consumer's CONTENT_GET can complete.
+        ctx = EmitContext(
+            source="bootstrap", handler_pattern=PUBLISHER_HANDLER_PATTERN
+        )
         self.emit_pathway.emit("system/peer/published-root", pr_entity, ctx)
         self.emit_pathway.emit(
             published_root_signature_path(pr_entity.compute_hash()),
@@ -1363,6 +1521,27 @@ class Peer:
             ctx,
         )
         return pr_entity
+
+    def enable_root_republish(self) -> PublishedRootRepublisher:
+        """Republish the signed root on **every** tree-root change (§4).
+
+        `PROPOSAL-PEER-MANIFEST` §4: the peer mints a signed
+        ``system/peer/published-root`` *on every tree-root change*. Without
+        this the root is minted once at startup, `seq` stays 0, no
+        `predecessor` chain forms, and — under the §6.5.6 Amendment 10
+        timing ruling — the served closure is frozen at boot, so every
+        entity written afterwards is permanently unservable.
+
+        Idempotent: calling twice installs one republisher.
+        """
+        if self._root_republisher is None:
+            self._root_republisher = PublishedRootRepublisher(self)
+            self.emit_pathway._add_internal_hook(
+                self._root_republisher,
+                pattern=None,
+                name=PUBLISHER_HANDLER_PATTERN,
+            )
+        return self._root_republisher
 
     async def start_http(
         self,
@@ -2006,6 +2185,11 @@ class Peer:
             self._connections.add(task)
 
         conn_state = PeerConnectionState()
+        # EXTENSION-NETWORK §6.7.1: the observed transport source, captured at
+        # accept. Read here — not at dispatch — because it is a property of
+        # the socket, and by the time a handler runs the peer must not have to
+        # ask the transport anything to answer honestly.
+        conn_state.observed_address = _peername_of(writer)
         # Tracks in-flight handler tasks for this connection so we can
         # drain them on close (and so the GC doesn't reap them mid-run).
         pending_handlers: set[asyncio.Task[None]] = set()
@@ -2581,16 +2765,27 @@ class Peer:
                     writer.get_extra_info("peername")
                     if hasattr(writer, "get_extra_info") else None
                 )
+                # `address` is EMPTY on the responder, deliberately.
+                # EXTENSION-NETWORK §6.7.1 MUST 2: the observed transport
+                # source MUST NOT be persisted to `system/connection.address`.
+                # That field means *the endpoint I dial to reach this peer*
+                # and is dialer-side state — the responder holds no dialable
+                # address for the remote and correctly records nothing. An
+                # accepted connection's ephemeral source port written here is
+                # a routable-LOOKING value that routes nowhere, and both §10
+                # dispatch and `system/peer/status` consume this field as
+                # dialable. (This peer previously wrote `tcp://{peername}`
+                # here; caught by the §6.7 MUST-2 vector. Go writes no
+                # responder-side connection entity at all — we keep ours,
+                # because the `active`→`closed` transition is a Ruling C
+                # surface this peer ships, but it records no address.)
                 conn_state.connection_entity_hash = (
                     liveness.write_connection_status(
                         self.emit_pathway,
                         remote_peer_id=conn_state.connect.remote_peer_id,
                         remote_identity_hash=(remote_identity_hash or b""),
                         transport="tcp" if peername else "http",
-                        address=(
-                            f"tcp://{peername[0]}:{peername[1]}"
-                            if peername else ""
-                        ),
+                        address="",
                         status="active",
                         established_at=ts,
                     )
@@ -3021,8 +3216,26 @@ class Peer:
 
         One entry per registered handler: the handler's pattern, its
         interface's declared operations (`system/handler/interface`), and
-        resources `*` — a handler advertises its whole namespace and is
-        narrowed by resources at grant time, not here.
+        an **unconstraining** resource axis — a handler advertises its whole
+        namespace and is narrowed by resources at grant time, not here.
+
+        "Unconstraining" is why the axis carries `/*/*` alongside `*` and
+        not `*` alone. `covers_four_axes` canonicalizes both sides (V7 §5.4),
+        and bare `*` canonicalizes to `/{local_peer_id}/*` — the LOCAL
+        namespace, not everything. Advertising `*` alone therefore said "I
+        serve only my own namespace", which is false: this peer serves the
+        universal address space (a `tree:put` at `/{other_peer}/foo` lands
+        and is readable — the `universal_address_space` category exercises
+        exactly that). The understatement was silent and had teeth: every
+        assembled grant claiming cross-namespace resources failed the
+        resource axis and was **dropped**, including the query-specific
+        entry `create_full_access_grant()` mints to carry v7.14
+        `constraints`/`allowances`. An open-access peer then handed its
+        counterpart only the universal `handlers:["*"]` entry (retained by
+        the carve-out, which skips the resource check), so the query
+        constraint/allowance pathway was unreachable from the wire — and
+        any delegation narrowed FROM those constraints read as a child
+        adding keys its parent lacked, and 403'd.
 
         A handler whose interface is not resolvable (registered without a
         manifest, or before the tree is seeded) advertises `operations: *`:
@@ -3053,7 +3266,7 @@ class Peer:
             scope.append(
                 Grant.create(
                     handlers=[pattern],
-                    resources=["*"],
+                    resources=["*", "/*/*"],
                     operations=operations,
                 )
             )
@@ -3845,6 +4058,11 @@ class Peer:
             deliver_to=deliver_to,  # V7.8: pass to handler
             deliver_token=deliver_token,  # V7.8: pass to handler
             durability_policy=self.durability_policy,  # §10: advertise/reason
+            # EXTENSION-NETWORK §6.7.1: the accept-side transport source. This
+            # is the ONLY site that populates it — sub-dispatches built by
+            # `_make_execute_dispatcher` and self-dispatch leave it None, so a
+            # handler can never mistake an in-process call for an observation.
+            observed_source_address=conn_state.observed_address,
             _execute_dispatcher=execute_dispatcher,
             keypair=self.keypair,
             included=request_included,
