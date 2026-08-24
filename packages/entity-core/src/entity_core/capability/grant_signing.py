@@ -23,6 +23,7 @@ from entity_core.crypto.identity import (
     UnsupportedKeyTypeError,
     key_type_byte_from_entity_data,
 )
+from entity_core.capability.temporal import temporal_validity
 from entity_core.crypto.signing import verify_for_key_type
 from entity_core.protocol.auth import create_identity_entity, create_signature_entity
 from entity_core.protocol.entity import Entity
@@ -227,16 +228,24 @@ def verify_handler_grant(
             "Handler grant signature verification failed",
         )
 
-    # 6. temporal bounds.
-    expires_at = grant_data.get("expires_at")
-    if expires_at is not None and expires_at < now:
+    # 6. temporal validity: representability, then bounds.
+    #
+    # A handler grant is locally issued (check 2 above), so it cannot be the
+    # hostile-token case §6.2 CAP-6a is about — but the same predicate applies
+    # for the same reason: a grant read back off the tree with an
+    # unrepresentable bound is malformed, and under Python a bignum compares
+    # cleanly rather than failing to decode. Fail closed, like every other
+    # branch of this function.
+    ok, reason = temporal_validity(grant_data, now)
+    if not ok:
+        if reason and reason.startswith("malformed:"):
+            raise GrantValidationError(
+                "permission_denied",
+                f"Handler grant {reason.split(':', 1)[1]} is not a uint64 "
+                f"timestamp — malformed, not unbounded",
+            )
         raise GrantValidationError(
             "permission_denied",
-            "Handler grant expired",
-        )
-    not_before = grant_data.get("not_before")
-    if not_before is not None and now < not_before:
-        raise GrantValidationError(
-            "permission_denied",
-            "Handler grant not yet valid",
+            "Handler grant expired" if reason == "expired"
+            else "Handler grant not yet valid",
         )

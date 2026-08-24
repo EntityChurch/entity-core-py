@@ -35,6 +35,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
+from entity_core.capability.temporal import temporal_validity
 from entity_core.capability.token import CapabilityScope, get_scope
 from entity_core.utils.identity import is_peer_id
 
@@ -237,12 +238,54 @@ def matches_scope(scope: CapabilityScope | dict[str, Any], value: str) -> bool:
     return True
 
 
+def extract_peer(uri_or_path: str, local_peer_id: str) -> str:
+    """The peer a dispatch targets — V7 §5.2 ``extract_peer``.
+
+    ``entity://{R}/system/tree`` and ``/{R}/system/tree`` both target R;
+    a peer-relative path targets the local peer, because that is what
+    :func:`canonicalize` resolves it to.
+    """
+    canonical = canonicalize(uri_or_path, local_peer_id)
+    if not canonical.startswith("/"):
+        # Reserved / ambiguous prefixes pass through canonicalize unchanged
+        # (see its docstring). They name no peer; treat them as local so the
+        # peers dimension neither grants nor invents authority here — the
+        # path itself is rejected downstream by validate_absolute_path.
+        return local_peer_id
+    segment = canonical[1:].split("/", 1)[0]
+    return segment or local_peer_id
+
+
+def grant_allows_peer(
+    grant: dict[str, Any],
+    target_peer: str,
+    local_peer_id: str,
+) -> bool:
+    """The §5.2 **peers** dimension for one grant.
+
+    ``peers_scope = grant.peers or {include: [local_peer_id]}`` — an absent
+    field defaults to the local peer **and is still checked**. Skipping the
+    check on absence is the foreign-namespace privilege escalation: every
+    ordinary grant, none of which name `peers`, would authorize a dispatch
+    into any peer's namespace.
+
+    `peers` is an ``id-scope`` (§5.2 F40, 0.8.1): values are compared as
+    literal identifiers, never canonicalized as paths. Canonicalizing a peer
+    id would turn it into ``/{local}/{id}`` and match nothing.
+    """
+    peers_scope = grant.get("peers")
+    if peers_scope is None:
+        peers_scope = {"include": [local_peer_id]}
+    return matches_scope(peers_scope, target_peer)
+
+
 def check_handler_scope(
     capability_data: dict[str, Any],
     handler_pattern: str,
     operation: str,
     local_peer_id: str,
     now: int | None = None,
+    target_peer: str | None = None,
 ) -> bool:
     """Check if capability grants operation on handler scope.
 
@@ -265,19 +308,27 @@ def check_handler_scope(
     if now is None:
         now = int(time.time() * 1000)
 
-    # Check temporal bounds
-    expires_at = capability_data.get("expires_at")
-    if expires_at is not None and expires_at < now:
+    # Temporal validity: representability, then bounds. §6.2 CAP-6a makes an
+    # unrepresentable expires_at / not_before / created_at *malformed*, and a
+    # malformed token grants nothing — fail closed here, and refuse with the
+    # §5.2 disposition at the chain walk, which is the site that has one.
+    if not temporal_validity(capability_data, now)[0]:
         return False
 
-    not_before = capability_data.get("not_before")
-    if not_before is not None and not_before > now:
-        return False
+    # §5.2: `target_peer = extract_peer(execute.uri, local)`. A caller that
+    # does not supply it is dispatching locally — passing local_peer_id there
+    # is the same value extract_peer would return for a peer-relative URI, not
+    # a bypass.
+    peer = target_peer if target_peer is not None else local_peer_id
 
     for grant in capability_data.get("grants", []):
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
         if not matches_scope(operations_scope, operation):
+            continue
+
+        # §5.2 peers dimension — the same grant must cover the target peer.
+        if not grant_allows_peer(grant, peer, local_peer_id):
             continue
 
         # V6.0: handlers is now a CapabilityScope
@@ -297,6 +348,7 @@ def check_resource_scope(
     local_peer_id: str,
     now: int | None = None,
     granter_peer_id: str | None = None,
+    target_peer: str | None = None,
 ) -> bool:
     """Check if capability grants operation on resource scope at dispatch level.
 
@@ -327,13 +379,11 @@ def check_resource_scope(
     # the two identical (latent), foreign-granter caps make them differ.
     grant_frame = granter_peer_id if granter_peer_id is not None else local_peer_id
 
-    # Check temporal bounds
-    expires_at = capability_data.get("expires_at")
-    if expires_at is not None and expires_at < now:
-        return False
-
-    not_before = capability_data.get("not_before")
-    if not_before is not None and not_before > now:
+    # Temporal validity: representability, then bounds. §6.2 CAP-6a makes an
+    # unrepresentable expires_at / not_before / created_at *malformed*, and a
+    # malformed token grants nothing — fail closed here, and refuse with the
+    # §5.2 disposition at the chain walk, which is the site that has one.
+    if not temporal_validity(capability_data, now)[0]:
         return False
 
     # Each resource target must be covered by some grant that also matches handler and operation
@@ -363,6 +413,14 @@ def check_resource_scope(
             # Check operation scope
             operations_scope = get_scope(grant, "operations")
             if not matches_scope(operations_scope, operation):
+                continue
+
+            # §5.2 peers dimension — one grant must cover all four axes.
+            if not grant_allows_peer(
+                grant,
+                target_peer if target_peer is not None else local_peer_id,
+                local_peer_id,
+            ):
                 continue
 
             # Check resource scope
@@ -443,13 +501,11 @@ def check_path_permission(
     # namespace; the request path against the verifier's.
     grant_frame = granter_peer_id if granter_peer_id is not None else local_peer_id
 
-    # Check temporal bounds
-    expires_at = capability_data.get("expires_at")
-    if expires_at is not None and expires_at < now:
-        return False
-
-    not_before = capability_data.get("not_before")
-    if not_before is not None and not_before > now:
+    # Temporal validity: representability, then bounds. §6.2 CAP-6a makes an
+    # unrepresentable expires_at / not_before / created_at *malformed*, and a
+    # malformed token grants nothing — fail closed here, and refuse with the
+    # §5.2 disposition at the chain walk, which is the site that has one.
+    if not temporal_validity(capability_data, now)[0]:
         return False
 
     canonical_path = canonicalize(path, local_peer_id)
@@ -523,12 +579,9 @@ def find_matching_grant(
     if now is None:
         now = int(time.time() * 1000)
 
-    expires_at = capability_data.get("expires_at")
-    if expires_at is not None and expires_at < now:
-        return None
-
-    not_before = capability_data.get("not_before")
-    if not_before is not None and not_before > now:
+    # Temporal validity: representability, then bounds (§6.2 CAP-6a — see the
+    # note at the first call site above).
+    if not temporal_validity(capability_data, now)[0]:
         return None
 
     for grant in capability_data.get("grants", []):

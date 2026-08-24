@@ -38,6 +38,46 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
+**Both core-tier fail-opens closed; the full surface is green again (2026-08-17 h).**
+CAP-6a **ingest** (a received capability whose `expires_at` / `not_before` / `created_at`
+does not fit `uint64` was honored — under Python a bignum compares cleanly instead of
+failing to decode) and the V7 §5.2 **`peers` dimension** (parsed since V6.0, read by
+nothing, so every grant we issued authorized dispatch into any peer's namespace). Against
+core-go's `validate-complete.sh python`, live at this tree: **pass 1
+`1594 · 1580 P · 14 W · 0 F · 0 S` — PASS (with warnings)**. The peers fix took two
+attempts; the first read the target peer after the dispatcher had stripped the peer segment
+and passed our tests while changing nothing, which is recorded in `AGENTS.md`. See
+`HANDOFF-2026-08-17-h-the-two-core-tier-fail-opens-are-closed.md`. Its §4.1 is worth
+reading before trusting any intermittent validator failure on this machine: four of them
+this session turned out to be a peer from an aborted run still holding the suite's **fixed**
+HTTP-poll port, which presents as a refused dial, a peer that never binds, or a content
+fetch 404 that looks exactly like a serving gap.
+
+**The L3 revision surface, and a validator run that corrected the conformance number
+(2026-08-17 g).** `entity_sdk.revision` covers all nineteen `EXTENSION-REVISION` §4
+operations; building it against `SDK-EXTENSION-OPERATIONS` §4 produced four new
+`SPEC-AMBIGUITIES` entries (SA-PY-5 … SA-PY-8) and surfaced a `checkout-result` shape
+defect we shared with core-go, now fixed here. **Against core-go's
+`validate-complete.sh python`, run live at this tree: pass 1
+`1594 · 1577 P · 13 W · 4 F · 0 S`, pass 1b (`--profile core`) `745 · 630 P · 10 W · 2 F ·
+103 S`, pass 2 `55/55`, pass 3 `27/27`.** The four are a CAP-6a **ingest** fail-open (a
+received token with a negative `not_before` is honoured), a V7 §5.2 peers-dimension
+escalation, and two published-root vectors; the first two also fail the core profile.
+Not bisected, so not labelled pre-existing — the 08-10 line below (`1566 · 0F · 0S`) is
+28 checks and several sessions older. See
+`HANDOFF-2026-08-17-g-revision-is-l3s-largest-surface-and-the-validator-found-four.md`.
+
+**Cohort catch-up round (2026-08-10).** The inbox type cut, `EXTENSION-REGISTRY`
+§6a.9.2, and the DISCOVERY §3.3 erratum are landed, and `tree:put` no longer re-derives
+a received entity's authored `content_hash` (a V7 §1.8 break invisible while author and
+receiver share a hash format). Against core-go's `validate-complete.sh`:
+**pass 1 `1566 (1537 peer-attributable) · 0 F · 0 S`**, pass 2 `55/55`, pass 3 `14/16`.
+The two remaining are core-go's — its validator sends `revoke-request` / `renew-request`
+unsigned and asserts success, which §6a.9 forbids. See
+`HANDOFF-2026-08-10-catchup-inbox-cut-6a92-and-the-unsigned-revoke-python.md`; §"Open
+questions routed upstream" carries three items for arch. *(The 2026-08-07 and 2026-08-08
+handoffs are the record for the cycles between this and the 08-05 entry below.)*
+
 **Symmetric origination authority + the namespace flag day (2026-08-05).** The
 `EXTENSION-SIGNALING` §6.5 (b) reciprocal grant is built **both-sided and assembled** —
 the S5 packet's gate #3 assignment for this repo. The dialer mints the acceptor's mirror

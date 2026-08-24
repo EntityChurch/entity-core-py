@@ -24,6 +24,7 @@ from enum import Enum
 from typing import Any, Callable
 
 from entity_core.capability.checking import matches_pattern
+from entity_core.capability.temporal import temporal_validity
 from entity_core.protocol.entity import Entity
 from entity_core.capability.token import (
     CapabilityScope,
@@ -817,19 +818,40 @@ def verify_capability_chain(
                         chain_depth=depth,
                     )
 
-        # Temporal bounds (every level).
-        expires_at = current_data.get("expires_at")
-        if expires_at is not None and expires_at < now:
+        # Temporal validity (every level): representability first, then bounds.
+        #
+        # §6.2 CAP-6a — a RECEIVED token whose expires_at / not_before /
+        # created_at does not fit uint64 is malformed and MUST be refused via
+        # the §5.2 capability_denied disposition. Under Python that check has
+        # to be explicit: cbor2 decodes a bignum into an arbitrary-precision
+        # int, so `2**64 + 1000 < now` is False and the token reads as
+        # never-expiring rather than failing to decode the way it does in Go
+        # and Rust. Left implicit, four of the six field×shape variants go's
+        # probe sends were honored here.
+        #
+        # No error_code: the default is what the dispatcher maps to
+        # 403 capability_denied. A subcode would move it to 401, which is the
+        # authentication half and not what a malformed bound means.
+        ok, reason = temporal_validity(current_data, now)
+        if not ok:
+            if reason and reason.startswith("malformed:"):
+                field = reason.split(":", 1)[1]
+                return DelegationResult(
+                    valid=False,
+                    error=(
+                        f"Capability {field} is not a uint64 timestamp "
+                        f"(depth {depth}) — malformed per CAP-6a; a token that "
+                        f"cannot be decoded is refused, not read as absent"
+                    ),
+                    chain_depth=depth,
+                )
             return DelegationResult(
                 valid=False,
-                error=f"Capability expired (depth {depth})",
-                chain_depth=depth,
-            )
-        not_before = current_data.get("not_before")
-        if not_before is not None and not_before > now:
-            return DelegationResult(
-                valid=False,
-                error=f"Capability not yet valid (depth {depth})",
+                error=(
+                    f"Capability expired (depth {depth})"
+                    if reason == "expired"
+                    else f"Capability not yet valid (depth {depth})"
+                ),
                 chain_depth=depth,
             )
 

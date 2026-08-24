@@ -28,6 +28,12 @@ from entity_core.protocol.auth import create_identity_entity, create_signature_e
 from entity_core.protocol.entity import Entity
 from entity_core.utils.ecf import Hash
 
+#: `expires_at` is a `primitive/uint` and every other implementation decodes it
+#: as a 64-bit unsigned integer. Python's arbitrary-precision ints mean the
+#: overflow other stacks must guard against simply does not occur here — it
+#: succeeds and encodes as a CBOR bignum instead.
+_UINT64_MAX = (1 << 64) - 1
+
 
 def create_capability_token(
     granter_keypair: Keypair,
@@ -87,9 +93,33 @@ def create_capability_token(
         "grantee": grantee_hash,  # V4: bytes
         "created_at": now_ms,
     }
-    # V4: Optional fields are omitted, not set to None
-    if expires_in_ms:
-        cap_data["expires_at"] = now_ms + expires_in_ms
+    # V4: Optional fields are omitted, not set to None.
+    #
+    # This is the **kernel's** mint path — `entity_handlers/capability.py` has
+    # its own (`_mint_token`), so one entity type has two independent minting
+    # implementations and a guard on one of them is a guard on half the repo.
+    # `entity-core-go`'s CAP-6 probe reached the handler path; this one it
+    # never saw, and every future caller of `create_capability_token` arrives
+    # here.
+    #
+    # Two rules, both from §5.6 (see `_bounded_expiry` in the handler for the
+    # full reasoning):
+    #   * an unrepresentable `now + ttl` is **absent** — never wrapped, never
+    #     saturated, and never carried at Python's arbitrary precision, which
+    #     cbor2 would encode as a bignum no uint64 peer can decode;
+    #   * `0` means **expires now**, not *never expires*. The previous
+    #     truthiness test folded a zero ttl into the absent case, which is the
+    #     dangerous direction: it hands back an immortal token for the request
+    #     that asked for the shortest possible life.
+    if expires_in_ms is not None:
+        expiry = now_ms + expires_in_ms
+        if expiry < 0:
+            # Underflow is not symmetric with overflow: "absent" here would
+            # mean never-expires. Clamp to already-expired instead.
+            cap_data["expires_at"] = 0
+        elif expiry <= _UINT64_MAX:
+            cap_data["expires_at"] = expiry
+        # else: unrepresentable -> omitted, per §5.6.
     # Note: delegation_caveats is also optional, omitted when empty
 
     # Create capability entity to compute hash

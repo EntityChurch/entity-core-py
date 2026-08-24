@@ -3338,9 +3338,24 @@ class Peer:
         path: str,
         operation: str,
         caller_capability: dict[str, Any],
+        *,
+        target_peer: str,
     ) -> "RegisteredHandler | _DispatchDenied":
         """Resolve the handler for `path` (V7 §6.6) and check that
         `caller_capability` permits `operation` on the matched handler scope.
+
+        Args:
+            path: The **handler-relative** path (`system/tree`) — handlers
+                register at peer-relative patterns.
+            target_peer: V7 §5.2 `extract_peer(execute.uri, local)` — the peer
+                whose namespace this dispatch names. **Required, and required
+                separately from `path`**: by the time dispatch resolves a
+                handler the peer segment has already been stripped
+                (`extract_handler_path`), so deriving it here would read
+                `system/tree` and answer "local" for every request, including
+                the foreign-namespace ones this dimension exists to refuse.
+                Keyword-only and non-defaulted so a new call site has to say
+                which peer it means rather than silently getting a pass.
 
         Returns the resolved handler, or a `_DispatchDenied` (404 no handler,
         403 handler scope).
@@ -3352,12 +3367,17 @@ class Peer:
             return _DispatchDenied(404, f"No handler for path: {path}")
 
         if not check_handler_scope(
-            caller_capability, registered.pattern, operation, self.peer_id
+            caller_capability, registered.pattern, operation, self.peer_id,
+            target_peer=target_peer,
         ):
             return _DispatchDenied(
                 403,
                 f"Capability doesn't allow {operation} on handler "
-                f"{registered.pattern}/",
+                f"{registered.pattern}/"
+                + (
+                    f" in peer {target_peer}'s namespace"
+                    if target_peer != self.peer_id else ""
+                ),
             )
         return registered
 
@@ -3541,6 +3561,7 @@ class Peer:
         # Canonicalize(normalize(uri)) then validate_absolute_path
         from entity_core.capability.checking import normalize as normalize_uri
         from entity_core.capability.checking import canonicalize
+        from entity_core.capability.checking import extract_peer
         from entity_core.utils.path import extract_handler_path, validate_absolute_path
 
         # Canonicalize is a pure transform (§5.4); validate_absolute_path is the
@@ -3557,6 +3578,12 @@ class Peer:
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return
+
+        # V7 §5.2 peers dimension: the target peer is read from the request
+        # URI, and it has to be read HERE — `extract_handler_path` below drops
+        # the peer segment, so anything downstream sees `system/tree` and can
+        # only ever answer "local".
+        target_peer = extract_peer(canonical_path, self.peer_id)
 
         # Extract handler-relative path for dispatch
         path = extract_handler_path(canonical_path)
@@ -3844,7 +3871,9 @@ class Peer:
         )
 
         # Steps 1-2: resolve handler (V7 §6.6) + handler-scope check (shared).
-        resolved = self._resolve_for_dispatch(path, operation, capability_data)
+        resolved = self._resolve_for_dispatch(
+            path, operation, capability_data, target_peer=target_peer,
+        )
         if isinstance(resolved, _DispatchDenied):
             if resolved.status == 404:
                 logger.debug("[dispatch] -> response status=404 code=not_found")
@@ -3900,7 +3929,8 @@ class Peer:
             if resource_targets:
                 if not check_resource_scope(
                     capability_data, handler_pattern, operation, resource_targets,
-                    resource_exclude, self.peer_id, granter_peer_id=granter_frame
+                    resource_exclude, self.peer_id, granter_peer_id=granter_frame,
+                    target_peer=target_peer,
                 ):
                     logger.warning("[dispatch] resource scope denied: targets=%s", resource_targets)
                     logger.debug("[dispatch] -> response status=403 code=capability_denied")
@@ -4569,14 +4599,21 @@ class Peer:
             )
 
         # Extract handler-relative path from URI or absolute path
+        from entity_core.capability.checking import extract_peer
         from entity_core.utils.path import extract_handler_path
+        # §5.2 peers: read the target peer before the peer segment is stripped
+        # (see handle_execute). An in-process caller reaching a foreign
+        # namespace is the same escalation as a wire one.
+        target_peer = extract_peer(uri, self.peer_id)
         path = extract_handler_path(uri)
 
         logger.debug("[dispatch:internal] uri=%s op=%s params=[%s]",
                     uri, operation, ", ".join(list((params or {}).keys())[:5]))
 
         # Steps 1-2: resolve handler (V7 §6.6) + handler-scope check (shared).
-        resolved = self._resolve_for_dispatch(path, operation, caller_capability)
+        resolved = self._resolve_for_dispatch(
+            path, operation, caller_capability, target_peer=target_peer,
+        )
         if isinstance(resolved, _DispatchDenied):
             logger.debug(
                 "[dispatch:internal] -> status=%d %s",

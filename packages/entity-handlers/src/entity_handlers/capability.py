@@ -166,6 +166,47 @@ def _parse_grants_payload(
     return grants, ttl_ms, None
 
 
+#: `expires_at` is a `primitive/uint` on the wire, and every other
+#: implementation decodes it into a **64-bit unsigned integer**. Python's ints
+#: are arbitrary-precision, so a sum that would overflow elsewhere silently
+#: succeeds here and cbor2 encodes it as a **bignum** — a token a uint64 peer
+#: cannot decode at all.
+_UINT64_MAX = (1 << 64) - 1
+
+
+def _bounded_expiry(created_at: int, ttl_ms: int) -> int | None:
+    """``created_at + ttl_ms`` as a wire-representable expiry, or ``None``.
+
+    **Returns ``None`` when the sum overflows uint64** — §5.6's *"overflow
+    contributes no ceiling"*: a term whose ``created_at + ttl_ms`` is not
+    representable is treated as **absent**, and MUST NOT wrap, and MUST NOT
+    saturate to a representable maximum, because *saturation and absence differ
+    in the encoded token*. Carrying the arbitrary-precision sum is a third
+    non-conformant form the same rule covers, and it is the one this
+    implementation had: `entity-core-go`'s wire probe caught us minting
+    ``18446745860712217718`` where go and rust mint no expiry at all.
+
+    The caller must treat ``None`` as *"this term contributes no ceiling"* —
+    skip it entirely — rather than as *"expires_at is None"*, or an overflowing
+    request would erase a finite ceiling the caller already had.
+
+    .. rubric:: Underflow is deliberately NOT symmetric
+
+    A large negative ``ttl_ms`` also makes the sum unrepresentable, but
+    "absent" means **never expires**. Applying the overflow rule in both
+    directions would turn a nonsense request into an immortal token — a
+    strictly worse outcome than the bug being fixed. An underflowing sum
+    therefore clamps to ``0``: representable, already expired, and the
+    conservative direction. A ``ttl_ms`` may never widen authority.
+    """
+    total = created_at + ttl_ms
+    if total > _UINT64_MAX:
+        return None
+    if total < 0:
+        return 0
+    return total
+
+
 def _mint_token(
     *,
     keypair: Any,
@@ -505,11 +546,16 @@ async def _handle_request(
     if policy_entry is not None:
         policy_ttl = policy_entry.get("ttl_ms")
         if isinstance(policy_ttl, int):
-            policy_expiry = now + policy_ttl
-            expires_at = policy_expiry if expires_at is None else min(expires_at, policy_expiry)
+            policy_expiry = _bounded_expiry(now, policy_ttl)
+            if policy_expiry is not None:
+                expires_at = policy_expiry if expires_at is None else min(expires_at, policy_expiry)
     if ttl_ms is not None:
-        req_expiry = now + ttl_ms
-        expires_at = req_expiry if expires_at is None else min(expires_at, req_expiry)
+        # None = unrepresentable = contributes no ceiling (§5.6). Skipping the
+        # term is the whole rule: assigning it would either mint an
+        # undecodable expiry or erase a finite ceiling the caller already had.
+        req_expiry = _bounded_expiry(now, ttl_ms)
+        if req_expiry is not None:
+            expires_at = req_expiry if expires_at is None else min(expires_at, req_expiry)
 
     token, signature = _mint_token(
         keypair=ctx.keypair,
@@ -600,8 +646,12 @@ async def _handle_delegate(
     parent_expires = parent_data.get("expires_at")
     expires_at: int | None = parent_expires if isinstance(parent_expires, int) else None
     if ttl_ms is not None:
-        req_expiry = now + ttl_ms
-        expires_at = req_expiry if expires_at is None else min(expires_at, req_expiry)
+        # Same rule as mint (§5.6): unrepresentable contributes no ceiling, so
+        # a delegate with an overflowing ttl inherits the parent's expiry
+        # unchanged rather than widening past it.
+        req_expiry = _bounded_expiry(now, ttl_ms)
+        if req_expiry is not None:
+            expires_at = req_expiry if expires_at is None else min(expires_at, req_expiry)
 
     token, signature = _mint_token(
         keypair=ctx.keypair,

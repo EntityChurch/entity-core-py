@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from entity_core.capability.checking import canonicalize, matches_pattern, matches_scope
+from entity_core.capability.temporal import temporal_validity
 from entity_core.capability.token import get_scope
 from entity_core.crypto.signing import public_key_from_bytes, verify_signature
 from entity_core.handlers.context import HandlerContext
@@ -246,11 +247,13 @@ def _find_consult_grants(
     if not isinstance(cap_data, dict):
         return []
 
-    expires_at = cap_data.get("expires_at")
-    if isinstance(expires_at, int) and expires_at < now_ms:
-        return []
-    not_before = cap_data.get("not_before")
-    if isinstance(not_before, int) and not_before > now_ms:
+    # Representability, then bounds — the shared §6.2 predicate. This runs on a
+    # capability the dispatcher already chain-verified, so it is
+    # defence-in-depth rather than the enforcement point; it uses the same
+    # predicate anyway, because the failure mode of a second copy is that it
+    # drifts from the first and nobody notices until one of them is the only
+    # one on the path.
+    if not temporal_validity(cap_data, now_ms)[0]:
         return []
 
     # D2 — resource axis: target namespaces come from the triggering

@@ -639,6 +639,200 @@ async def test_configure_rejects_non_hex(peer) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CAP-6 — ttl_ms zero and overflow (§5.6 "overflow contributes no ceiling")
+#
+# Found by `entity-core-go`'s wire probe, report
+# docs/validation/reports/2026-08-17-g-core-py-cap-fold-validation.md, against
+# py a7deda6. We minted `expires_at = 18446745860712217718` — larger than
+# uint64 max — where go and rust mint no expiry at all.
+#
+# Python's ints are arbitrary-precision, so the overflow every other
+# implementation has to guard against simply does not happen here: the sum
+# succeeds and cbor2 encodes it as a **bignum**, producing a token a uint64
+# peer cannot decode at all. A numeric-encoding slip that becomes a cross-impl
+# interop break on the capability wire — and one that is invisible locally,
+# because nothing in this process ever fails to read it back.
+#
+# The no-ceiling condition is load-bearing: with a finite caller cap the
+# `min()` picks the finite side and the bug is masked. That is why go had to
+# strengthen its check (u) with a no-ceiling probe before py went RED.
+# ---------------------------------------------------------------------------
+
+UINT64_MAX = (1 << 64) - 1
+
+
+def _no_ceiling_cap() -> dict[str, object]:
+    """Full access with **no `expires_at`** — the §4.4 nil-expiry connection cap.
+
+    `_full_access_cap()` already has this shape; naming it here is the point of
+    the test, so a later edit that adds an expiry to the shared fixture does not
+    silently disarm these three assertions.
+    """
+    cap = _full_access_cap()
+    assert "expires_at" not in cap, "this probe requires a caller cap with no ceiling"
+    return cap
+
+
+async def _mint_with_ttl(peer, ttl_ms: int, *, caller_cap=None):
+    """Mint via `request` with `ttl_ms`, returning the token entity dict."""
+    requested = [{
+        "handlers": {"include": ["system/tree"]},
+        "resources": {"include": ["app/*"]},
+        "operations": {"include": ["get"]},
+    }]
+    ctx = _ctx(peer, caller_cap=caller_cap or _no_ceiling_cap())
+    result = await capability_handler(
+        CAPABILITY_HANDLER_PATTERN, "request",
+        {"data": {"grants": requested, "ttl_ms": ttl_ms}}, ctx,
+    )
+    assert result["status"] == 200, result
+    token_hash = result["result"]["data"]["token"]
+    return result["envelope_included"][token_hash]
+
+
+@pytest.mark.asyncio
+async def test_cap6_overflowing_ttl_with_no_ceiling_mints_no_expiry(peer) -> None:
+    """§5.6: an unrepresentable `created_at + ttl_ms` term is **absent**.
+
+    Not wrapped, not saturated to a representable maximum, and — the form we
+    had — not carried at full arbitrary precision. Saturation and absence
+    differ in the encoded token, so "close enough" is not available.
+    """
+    token = await _mint_with_ttl(peer, UINT64_MAX - 10)
+
+    assert "expires_at" not in token["data"] or token["data"]["expires_at"] is None, (
+        f"overflowing ttl must mint no expiry, got {token['data'].get('expires_at')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap6_the_minted_expiry_is_always_uint64_decodable(peer) -> None:
+    """The property the cross-impl break actually violated.
+
+    A value above uint64 max is CBOR-encoded as a bignum, which go and rust
+    cannot decode — so the token is unreadable by the peers it was minted for.
+    Asserted over the encoded bytes rather than the Python int, because the
+    Python int is exactly the thing that never complains.
+    """
+    import cbor2
+
+    for ttl in (0, 1_000, UINT64_MAX - 10, UINT64_MAX, 1 << 70):
+        token = await _mint_with_ttl(peer, ttl)
+        expires = token["data"].get("expires_at")
+        if expires is None:
+            continue
+        assert 0 <= expires <= UINT64_MAX, f"ttl_ms={ttl} minted {expires}"
+        # A bignum-tagged encoding is the wire symptom. Major type 6 (tag)
+        # 2/3 is what cbor2 emits for an int outside the 64-bit range.
+        encoded = cbor2.dumps(expires, canonical=True)
+        assert encoded[0] not in (0xC2, 0xC3), (
+            f"ttl_ms={ttl} encoded expires_at as a CBOR bignum: {encoded[:3].hex()}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_cap6_ttl_zero_expires_immediately_rather_than_never(peer) -> None:
+    """`ttl_ms: 0` is a real expiry at mint time, not an absent one.
+
+    The distinction matters: absent means *never expires*, so collapsing zero
+    into the overflow branch would hand back an immortal token for the request
+    that asked for the shortest possible life.
+    """
+    token = await _mint_with_ttl(peer, 0)
+
+    expires = token["data"].get("expires_at")
+    assert isinstance(expires, int)
+    assert 0 < expires <= UINT64_MAX
+
+
+@pytest.mark.asyncio
+async def test_cap6_an_overflowing_ttl_does_not_erase_a_finite_ceiling(peer) -> None:
+    """"Contributes no ceiling" means *skip the term*, not *set it to None*.
+
+    The masking case from go's report, asserted from the other side: with a
+    finite caller cap the overflowing request must leave that ceiling intact.
+    Treating unrepresentable as `expires_at = None` would let an overflowing
+    ttl **widen** authority past the caller's own expiry — a worse bug than
+    the one being fixed, and one this shape of fix invites.
+    """
+    ceiling = 1_700_000_000_000
+    capped = {**_full_access_cap(), "expires_at": ceiling}
+
+    token = await _mint_with_ttl(peer, UINT64_MAX - 10, caller_cap=capped)
+
+    assert token["data"].get("expires_at") == ceiling
+
+
+@pytest.mark.asyncio
+async def test_cap6_a_hugely_negative_ttl_expires_now_rather_than_never(peer) -> None:
+    """Underflow is deliberately **not** symmetric with overflow.
+
+    A sum below zero is equally unrepresentable as a uint64, but "absent" here
+    would mean *never expires* — turning a nonsense request into an immortal
+    token. It clamps to an already-expired value instead: a `ttl_ms` may never
+    widen authority, in either direction.
+    """
+    token = await _mint_with_ttl(peer, -(1 << 70))
+
+    expires = token["data"].get("expires_at")
+    assert expires is not None, "underflow must not mint an unexpiring token"
+    assert 0 <= expires <= UINT64_MAX
+    assert expires <= _now_ms_upper_bound()
+
+
+def _now_ms_upper_bound() -> int:
+    import time
+
+    return int(time.time() * 1000) + 60_000
+
+
+@pytest.mark.asyncio
+async def test_cap6_delegate_is_the_second_mint_site_and_has_the_same_rule(peer) -> None:
+    """`delegate` computes `now + ttl_ms` too, and go's probe never reached it.
+
+    The report tested `request`. A second mint site carrying the same defect
+    that no probe visits is exactly the shape this repo has been bitten by
+    before — one concern, two code paths, coverage on one of them. Delegating
+    with an overflowing ttl must inherit the parent's expiry unchanged rather
+    than mint an undecodable one or widen past the parent.
+    """
+    parent_grants = [{
+        "handlers": {"include": ["system/tree"]},
+        "resources": {"include": ["app/*"]},
+        "operations": {"include": ["get", "put"]},
+    }]
+    mint = await capability_handler(
+        CAPABILITY_HANDLER_PATTERN, "request",
+        {"data": {"grants": parent_grants, "ttl_ms": 3_600_000}}, _ctx(peer),
+    )
+    parent_hash = mint["result"]["data"]["token"]
+    parent_dict = mint["envelope_included"][parent_hash]
+    parent_expiry = parent_dict["data"]["expires_at"]
+    assert isinstance(parent_expiry, int)
+
+    child_grants = [{
+        "handlers": {"include": ["system/tree"]},
+        "resources": {"include": ["app/*"]},
+        "operations": {"include": ["get"]},
+    }]
+    result = await capability_handler(
+        CAPABILITY_HANDLER_PATTERN, "delegate",
+        {"data": {
+            "parent": parent_hash,
+            "grants": child_grants,
+            "ttl_ms": UINT64_MAX - 10,
+        }},
+        _ctx(peer, included={parent_hash: parent_dict}),
+    )
+    assert result["status"] == 200, result
+
+    child = result["envelope_included"][result["result"]["data"]["token"]]
+    assert child["data"]["expires_at"] == parent_expiry, (
+        "an overflowing delegate ttl must leave the parent's ceiling intact"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
