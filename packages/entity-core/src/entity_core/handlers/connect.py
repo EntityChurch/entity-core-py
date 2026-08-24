@@ -37,7 +37,11 @@ from entity_core.crypto.signing import (
     verify_signature,
 )
 from entity_core.primitives import Uint
-from entity_core.protocol.auth import create_identity_entity, create_signature_entity
+from entity_core.protocol.auth import (
+    create_identity_entity,
+    create_peer_entity,
+    create_signature_entity,
+)
 from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.messages import Execute, ExecuteResponse
@@ -422,7 +426,8 @@ def handle_connect_authenticate(
     our_authenticate_hash = our_authenticate_entity.compute_hash()
 
     # V7 v7.65 §2: system/peer data = (public_key, key_type) only
-    our_identity_entity = create_identity_entity(local_keypair, algorithm=active_format)
+    # V7 v7.77 §4.5a item 1a: floor-pinned, not authored under active_format
+    our_identity_entity = create_identity_entity(local_keypair)
     our_identity_hash = our_identity_entity.compute_hash()
 
     # Sign our AUTHENTICATE hash (V4: hash bytes, not string)
@@ -447,16 +452,11 @@ def handle_connect_authenticate(
         if grantee_dict:
             grantee_identity, _ = Entity.from_wire_dict(grantee_dict)
     if grantee_identity is None:
-        # Fallback (signer not in included): reconstruct under the active
-        # format so it still matches the connecting peer's §4.5a authoring.
-        grantee_identity = Entity(
-            type="system/peer",
-            data={
-                "public_key": public_key_bytes,
-                "key_type": key_type,
-            },
-            hash_algorithm=active_format,
-        )
+        # Fallback (signer not in included): reconstruct at the floor, which
+        # under §4.5a item 1a is where a conformant peer authored it — this is
+        # the derive-to-meet route, and it now yields the authored bytes on
+        # every connection rather than only floor-active ones.
+        grantee_identity = create_peer_entity(public_key_bytes, key_type)
 
     # R3a — granter idempotency (PROPOSAL-TRANSPORT-FAMILY §7.3):
     # reuse a live cap for this grantee+grants rather than emitting a fresh
@@ -605,7 +605,8 @@ Type is "system/protocol/connect/authenticate".
     authenticate_hash = authenticate_entity.compute_hash()
 
     # V7 v7.65 §2: system/peer data = (public_key, key_type) only
-    identity_entity = create_identity_entity(keypair, algorithm=algorithm)
+    # V7 v7.77 §4.5a item 1a: floor-pinned, not authored under `algorithm`
+    identity_entity = create_identity_entity(keypair)
     identity_hash = identity_entity.compute_hash()
 
     #Sign the hash bytes (not string)

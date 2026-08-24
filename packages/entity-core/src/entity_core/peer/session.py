@@ -43,11 +43,8 @@ class Session:
                 key_type = KEY_TYPE_BYTE_TO_ENTITY_DATA.get(kt_byte, "ed25519")
             except Exception:
                 pass
-            identity_entity = Entity(
-                type="system/peer",
-                data={
-                    "public_key": self.remote_public_key,
-                    "key_type": key_type,
-                },
-            )
+            # §4.5a item 1a — one constructor, floor-pinned.
+            from entity_core.protocol.auth import create_peer_entity
+
+            identity_entity = create_peer_entity(self.remote_public_key, key_type)
             self.remote_identity_hash = identity_entity.compute_hash()

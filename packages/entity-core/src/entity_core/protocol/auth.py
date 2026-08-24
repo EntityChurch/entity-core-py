@@ -25,7 +25,13 @@ from entity_core.crypto.signing import verify_for_key_type
 from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.messages import Execute
-from entity_core.utils.ecf import Hash, hash_equals, hash_to_display, normalize_hash
+from entity_core.utils.ecf import (
+    ALG_ECFV1_SHA256,
+    Hash,
+    hash_equals,
+    hash_to_display,
+    normalize_hash,
+)
 
 if TYPE_CHECKING:
     from entity_core.capability.revocation import RevocationContext
@@ -67,36 +73,23 @@ class AuthenticatedRequest:
         )
 
 
-def create_identity_entity(keypair: Keypair, *, algorithm: int | None = None) -> Entity:
-    """V7 v7.65 §2 — system/peer entity (canonical-form, no peer_id in data).
-
-    content_hash(system/peer) is a pure function of (public_key, key_type)
-    per the F amendment: peer_id has exited the hashable basis. The wire
-    peer_id is a presentation/routing handle (§1.5) and is carried at the
-    transport layer, not inside the entity.
-
-    ``algorithm`` (V7 v7.69 §4.5a) is the connection's active
-    content_hash_format. Connection-bound callers (handshake, ongoing
-    authenticated requests) MUST pass it so the identity reference this
-    entity yields matches what the peer authors elsewhere on the same
-    connection (``grantee == author``, §1.8). ``None`` → process-global
-    default.
-    """
-    return Entity(
-        type="system/peer",
-        data={
-            "public_key": keypair.public_key_bytes(),
-            "key_type": keypair.key_type,
-        },
-        hash_algorithm=algorithm,
-    )
-
-
 def create_peer_entity(public_key: bytes, key_type: str = "ed25519") -> Entity:
     """V7 v7.65 §2 — build a canonical system/peer entity from (pubkey, key_type).
 
-    Used at sites that have a remote peer's pubkey but not their Keypair
-    (e.g., handshake-completion, capability granter construction).
+    **The one function.** Every ``system/peer`` in this implementation is built
+    here; §4.5a item 4 names *two derivation functions* as the defect item 1a
+    exists to prevent, so there is deliberately no second constructor and no
+    format parameter to pass one.
+
+    **V7 v7.77 §4.5a item 1a — pinned to the floor.** The identity entity is
+    authored under **ECFv1-SHA-256 (0x00) unconditionally**: on every
+    connection, whatever the negotiated active format, and whatever this peer's
+    home format. It is the single exception to §1.2's "a peer's persistent
+    state is uniformly its home format". Its data is wholly recoverable from
+    the public peer-id, so every consumer *derives* this hash rather than
+    fetching it (`[derive-to-meet]`, SPECIFICATION-FORMAT §8.4.6) — pinning
+    makes the derived form and the authored form one value network-wide rather
+    than two that coincide only while the active format happens to be the floor.
 
     V7 v7.66 §2 errata — the ``key_type`` parameter here is the
     *entity-data field surface*: a ``primitive/string`` (canonical
@@ -111,7 +104,24 @@ def create_peer_entity(public_key: bytes, key_type: str = "ed25519") -> Entity:
             "public_key": public_key,
             "key_type": key_type,
         },
+        hash_algorithm=ALG_ECFV1_SHA256,
     )
+
+
+def create_identity_entity(keypair: Keypair) -> Entity:
+    """V7 v7.65 §2 — our own system/peer entity (canonical-form, no peer_id in data).
+
+    content_hash(system/peer) is a pure function of (public_key, key_type)
+    per the F amendment: peer_id has exited the hashable basis. The wire
+    peer_id is a presentation/routing handle (§1.5) and is carried at the
+    transport layer, not inside the entity.
+
+    Takes **no format parameter** — see :func:`create_peer_entity` for why
+    (§4.5a item 1a; the parameter was deleted rather than defaulted so that
+    every caller that used to thread an active format is a hard failure, not a
+    silent no-op).
+    """
+    return create_peer_entity(keypair.public_key_bytes(), keypair.key_type)
 
 
 def compute_peer_identity_hash(
@@ -142,13 +152,7 @@ def compute_peer_identity_hash(
                 f"{peer_id[:16]}...; identity-form PeerIDs derive locally"
             )
         public_key, _key_type = derived
-    return Entity(
-        type="system/peer",
-        data={
-            "public_key": public_key,
-            "key_type": key_type,
-        },
-    ).compute_hash()
+    return create_peer_entity(public_key, key_type).compute_hash()
 
 
 def create_signature_entity(
@@ -169,16 +173,17 @@ def create_signature_entity(
         signer_identity_hash: Content hash of signer's identity entity (bytes).
             If None, creates identity entity and computes hash.
         algorithm: V7 v7.69 §4.5a active content_hash_format. The signature
-            entity is itself authored under it (it rides in ``included``), and
-            the internally-derived signer identity (when ``signer_identity_hash``
-            is None) is authored under it too. ``None`` → process-global default.
+            entity is itself authored under it (it rides in ``included``).
+            The internally-derived signer identity is **not** — under §4.5a
+            item 1a a ``system/peer`` is floor-pinned whatever the active
+            format. ``None`` → process-global default.
 
     Returns:
         A signature entity.
     """
     # V4: signer is the content hash of the signer's identity entity, not peer_id
     if signer_identity_hash is None:
-        identity_entity = create_identity_entity(keypair, algorithm=algorithm)
+        identity_entity = create_identity_entity(keypair)
         signer_identity_hash = identity_entity.compute_hash()
 
     # V4: Sign the full hash bytes (algorithm + digest)
@@ -226,10 +231,10 @@ def create_authenticated_request(
     Returns:
         An AuthenticatedRequest with all supporting entities.
     """
-    # Create identity entity. V7 v7.69 §4.5a — author under the connection's
-    # active format so execute.author matches the cap grantee (issued under the
-    # same active format during the handshake).
-    identity_entity = create_identity_entity(keypair, algorithm=algorithm)
+    # Create identity entity. V7 v7.77 §4.5a item 1a — floor-pinned, so
+    # execute.author matches the cap grantee on every connection rather than
+    # only on those whose active format happens to be the floor.
+    identity_entity = create_identity_entity(keypair)
     identity_hash = identity_entity.compute_hash()
 
     # Use capability hash from the received dict - don't recompute

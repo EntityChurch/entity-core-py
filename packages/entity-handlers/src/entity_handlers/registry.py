@@ -1197,7 +1197,16 @@ async def _handle_revoke_request(ctx: HandlerContext, params: dict[str, Any]) ->
     target_peer_id = binding.data.get("target_peer_id")
     req_hash = _request_hash(REVOKE_REQUEST_TYPE, data)
     if not (_is_operator(ctx) or _verify_proof_by(ctx, req_hash, target_peer_id)):
-        return _error(403, "not_entitled", "revoke requires proof by the registrant or operator")
+        # 401 `proof_failed`, matching the register path above and core-go's
+        # REG-REVOKE-PROOF-1. We answered 403 `not_entitled` here — the
+        # layer-2 code — for a layer-1 failure, which is the same conflation
+        # 4cdf805 already unpicked on register. Absent proof is an
+        # authentication result; "policy says no" is the 403.
+        return _error(
+            401, "proof_failed",
+            "revoke-request is not signed by target_peer_id or the operator "
+            "(§6a.9 layer-1)",
+        )
     rh = _emit_revocation(ctx, bh, data.get("reason"))
     return _ok("system/registry/revoke-result", {"revoked": True, "revocation_hash": rh})
 
@@ -1214,7 +1223,13 @@ async def _handle_renew_request(ctx: HandlerContext, params: dict[str, Any]) -> 
     target_peer_id = binding.data.get("target_peer_id")
     req_hash = _request_hash(RENEW_REQUEST_TYPE, data)
     if not (_is_operator(ctx) or _verify_proof_by(ctx, req_hash, target_peer_id)):
-        return _error(403, "not_entitled", "renew requires proof by the registrant or operator")
+        # 401 `proof_failed` — see the revoke path; §6a.9 makes renew
+        # "Signed by target_peer_id (layer-1)", same class, same answer.
+        return _error(
+            401, "proof_failed",
+            "renew-request is not signed by target_peer_id or the operator "
+            "(§6a.9 layer-1)",
+        )
     policy = _load_issuer_policy(ctx)
     ttl = data.get("ttl")
     if not isinstance(ttl, int):

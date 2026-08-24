@@ -96,14 +96,10 @@ def _identity_hash_from_authenticate_params(
     if not remote_peer_id or not pkey:
         return None
     # V7 v7.65 §2: system/peer data = (public_key, key_type) only
-    identity_entity = Entity(
-        type="system/peer",
-        data={
-            "public_key": pkey,
-            "key_type": key_type,
-        },
-    )
-    return identity_entity.compute_hash()
+    # §4.5a item 1a: floor-pinned via the one constructor.
+    from entity_core.protocol.auth import create_peer_entity
+
+    return create_peer_entity(pkey, key_type).compute_hash()
 
 
 def _grantee_identity_hash(
@@ -2670,11 +2666,10 @@ class Peer:
                         cap_fp = None
                     if cap_fp == grants_fp and cached_format == active_format:
                         # V7 v7.65 §2: system/peer data = (public_key, key_type) only.
-                        # Reconstruct granter identity + cap signature under the
-                        # cap's (== active) format so they match the cached cap.
-                        granter_id_c = create_identity_entity(
-                            self.keypair, algorithm=active_format,
-                        )
+                        # The cap signature is reconstructed under the cap's
+                        # (== active) format; the granter identity is not —
+                        # §4.5a item 1a floor-pins it whatever the active value.
+                        granter_id_c = create_identity_entity(self.keypair)
                         cap_sig_c = create_signature_entity(
                             self.keypair,
                             cap_entity_c.compute_hash(),
@@ -4616,16 +4611,11 @@ class Peer:
         # Compute local peer identity hash for internal dispatch author tracking
         local_identity_hash: bytes | None = None
         if self.keypair:
-            from entity_core.protocol.entity import Entity as _Entity
             # V7 v7.65 §2: system/peer data = (public_key, key_type) only
-            local_identity = _Entity(
-                type="system/peer",
-                data={
-                    "public_key": self.keypair.public_key_bytes(),
-                    "key_type": self.keypair.key_type,
-                },
-            )
-            local_identity_hash = local_identity.compute_hash()
+            # §4.5a item 1a: floor-pinned via the one constructor.
+            from entity_core.protocol.auth import create_identity_entity
+
+            local_identity_hash = create_identity_entity(self.keypair).compute_hash()
 
         # V7 §6.8 context propagation. When the caller passed propagated_*
         # values, the sub-handler sees the original external caller's

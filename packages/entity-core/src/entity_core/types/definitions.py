@@ -1866,27 +1866,6 @@ def type_system_inbox_delivery() -> Entity:
     )
 
 
-def type_system_protocol_inbox_notification() -> Entity:
-    """Type for inbox notification (subscription event).
-
-    Per EXTENSION-INBOX v5.0 §3.2.
-    Delivers a subscription notification for entity tree changes.
-    """
-    return Entity(
-        type="system/type",
-        data={
-            "name": "system/protocol/inbox/notification",
-            "fields": {
-                "subscription_id": {"type_ref": "primitive/string"},
-                "event": {"type_ref": "primitive/string"},
-                "uri": {"type_ref": "system/tree/path"},
-                "hash": {"type_ref": "system/hash", "optional": True},
-                "previous_hash": {"type_ref": "system/hash", "optional": True},
-            },
-        },
-    )
-
-
 # =============================================================================
 # Continuation Extension Types (EXTENSION-CONTINUATION v1.9)
 # =============================================================================
@@ -2108,6 +2087,35 @@ def type_system_continuation_install_result() -> Entity:
 # =============================================================================
 # Subscription Extension Types (EXTENSION-SUBSCRIPTION v3.2)
 # =============================================================================
+
+
+def type_system_subscription_notification() -> Entity:
+    """Type for a subscription notification (an entity-tree change event).
+
+    Per EXTENSION-SUBSCRIPTION §2.2, **RATIFIED 2026-08-10**: renamed from
+    `system/protocol/inbox/notification` and re-homed INBOX → SUBSCRIPTION —
+    a subscription event belongs to the spec that defines subscriptions
+    (owner-not-problem-domain, SPECIFICATION-FORMAT §8.4.2), and the
+    `protocol/` prefix was the mis-homing that misled the cohort. Its sibling
+    `system/inbox/delivery` (async op results) correctly stays INBOX-owned.
+
+    Coordinated cohort cut [MUST]: one round, no dual-kind acceptance window.
+    The identifier moved here with the ownership rather than staying beside
+    the inbox types under a new string.
+    """
+    return Entity(
+        type="system/type",
+        data={
+            "name": "system/subscription/notification",
+            "fields": {
+                "subscription_id": {"type_ref": "primitive/string"},
+                "event": {"type_ref": "primitive/string"},
+                "uri": {"type_ref": "system/tree/path"},
+                "hash": {"type_ref": "system/hash", "optional": True},
+                "previous_hash": {"type_ref": "system/hash", "optional": True},
+            },
+        },
+    )
 
 
 def type_system_subscription_limits() -> Entity:
@@ -7240,7 +7248,6 @@ ALL_TYPE_DEFINITIONS = [
     # Inbox extension types (EXTENSION-INBOX v5.0 - V7.8)
     type_system_delivery_spec,
     type_system_inbox_delivery,
-    type_system_protocol_inbox_notification,
     # Durability contract types (EXTENSION-DURABILITY v0.1 — exploratory,
     # optional, extracted from EXTENSION-INBOX §10; depends V7 v7.46+)
     type_system_durability_request,
@@ -7257,6 +7264,7 @@ ALL_TYPE_DEFINITIONS = [
     type_system_continuation_abandon_request,
     type_system_continuation_install_result,
     # Subscription extension types (EXTENSION-SUBSCRIPTION v3.2)
+    type_system_subscription_notification,
     type_system_subscription,
     type_system_subscription_request,
     type_system_subscription_cancel,

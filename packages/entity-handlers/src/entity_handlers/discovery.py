@@ -113,6 +113,16 @@ _OP_ANNOUNCE_STOP = "announce-stop"
 # flagged for D5 reconciliation (handoff discipline #3, slug-divergence watch).
 _OP_DECIDE = "decide"
 
+
+class UnknownProfileRef(Exception):
+    """§3.3 sentinel — a backend does not recognize this ``profile_ref``.
+
+    Raised by :meth:`DiscoveryBackend.recognize_profile_ref` and mapped by the
+    substrate to **400 ``unknown_profile_ref``** on ``:announce`` *and*
+    ``:announce-stop`` alike. (go's counterpart: ``discovery.ErrUnknownProfileRef``.)
+    """
+
+
 _VALID_OUTCOMES = {"ignore", "track", "grant-limited", "grant-more"}
 _GRANT_OUTCOMES = {"grant-limited", "grant-more"}
 
@@ -323,6 +333,30 @@ class DiscoveryBackend(ABC):
     async def announce(self, profile_ref: str, txt: dict[str, Any]) -> AnnounceSession:
         """Advertise self on the backend's medium (§3 ``:announce``)."""
         ...
+
+    def recognize_profile_ref(self, profile_ref: str) -> None:
+        """§3.3 ``[corrected 2026-08-11]`` — classify ``profile_ref``. Return
+        normally if this backend recognizes it; raise :class:`UnknownProfileRef`
+        if it does not.
+
+        **Recognition is the backend's, not the tree's.** The earlier text
+        required resolution against a published
+        ``system/peer/transport/{peer}/{profile-id}`` entity; arch ruled that a
+        drafting slip — it made the mandatory happy path unreachable, and all
+        three implementations routed it independently in one cycle. ``unknown``
+        means *this backend has no such profile*, exactly as ``unknown_backend``
+        means *this peer has not registered that backend*.
+
+        The base raises :class:`NotImplementedError`, which the substrate
+        reports as **500** ``backend_error`` — deliberately neither of the two
+        conformant answers. A backend that cannot classify has a wiring defect;
+        answering 400 would blame the caller for it and answering 200 would
+        advertise a profile nobody can dial.
+        """
+        raise NotImplementedError(
+            f"backend {self.name!r} cannot classify profile_ref "
+            f"{profile_ref!r} — no recognize_profile_ref implementation"
+        )
 
     def set_local_peer_id(self, peer_id: str) -> None:
         """Optional hook: the substrate calls this at init with the local
@@ -702,49 +736,31 @@ class DiscoveryExtension(Extension):
         )
         self._emit_candidate(backend, obs, at_ceiling=at_ceiling)
 
-    def _resolves_own_transport_profile(
-        self, ctx: HandlerContext, profile_ref: str,
-    ) -> bool:
-        """DISCOVERY §3.3 — does ``profile_ref`` name a transport profile this
-        peer publishes at ``system/peer/transport/{peer}/{profile-id}``?
+    def _classify_profile_ref(
+        self, backend: DiscoveryBackend, profile_ref: str,
+    ) -> dict[str, Any] | None:
+        """§3.3 ``[corrected 2026-08-11]`` — ask the backend whether it
+        recognizes ``profile_ref``. Returns an error response, or ``None`` when
+        the ref is recognized and the caller may proceed.
 
-        Matched two ways, and deliberately: by the **profile-id** segment
-        (``primary``, ``primary-http-poll``) and by the profile entity's
-        **transport_type** (``tcp``, ``http-poll``). The cohort's own-profile
-        vocabularies diverge — py publishes its listener at profile-id
-        ``primary`` with ``transport_type: "tcp"``, while core-go's mDNS
-        resolver switches on the literal strings ``tcp`` / ``http-poll`` and
-        derives the port from the listen address without consulting the tree at
-        all. §3.3's MUST is observable only on the *negative* case, so both
-        readings pass it while meaning different things; accepting either
-        spelling resolves what a caller can reasonably mean without inventing a
-        transport entity we do not have. Routed upstream rather than guessed at
-        silently.
-
-        Fails **closed**: with no tree to read, nothing resolves.
+        Shared by ``:announce`` and ``:announce-stop`` deliberately: the ruling
+        binds **both** ops, and the two used to disagree here because the check
+        lived in the announce handler rather than between them.
         """
-        pathway = getattr(ctx, "emit_pathway", None) or self._emit_pathway
-        if pathway is None:
-            return False
-        peer_id = getattr(ctx, "local_peer_id", None) or self._local_peer_id
-        if not peer_id:
-            return False
-        from entity_core.protocol.auth import compute_peer_identity_hash
-
         try:
-            peer_hex = compute_peer_identity_hash(peer_id).hex()
-        except Exception:
-            return False
-        prefix = f"system/peer/transport/{peer_hex}/"
-        tree = pathway.entity_tree
-        for uri in tree.list_prefix(prefix):
-            if uri.rsplit("/", 1)[-1] == profile_ref:
-                return True
-            h = tree.get(uri)
-            profile = pathway.content_store.get(h) if h is not None else None
-            if profile is not None and profile.data.get("transport_type") == profile_ref:
-                return True
-        return False
+            backend.recognize_profile_ref(profile_ref)
+        except UnknownProfileRef as exc:
+            # A ref the backend has never heard of is a caller error — 400,
+            # never 500. A 500 tells the caller to retry something that can
+            # never succeed.
+            return _error(
+                400, "unknown_profile_ref",
+                f"backend {backend.name!r} does not recognize profile_ref "
+                f"{profile_ref!r}: {exc}",
+            )
+        except NotImplementedError as exc:
+            return _error(500, "backend_error", str(exc))
+        return None
 
     async def _handle_announce(
         self, ctx: HandlerContext, params: dict[str, Any],
@@ -759,15 +775,9 @@ class DiscoveryExtension(Extension):
         profile_ref = data.get("profile_ref")
         if not isinstance(profile_ref, str) or not profile_ref:
             return _error(400, "invalid_params", "announce requires a profile_ref")
-        if not self._resolves_own_transport_profile(ctx, profile_ref):
-            # §3.3 [added 2026-08-10]: a profile_ref naming no transport profile
-            # of ours is a caller error — 400, never 500. `announce` advertises
-            # something real; a synthetic label has nothing to publish, and a
-            # 500 would invite a retry that can never succeed.
-            return _error(
-                400, "unknown_profile_ref",
-                f"no transport profile {profile_ref!r} published by this peer",
-            )
+        err = self._classify_profile_ref(backend, profile_ref)
+        if err is not None:
+            return err
         txt = data.get("txt") if isinstance(data.get("txt"), dict) else {}
         try:
             session = await backend.announce(profile_ref, txt)
@@ -780,19 +790,43 @@ class DiscoveryExtension(Extension):
     async def _handle_announce_stop(
         self, ctx: HandlerContext, params: dict[str, Any],
     ) -> dict[str, Any]:
-        """§3 ``:announce-stop(backend, profile_ref)`` — end an announce."""
+        """§3 ``:announce-stop(backend, profile_ref)`` — end an announce.
+
+        §3.3 is a **two-case** rule and this op needs both of them:
+
+        - *unrecognized by the backend* → **400** ``unknown_profile_ref``
+        - *recognized but not running*  → **200**, idempotent
+
+        Being idempotent is not conformance on its own. Returning 200 for
+        everything answers the second case without ever asking the first — which
+        is what this handler did, and what the ruling names in terms.
+        """
         data = _params_data(params)
         backend_name = data.get("backend")
+        backend = self._get_backend(backend_name)
+        if backend is None:
+            return _error(400, "unknown_backend",
+                          f"no discovery backend {backend_name!r}")
         profile_ref = data.get("profile_ref")
-        st = self._state.get(backend_name) if isinstance(backend_name, str) else None
+        if not isinstance(profile_ref, str) or not profile_ref:
+            return _error(400, "invalid_params", "announce-stop requires a profile_ref")
+
+        st = self._state.get(backend_name)
         session = st.announces.pop(profile_ref, None) if st else None
         if session is not None:
+            # Running: stopping it answers the question, no classification
+            # needed — a ref we are actively announcing is recognized by
+            # construction.
             try:
                 await session.stop()
             except Exception:
                 logger.debug("discovery: announce-stop failed", exc_info=True)
-        # Idempotent: stopping an absent announce is still ().
-        return _ok("system/protocol/ack", {"stopped": session is not None})
+            return _ok("system/protocol/ack", {"stopped": True})
+
+        err = self._classify_profile_ref(backend, profile_ref)
+        if err is not None:
+            return err
+        return _ok("system/protocol/ack", {"stopped": False})
 
     async def _handle_decide(
         self, ctx: HandlerContext, params: dict[str, Any],

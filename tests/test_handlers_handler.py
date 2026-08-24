@@ -161,6 +161,74 @@ class TestRegister:
         assert et.get("system/compute/builtins/map") is None
 
     @pytest.mark.asyncio
+    async def test_register_rejects_reserved_system_pattern(self):
+        """V7 §6.2: *"Implementations MUST NOT allow user-installed handlers to
+        register at `system/*` paths."*
+
+        We guarded only `system/compute/builtins/*` and let the rest of the
+        namespace through — a live cross-impl run answered 200 to a register at
+        a reserved `system/*` pattern. §6.6 resolves by longest prefix, so a
+        handler bound in front of `system/tree` takes every dispatch to that
+        prefix.
+        """
+        ep, cs, et, kp = _setup()
+
+        manifest = _manifest("system/tree", "shadow",
+                             {"get": {"output_type": "primitive/any"}})
+        params = {"data": {"manifest": manifest}}
+
+        result = await handlers_handler(
+            HANDLERS_HANDLER_PATTERN, "register", params,
+            _ctx(ep, kp.peer_id, kp,
+                 resource_targets=["system/handler/system/tree"]),
+        )
+        assert result["status"] == 403
+        assert result["result"]["data"]["code"] == "forbidden_pattern"
+
+    @pytest.mark.asyncio
+    async def test_reserved_register_publishes_nothing(self):
+        """GUIDE-CONFORMANCE §2.4a negative half — the conjunct that matters.
+
+        A refusal that published the artifacts anyway satisfies a status-only
+        check while defeating the reservation entirely. All three of what the
+        positive path writes must be absent: the interface at
+        `system/handler/{pattern}`, the handler entity at `{pattern}`, and the
+        grant at `system/capability/grants/{pattern}`.
+        """
+        ep, cs, et, kp = _setup()
+
+        manifest = _manifest("system/capability", "shadow",
+                             {"request": {"output_type": "primitive/any"}})
+        result = await handlers_handler(
+            HANDLERS_HANDLER_PATTERN, "register",
+            {"data": {"manifest": manifest}},
+            _ctx(ep, kp.peer_id, kp,
+                 resource_targets=["system/handler/system/capability"]),
+        )
+        assert result["status"] == 403
+        assert et.get("system/handler/system/capability") is None
+        assert et.get("system/capability") is None
+        assert et.get("system/capability/grants/system/capability") is None
+
+    @pytest.mark.asyncio
+    async def test_reservation_is_a_component_boundary(self):
+        """`system` and `system/...` are reserved; `systemic/...` is not. The
+        same boundary defect go hit in DOMAIN-LOCAL-FILES §8.3 — a raw
+        `startswith("system")` takes a name that merely begins with the letters
+        and refuses a legitimate registration."""
+        ep, cs, et, kp = _setup()
+
+        manifest = _manifest("systemic/foo", "ok",
+                             {"do": {"output_type": "primitive/any"}})
+        result = await handlers_handler(
+            HANDLERS_HANDLER_PATTERN, "register",
+            {"data": {"manifest": manifest}},
+            _ctx(ep, kp.peer_id, kp,
+                 resource_targets=["system/handler/systemic/foo"]),
+        )
+        assert result["status"] == 200, result
+
+    @pytest.mark.asyncio
     async def test_register_uses_requested_scope_over_internal_scope(self):
         ep, cs, et, kp = _setup()
 

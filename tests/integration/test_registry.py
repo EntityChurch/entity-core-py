@@ -958,3 +958,60 @@ async def test_reg_set_issuer_policy_replaces_whole(peer):
     assert got["allowlist"] is None
     assert got["name_constraints"] is None
     assert got["default_ttl"] is None
+
+
+@pytest.mark.asyncio
+async def test_reg_unsigned_revoke_refused_401(peer):
+    """§6a.9 REG-REVOKE-PROOF-1 — revoke is *"Signed by target_peer_id or the
+    operator"*. An unsigned revoke MUST be refused.
+
+    The suite had the signed path only, on both revoke and renew. That is the
+    gap the whole cohort shipped through: §6a.9 named a proof vector for
+    `register` and none for these two, and *the vector list, not the prose, is
+    what gets implemented against* — go and rust accepted unsigned revokes
+    outright, a permanent denial-of-name against every binding in the registry
+    since revocation is monotonic.
+
+    401 `proof_failed`, not 403 `not_entitled`: absent proof is an
+    authentication result; 403 is "proof accepted, policy says no".
+    """
+    _emit_issuer_policy(peer, "open")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    data = _register_data(reg_kp.peer_id, "keepme.com")
+    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
+    binding_hash = (await _call(peer, "register-request", data))["result"]["data"]["binding_hash"]
+
+    # No _sign_into_store for the revoke — that is the whole test.
+    r = await _call(peer, "revoke-request", {"binding_hash": binding_hash,
+                                             "reason": "not mine to revoke"})
+    assert r["status"] == 401
+    assert r["result"]["data"]["code"] == "proof_failed"
+
+    # §2.4a negative half: refused AND nothing published. A 401 that emitted
+    # the revocation anyway would satisfy a status-only check while leaving the
+    # name permanently dead — the failure this vector exists to catch.
+    assert (await _call(peer, "resolve", {"name": "keepme.com"}))["result"]["data"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_reg_unsigned_renew_refused_401(peer):
+    """§6a.9 REG-RENEW-PROOF-1 — renew is *"Signed by target_peer_id"*
+    (layer-1). Replay defense is not authorization: a nonce check stops a
+    *captured* request being re-run while leaving a *fresh unsigned* one
+    accepted."""
+    _emit_issuer_policy(peer, "open")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    data = _register_data(reg_kp.peer_id, "renewme.com")
+    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
+    binding_hash = (await _call(peer, "register-request", data))["result"]["data"]["binding_hash"]
+
+    r = await _call(peer, "renew-request", {"binding_hash": binding_hash, "ttl": 999999})
+    assert r["status"] == 401
+    assert r["result"]["data"]["code"] == "proof_failed"
+
+    # Negative half: no superseding binding was issued.
+    resolved = await _call(peer, "resolve", {"name": "renewme.com"})
+    assert resolved["result"]["data"]["status"] == "resolved"
+    assert bytes(resolved["result"]["data"]["binding"]) == bytes(binding_hash)

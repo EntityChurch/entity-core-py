@@ -11,7 +11,7 @@ Operations: receive
 The single `receive` operation accepts any entity type. The entity's
 type carries semantic information:
 - system/inbox/delivery: Async operation results
-- system/protocol/inbox/notification: Subscription notifications
+- system/subscription/notification: Subscription notifications (SUBSCRIPTION-owned)
 
 Example inbox URI: entity://peer/system/inbox/my-request
 

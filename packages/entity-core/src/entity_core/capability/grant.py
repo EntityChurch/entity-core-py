@@ -49,16 +49,18 @@ def create_capability_token(
             hash, never recomputed here.
         grants: List of permission grants.
         expires_in_ms: Optional expiration time from now in milliseconds.
-        algorithm: V7 v7.69 §4.5a active content_hash_format. The cap entity,
-            the granter identity, and the cap signature are all authored under
-            it (the cap chain is format-self-consistent, §5.5 freeze). ``None``
-            → process-global default.
+        algorithm: V7 v7.69 §4.5a active content_hash_format. The cap entity
+            and the cap signature are authored under it (the cap chain is
+            format-self-consistent, §5.5 freeze). The granter *identity* is
+            not: §4.5a item 1a floor-pins ``system/peer`` unconditionally, and
+            it is the named exception the chain's self-consistency reads
+            around. ``None`` → process-global default.
 
     Returns:
         Tuple of (capability_entity, granter_identity, signature_entity).
     """
-    # Create granter identity (authored under the active format)
-    granter_identity = create_identity_entity(granter_keypair, algorithm=algorithm)
+    # Create granter identity (floor-pinned, §4.5a item 1a)
+    granter_identity = create_identity_entity(granter_keypair)
     granter_hash = granter_identity.compute_hash()
     # §1.8: if grantee_identity carries a wire content_hash, compute_hash
     # returns it verbatim (the connecting peer's authored form); otherwise it

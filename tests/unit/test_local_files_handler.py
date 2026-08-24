@@ -1102,3 +1102,72 @@ def test_reverse_write_projects_tree_to_disk(tmp_path):
         assert on_disk.read_bytes() == body
 
     _run(_drive())
+
+
+# -----------------------------------------------------------------------------
+# §8.3 containment is a COMPONENT boundary — LF-CONTAIN-BOUNDARY-1
+#
+# core-go's containment prefix test had no component boundary, so `/srv/peerroot`
+# contained `/srv/peerroot-backup`. Arch took the spec defect as theirs (§8.3's
+# own pseudocode read as a raw string prefix test) and restructured §8.3
+# invariant-first with the boundary as its own MUST.
+#
+# py holds on both sides, but by *construction* rather than by assertion — the
+# filesystem side appends os.sep before comparing, the tree side normalizes every
+# prefix to end in "/". Construction is exactly what a later simplification
+# removes without noticing, and the go packet is explicit that the V4 probe is
+# read-only and structurally cannot reach this: "V4a green is not containment
+# audited." So it gets pinned here instead.
+# -----------------------------------------------------------------------------
+
+
+def test_sibling_root_with_shared_prefix_is_not_contained(tmp_path):
+    """The go shape, on py's filesystem-side comparison: a sibling directory
+    whose name merely *starts with* the root's name is outside it."""
+    from entity_handlers.local_files.config import RootMapping, resolve_fs_path
+
+    root_dir = tmp_path / "peerroot"
+    sibling = tmp_path / "peerroot-backup"
+    root_dir.mkdir()
+    sibling.mkdir()
+    (sibling / "secret.txt").write_text("not yours")
+
+    root = RootMapping(
+        name="r", prefix="local/files/r/", filesystem_root=str(root_dir),
+    )
+    # `..` back out and into the sibling — the resolved path is
+    # `<tmp>/peerroot-backup/secret.txt`, which shares every byte of
+    # `<tmp>/peerroot` as a raw string prefix.
+    with pytest.raises(PermissionError):
+        resolve_fs_path(root, "local/files/r/../peerroot-backup/secret.txt")
+
+
+def test_root_itself_is_contained(tmp_path):
+    """The other half of the boundary: equality still counts as inside. A
+    boundary check written as `startswith(root + sep)` alone would reject the
+    root — over-strict is a defect too, just a quieter one."""
+    from entity_handlers.local_files.config import RootMapping, resolve_fs_path
+
+    root_dir = tmp_path / "peerroot"
+    root_dir.mkdir()
+    (root_dir / "ok.txt").write_text("mine")
+    root = RootMapping(
+        name="r", prefix="local/files/r/", filesystem_root=str(root_dir),
+    )
+    fs_path, rel = resolve_fs_path(root, "local/files/r/ok.txt")
+    assert fs_path == str(root_dir / "ok.txt")
+    assert rel == "ok.txt"
+
+
+def test_tree_prefix_match_respects_the_component_boundary():
+    """The same rule on the *tree* side, which is where a mis-route rather than
+    an escape would happen: `local/files/shared/` must not claim a path under
+    `local/files/shared-evil/`."""
+    from entity_handlers.local_files.config import RootMapping, find_root_mapping
+
+    shared = RootMapping(
+        name="shared", prefix="local/files/shared/", filesystem_root="/srv/shared",
+    )
+    roots = {"shared": shared}
+    assert find_root_mapping(roots, "local/files/shared/a.txt") is shared
+    assert find_root_mapping(roots, "local/files/shared-evil/a.txt") is None

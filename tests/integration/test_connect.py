@@ -290,15 +290,23 @@ async def test_malformed_request_path_rejected_400_not_dropped(server_peer: Peer
     a clean 400 by validate_absolute_path AFTER canonicalize (which is now a
     pure transform, no longer the rejection point). The connection MUST stay
     answerable — this is the request-path half of the fail-closed fix; the
-    grant-pattern half is in test_capability.py."""
+    grant-pattern half is in test_capability.py.
+
+    Driven through ``conn.execute`` rather than raw ``send``/``recv``:
+    ``Connection.connect`` starts the demux reader task, so a bare
+    ``conn.recv()`` afterwards is a second coroutine reading one StreamReader.
+    That raced rather than asserted — ``readexactly() called while another
+    coroutine is already waiting``. The authenticated caller is the point of
+    the check: unauthenticated, the same URIs stop at ``403
+    capability_denied`` and never reach the path validator, so the 400 this
+    test exists to pin would go unmeasured."""
     client_keypair = Keypair.generate()
     conn = await Connection.connect("127.0.0.1", 19000, client_keypair)
     try:
         for bad_uri in ("../secret", "*/local/files/x"):
-            execute = Execute.create(uri=bad_uri, operation="get")
-            await conn.send(Envelope(root=execute.to_entity()))
-            response_env = await asyncio.wait_for(conn.recv(), timeout=2.0)
-            response = ExecuteResponse.from_entity(response_env.root)
+            response = await asyncio.wait_for(
+                conn.execute(uri=bad_uri, operation="get"), timeout=2.0,
+            )
             assert response.status == 400, f"{bad_uri!r} should 400, got {response.status}"
     finally:
         conn.close()

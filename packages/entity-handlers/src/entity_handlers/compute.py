@@ -2834,10 +2834,10 @@ async def _handle_install(
         derived = derive_peer_from_peer_id(handler_ctx.remote_peer_id)
         if derived is not None:
             pkey, _key_type = derived
-            author_entity = Entity(
-                type="system/peer",
-                data={"public_key": pkey, "key_type": "ed25519"},
-            )
+            # §4.5a item 1a — floor-pinned via the one constructor.
+            from entity_core.protocol.auth import create_peer_entity
+
+            author_entity = create_peer_entity(pkey, "ed25519")
             author_hash = ep.content_store.put(author_entity)
 
     from entity_core.storage.emit import EmitContext

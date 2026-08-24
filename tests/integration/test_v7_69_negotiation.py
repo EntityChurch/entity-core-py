@@ -188,7 +188,12 @@ async def _assert_authenticated_execute_ok(peer: Peer, conn: Connection) -> None
 @pytest.mark.asyncio
 async def test_both_sha384_authors_under_sha384():
     """Both peers SHA-384 → active SHA-384; handshake + authenticated EXECUTE
-    succeed with the cap grantee authored under SHA-384 (format byte 0x01)."""
+    succeed with the **cap** authored under SHA-384 (format byte 0x01) and the
+    **grantee identity pinned to the floor** (0x00).
+
+    v7.77 §4.5a item 1a: ``system/peer`` is the one entity on the wire/identity
+    surface that does not follow the active format. This test is the split —
+    two different format bytes in one cap, on one connection, deliberately."""
     with _default_format(ALG_ECFV1_SHA384):
         server_kp = Keypair.generate()
         peer = (
@@ -205,8 +210,14 @@ async def test_both_sha384_authors_under_sha384():
             try:
                 assert conn.active_hash_format == ALG_ECFV1_SHA384
                 assert conn.capability is not None
-                # grantee hash authored under the active format (0x01 = SHA-384)
-                assert conn.capability["data"]["grantee"][0] == ALG_ECFV1_SHA384
+                # The cap itself follows the active format (0x01 = SHA-384)…
+                assert conn.capability["content_hash"][0] == ALG_ECFV1_SHA384
+                # …but both identity references in it are floor-pinned (0x00),
+                # §4.5a item 1a. Asserting the granter too is the point: it is
+                # authored locally by the SHA-384 responder, so a home-format
+                # leak would show up here and not in the grantee.
+                assert conn.capability["data"]["grantee"][0] == ALG_ECFV1_SHA256
+                assert conn.capability["data"]["granter"][0] == ALG_ECFV1_SHA256
                 await _assert_authenticated_execute_ok(peer, conn)
             finally:
                 conn.close()
@@ -269,11 +280,14 @@ def test_sha384_home_responder_authors_downgraded_handshake_under_sha256():
         # Responder's home is SHA-384, but EVERY authored entity on this
         # connection is SHA-256 (format byte 0x00) — the §4.5a downgrade.
         assert cap.compute_hash()[0] == ALG_ECFV1_SHA256
-        assert granter_id.compute_hash()[0] == ALG_ECFV1_SHA256
         assert cap_sig.compute_hash()[0] == ALG_ECFV1_SHA256
+        # The identities here are floor-pinned by §4.5a item 1a rather than by
+        # the downgrade — on this connection the two rules agree on 0x00, which
+        # is why the sha384-active test above is the one that separates them.
+        assert granter_id.compute_hash()[0] == ALG_ECFV1_SHA256
         assert cap.data["granter"][0] == ALG_ECFV1_SHA256
-        # Grantee is the client's wire-authored identity (SHA-256), used
-        # verbatim per §1.8 — never re-hashed under the responder's home format.
+        # Grantee is the client's wire-authored identity, used verbatim per
+        # §1.8 — never re-hashed under the responder's home format.
         assert cap.data["grantee"] == id_ent.compute_hash()
         assert cap.data["grantee"][0] == ALG_ECFV1_SHA256
 

@@ -32,6 +32,7 @@ from entity_handlers.discovery import (
     BrowseSession,
     CandidateObservation,
     DiscoveryBackend,
+    UnknownProfileRef,
     DiscoveryExtension,
     identity_claim_from_peer_id,
     identity_hint_for_peer_id,
@@ -66,6 +67,10 @@ class _FakeAnnounce(AnnounceSession):
 class FakeBackend(DiscoveryBackend):
     name = "fake"
 
+    # §3.3 — recognition is the backend's vocabulary, not a tree lookup. `p1`
+    # and `p2` are this fake's whole world; everything else is unrecognized.
+    recognized = frozenset({"p1", "p2"})
+
     def __init__(self) -> None:
         self.snapshot: list[CandidateObservation] = []
         self.on_arrive = None
@@ -87,6 +92,10 @@ class FakeBackend(DiscoveryBackend):
         s = _FakeAnnounce()
         self.announces.append(s)
         return s
+
+    def recognize_profile_ref(self, profile_ref):
+        if profile_ref not in self.recognized:
+            raise UnknownProfileRef(f"fake backend knows {sorted(self.recognized)}")
 
     # test driver helpers
     def arrive(self, obs: CandidateObservation):
@@ -463,19 +472,7 @@ async def test_decide_grant_outcome_stores_refless_bare_hash(ext, peer):
 # ---------------------------------------------------------------------------
 
 
-def _publish_own_transport(peer, profile_id="p1", transport_type="tcp"):
-    """Publish one of THIS peer's transport profiles at the §6.5.1 path, which
-    is what `:announce` resolves `profile_ref` against (§3.3). `start()` does
-    this for real; these tests never bind a socket."""
-    peer._publish_tcp_profile(
-        peer.peer_id, "127.0.0.1:9999",
-        public_key=peer.keypair.public_key_bytes(),
-        profile_id=profile_id,
-    )
-
-
 async def test_announce_and_stop(ext, peer, backend):
-    _publish_own_transport(peer)
     resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "p1"})
     assert resp["status"] == 200 and resp["result"]["data"]["announced"] is True
     assert len(backend.announces) == 1 and backend.announces[0].stopped is False
@@ -484,51 +481,82 @@ async def test_announce_and_stop(ext, peer, backend):
     assert backend.announces[0].stopped is True
 
 
-async def test_announce_resolves_profile_ref_by_transport_type(ext, peer, backend):
-    """§3.3 — a profile published at profile-id `p1` with `transport_type: tcp`
-    resolves under EITHER spelling. core-go's mDNS resolver takes the literal
-    `tcp`; py's own listener profile is keyed `primary`. Accepting both is what
-    keeps one cohort vocabulary from silently failing the other's."""
-    _publish_own_transport(peer, profile_id="p1")
-    resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "tcp"})
-    assert resp["status"] == 200
-
-
 async def test_announce_unknown_profile_ref_400(ext, peer):
-    """§3.3 [added 2026-08-10] — a profile_ref that resolves to no transport
-    profile of ours is a caller error: 400 `unknown_profile_ref`, NOT 500. Same
-    Ruling-5 class as an unknown `backend`; a 500 tells the caller to retry
-    something that can never succeed."""
-    _publish_own_transport(peer)
+    """§3.3 — a profile_ref the **backend** does not recognize is a caller
+    error: 400 `unknown_profile_ref`, NOT 500. Same Ruling-5 class as an unknown
+    `backend`; a 500 tells the caller to retry something that can never
+    succeed."""
     resp = await _call(ext, peer, "announce",
-                       {"backend": "fake", "profile_ref": "no-such-transport-profile"})
+                       {"backend": "fake", "profile_ref": "no-such-profile"})
     assert resp["status"] == 400
     assert resp["result"]["data"]["code"] == "unknown_profile_ref"
 
 
-async def test_announce_fails_closed_with_no_published_profile(ext, peer):
-    """The negative half: a peer publishing NO transport profile resolves
-    nothing, so announce 400s rather than advertising a profile that does not
-    exist. Fail-closed is the point — the check is worthless if an empty tree
-    means 'sure, anything'."""
-    resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "tcp"})
+async def test_announce_stop_unknown_profile_ref_400(ext, peer):
+    """§3.3 `[corrected 2026-08-11]`, case 1 of 2 — the half we did not have.
+
+    We answered 200 for every stop, which is idempotency applied to a question
+    we never asked. The ruling says so in terms: *an implementation whose
+    announce-stop never maps its unknown-profile sentinel to 400 is not
+    conformant merely by being idempotent — the idempotency ruling covers the
+    second case only.*"""
+    resp = await _call(ext, peer, "announce-stop",
+                       {"backend": "fake", "profile_ref": "no-such-profile"})
     assert resp["status"] == 400
     assert resp["result"]["data"]["code"] == "unknown_profile_ref"
 
 
-async def test_announce_stop_idempotent(ext, peer):
-    """§3, §8.1 — announce-stop on a never-announced profile is a 200 no-op,
-    and deliberately does NOT resolve profile_ref. §3.3's sentence names
-    announce-stop too, but stopping something that was never started cannot
-    require the ref to resolve without contradicting idempotency; core-go
-    applies the check to `announce` only (ext/discovery/discovery.go
-    handleAnnounce vs handleAnnounceStop). Routed upstream."""
-    resp = await _call(ext, peer, "announce-stop", {"backend": "fake", "profile_ref": "ghost"})
+async def test_announce_stop_recognized_but_not_running_is_idempotent_200(ext, peer):
+    """§3.3 case 2 of 2 — *recognized but not running* stays a 200 no-op. The
+    two cases do not overlap once recognition is the backend's question: this
+    ref resolves, it simply was never announced."""
+    resp = await _call(ext, peer, "announce-stop",
+                       {"backend": "fake", "profile_ref": "p2"})
     assert resp["status"] == 200 and resp["result"]["data"]["stopped"] is False
+
+
+async def test_announce_stop_unknown_backend_400(ext, peer):
+    """An unregistered backend is 400 `unknown_backend` on stop as on scan —
+    stop used to reach past the backend registry entirely and report a cheerful
+    no-op for a backend this peer has never had."""
+    resp = await _call(ext, peer, "announce-stop",
+                       {"backend": "nope", "profile_ref": "p1"})
+    assert resp["status"] == 400
+    assert resp["result"]["data"]["code"] == "unknown_backend"
+
+
+async def test_announce_backend_that_cannot_classify_is_500_not_400(ext, peer):
+    """A backend with no `recognize_profile_ref` has a **wiring** defect, and
+    the substrate says so: 500, deliberately neither conformant answer. 400
+    would blame the caller for our own gap; 200 would advertise a profile
+    nobody can dial."""
+    from entity_handlers.discovery import DiscoveryBackend
+
+    class MuteBackend(DiscoveryBackend):
+        name = "mute"
+
+        async def scan(self, filter):
+            return []
+
+        async def start_browse(self, filter, on_arrive, on_depart):
+            raise NotImplementedError
+
+        async def announce(self, profile_ref, txt):
+            raise AssertionError("must not reach announce — classification failed first")
+
+    ext.register_backend(MuteBackend())
+    resp = await _call(ext, peer, "announce", {"backend": "mute", "profile_ref": "p1"})
+    assert resp["status"] == 500
+    assert resp["result"]["data"]["code"] == "backend_error"
 
 
 async def test_announce_requires_profile_ref(ext, peer):
     resp = await _call(ext, peer, "announce", {"backend": "fake"})
+    assert resp["status"] == 400
+
+
+async def test_announce_stop_requires_profile_ref(ext, peer):
+    resp = await _call(ext, peer, "announce-stop", {"backend": "fake"})
     assert resp["status"] == 400
 
 

@@ -39,6 +39,7 @@ from entity_handlers.discovery import (
     DiscoveryBackend,
     OnArrive,
     OnDepart,
+    UnknownProfileRef,
 )
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,35 @@ class MdnsBackend(DiscoveryBackend):
 
     name = "mdns"
 
-    def __init__(self, *, peer_id: str | None = None, resolve_timeout_ms: int = 3000) -> None:
+    #: §3.3 ``[corrected 2026-08-11]`` — the profile_refs this v1 backend
+    #: recognizes. Recognition is the **backend's vocabulary**, not a tree
+    #: lookup: arch ruled the "resolve against a published
+    #: ``system/peer/transport/{peer}/{profile-id}`` entity" sentence a drafting
+    #: slip that made the mandatory happy path unreachable.
+    #:
+    #: Two spellings, deliberately. core-go's mDNS resolver switches on the
+    #: literal transport types ``tcp`` / ``http-poll`` and derives the port from
+    #: the listen address; py publishes its own listener at profile-id
+    #: ``primary``. Accepting both resolves what a caller can reasonably mean
+    #: across the cohort. The divergence itself is routed upstream — §3.3's MUST
+    #: is observable only on the negative case, so both vocabularies pass it
+    #: while meaning different things.
+    RECOGNIZED_PROFILE_REFS = frozenset({
+        "tcp", "http-poll", "primary", "primary-http-poll",
+    })
+
+    def __init__(
+        self,
+        *,
+        peer_id: str | None = None,
+        resolve_timeout_ms: int = 3000,
+        recognized_profile_refs: frozenset[str] | set[str] | None = None,
+    ) -> None:
+        self._recognized = frozenset(
+            recognized_profile_refs
+            if recognized_profile_refs is not None
+            else self.RECOGNIZED_PROFILE_REFS
+        )
         self._peer_id = peer_id
         self._resolve_timeout_ms = resolve_timeout_ms
         self._azc: Any | None = None
@@ -173,6 +202,14 @@ class MdnsBackend(DiscoveryBackend):
         self._browser: Any | None = None
         self._on_arrive: OnArrive | None = None
         self._on_depart: OnDepart | None = None
+
+    def recognize_profile_ref(self, profile_ref: str) -> None:
+        """§3.3 — recognized or not, on both ``:announce`` and
+        ``:announce-stop``. Fails closed on anything outside the v1 vocabulary."""
+        if profile_ref not in self._recognized:
+            raise UnknownProfileRef(
+                f"mdns v1 backend supports: {', '.join(sorted(self._recognized))}"
+            )
 
     def set_local_peer_id(self, peer_id: str) -> None:
         if not self._peer_id:

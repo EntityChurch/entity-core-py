@@ -136,6 +136,25 @@ async def _handle_register(
                       "handlers under system/compute/builtins/* MUST NOT be "
                       "overridden (EXTENSION-COMPUTE §3.5)")
 
+    # V7 §6.2 / §6.6 system-path reservation: "Implementations MUST NOT allow
+    # user-installed handlers to register at `system/*` paths." The whole
+    # namespace, not just the compute builtins above — without this a caller
+    # holding register authority can bind a handler in front of `system/tree`
+    # or `system/capability` and every subsequent dispatch to that prefix
+    # resolves to theirs (§6.6 longest-prefix wins).
+    #
+    # Component-boundary comparison on purpose: `system` and `system/...` are
+    # reserved, `systemic/...` is not. A raw `startswith("system")` would take
+    # a name that merely begins with the same letters.
+    #
+    # Returns BEFORE any emit, which is the §2.4a negative half — a refusal
+    # that published the manifest, handler entity or grant anyway would satisfy
+    # a status-only check while defeating the reservation entirely.
+    if derived_pattern == "system" or derived_pattern.startswith("system/"):
+        return _error(403, "forbidden_pattern",
+                      f"pattern {derived_pattern!r} is reserved: user-installed "
+                      "handlers MUST NOT register at system/* (V7 §6.2)")
+
     manifest = params_data.get("manifest")
     if not isinstance(manifest, dict):
         return _error(400, "invalid_request",

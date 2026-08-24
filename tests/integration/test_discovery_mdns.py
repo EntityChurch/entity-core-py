@@ -12,12 +12,15 @@ Go/Rust byte dumps.
 
 from __future__ import annotations
 
+import pytest
+
 from entity_core.crypto.identity import Keypair
 
-from entity_handlers.discovery import identity_hint_for_peer_id
+from entity_handlers.discovery import UnknownProfileRef, identity_hint_for_peer_id
 from entity_handlers.discovery_mdns import (
     SERVICE_TYPE,
     TXT_VERSION,
+    MdnsBackend,
     _observation_from_info,
     _txt_properties,
 )
@@ -103,3 +106,35 @@ def test_observation_peer_id_hint_enables_identity_hint():
     obs = _observation_from_info(f"x.{SERVICE_TYPE}", info)
     assert obs.peer_id_hint == kp.peer_id
     assert identity_hint_for_peer_id(obs.peer_id_hint) == identity_hint_for_peer_id(kp.peer_id)
+
+
+# ---------------------------------------------------------------------------
+# §3.3 [corrected 2026-08-11] — profile_ref recognition is the backend's
+# ---------------------------------------------------------------------------
+
+
+def test_mdns_recognizes_both_cohort_spellings():
+    """The v1 vocabulary carries two spellings on purpose: core-go's mDNS
+    resolver switches on the literal transport types (`tcp`, `http-poll`) while
+    py publishes its own listener at profile-id `primary`. §3.3's MUST is
+    observable only on the negative case, so both vocabularies pass it while
+    meaning different things — accepting either is what keeps one cohort
+    spelling from silently failing the other's."""
+    b = MdnsBackend()
+    for ref in ("tcp", "http-poll", "primary", "primary-http-poll"):
+        b.recognize_profile_ref(ref)  # no raise == recognized
+
+
+def test_mdns_unrecognized_profile_ref_raises_the_sentinel():
+    """Fails closed, and with the sentinel the substrate maps to 400 on BOTH
+    `:announce` and `:announce-stop`."""
+    b = MdnsBackend()
+    with pytest.raises(UnknownProfileRef):
+        b.recognize_profile_ref("no-such-profile")
+
+
+def test_mdns_recognized_set_is_configurable():
+    b = MdnsBackend(recognized_profile_refs={"only-this"})
+    b.recognize_profile_ref("only-this")
+    with pytest.raises(UnknownProfileRef):
+        b.recognize_profile_ref("tcp")

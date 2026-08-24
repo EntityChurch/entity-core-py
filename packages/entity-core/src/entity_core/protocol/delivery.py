@@ -123,7 +123,7 @@ class InboxDelivery:
 
 @dataclass
 class InboxNotification:
-    """Params for system/protocol/inbox/notification (v7.8).
+    """Params for system/subscription/notification (v7.8).
 
     Delivers a subscription notification to an inbox endpoint.
 
@@ -135,7 +135,12 @@ class InboxNotification:
         previous_hash: The previous content hash (None for created).
     """
 
-    TYPE = "system/protocol/inbox/notification"
+    # EXTENSION-SUBSCRIPTION §2.2, RATIFIED 2026-08-10: renamed from
+    # `system/protocol/inbox/notification` and re-homed INBOX → SUBSCRIPTION
+    # (owner-not-problem-domain, SPECIFICATION-FORMAT §8.4.2). Coordinated
+    # cohort cut [MUST], one round, no dual-kind acceptance window — same
+    # round as the `system/inbox/delivery` sibling.
+    TYPE = "system/subscription/notification"
 
     subscription_id: str
     event: str

@@ -106,7 +106,7 @@ class TestInboxNotification:
     """Tests for InboxNotification (v7.8)."""
 
     def test_type_constant(self):
-        assert InboxNotification.TYPE == "system/protocol/inbox/notification"
+        assert InboxNotification.TYPE == "system/subscription/notification"
 
     def test_to_dict_full(self):
         notification = InboxNotification(
