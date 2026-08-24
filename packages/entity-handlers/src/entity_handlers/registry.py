@@ -1090,8 +1090,13 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
     # Layer-1 (ALWAYS): the request MUST be self-signed by target_peer_id.
     req_hash = _request_hash(REGISTER_REQUEST_TYPE, data)
     if not _verify_proof_by(ctx, req_hash, target_peer_id):
+        # 401, not 403: layer-1 is an *authentication* result — the requester
+        # failed to prove they hold the key they are binding the name to. 403
+        # is the layer-2 answer (`not_entitled`: proof accepted, policy says
+        # no). The spec pins neither code; this converges on core-go, which
+        # answers 401 for every layer-1 failure.
         return _error(
-            403, "proof_failed",
+            401, "proof_failed",
             "register-request signature is not by target_peer_id (§6a.9 layer-1)",
         )
 
@@ -1138,7 +1143,15 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
             REGISTER_PENDING_PREFIX + ph.hex(), pending,
             EmitContext.from_handler_grant(ctx, "register"),
         )
-        return _ok("system/registry/register-result", {"status": "pending_review", "pending_hash": ph})
+        # 202, not 200: the request was accepted for review, not acted on. A
+        # 200 says "done" for an operation whose entire point is that nothing
+        # was signed. The spec pins the body (`status: "pending_review"`) but
+        # not the code; this converges on core-go.
+        return _ok(
+            "system/registry/register-result",
+            {"status": "pending_review", "pending_hash": ph},
+            status=202,
+        )
 
     if mode == "allowlist":
         allow = policy.get("allowlist") or []
@@ -1238,29 +1251,53 @@ async def _handle_approve_request(ctx: HandlerContext, params: dict[str, Any]) -
 
 
 async def _handle_set_issuer_policy(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
-    """§6a.9.1 ``:set-issuer-policy`` — install/replace the registry's admission
+    """§6a.9.2 ``:set-issuer-policy`` — install/replace the registry's admission
     config (gated by ``registry-manage-issuer-policy``). Writing a policy is
-    what turns a curated registry *live*."""
+    what turns a curated registry *live*.
+
+    **Replace-whole, not merge** [MUST]: every optional field is read from this
+    request and an absent one means *unset*, never *unchanged* — a merge would
+    make the resulting policy depend on write order, which two peers cannot
+    reconstruct. Returns the stored policy as written (§6a.9.2 table)."""
     data = _params_data(params)
     mode = data.get("mode")
     if mode not in ISSUER_MODES:
         return _error(400, "invalid_params", f"mode must be one of {sorted(ISSUER_MODES)}")
-    policy = Entity(type=ISSUER_POLICY_TYPE, data={
+    if mode == "domain-control":
+        # §6a.9.2 [MUST]: the challenge format is deferred to the web-native
+        # domain-proof co-design (§6a.9.1), so refuse to *store* a policy the
+        # registry could not enforce rather than accept it and reject later.
+        return _error(
+            400, "unsupported_mode",
+            "domain-control is deferred (§6a.9.1) until the challenge format lands "
+            "— use open/allowlist/manual",
+        )
+    stored = {
         "mode": mode,
         "allowlist": data.get("allowlist"),
         "name_constraints": data.get("name_constraints"),
         "default_ttl": data.get("default_ttl"),
-    })
+    }
+    policy = Entity(type=ISSUER_POLICY_TYPE, data=stored)
     ctx.emit_pathway.emit(ISSUER_POLICY_PATH, policy, EmitContext.from_handler_grant(ctx, "configure"))
-    return _ok("system/protocol/ack", {"configured": True, "mode": mode})
+    return _ok(ISSUER_POLICY_TYPE, dict(stored))
 
 
 async def _handle_get_issuer_policy(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
-    """§6a.9.1 ``:get-issuer-policy`` — read the current policy (``mode: null``
-    when the registry is curated/static)."""
+    """§6a.9.2 ``:get-issuer-policy`` — read the stored policy.
+
+    **Unset is not a mode** [MUST]: with no policy entity stored this registry
+    is a conformant curated-only one (§6a.8) that does not run live
+    registration, so this returns ``404 not_found``. Synthesizing a default
+    ``open`` would silently turn a curated registry into first-come-first-serve.
+    """
     policy = _load_issuer_policy(ctx)
     if policy is None:
-        return _ok(ISSUER_POLICY_TYPE, {"mode": None})
+        return _error(
+            404, "not_found",
+            "no issuer-policy is stored — this registry is curated-only (§6a.8) "
+            "and does not run live registration",
+        )
     return _ok(ISSUER_POLICY_TYPE, dict(policy))
 
 

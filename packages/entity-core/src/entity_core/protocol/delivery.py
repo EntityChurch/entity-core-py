@@ -74,7 +74,7 @@ def _ensure_entity_hash(value: Any) -> Any:
 
 @dataclass
 class InboxDelivery:
-    """Params for system/protocol/inbox/delivery (v7.8).
+    """Params for system/inbox/delivery (v7.8).
 
     Delivers the result of a completed async operation to an inbox endpoint.
 
@@ -89,7 +89,11 @@ class InboxDelivery:
         result: The operation result as a full entity {type, data, content_hash}.
     """
 
-    TYPE = "system/protocol/inbox/delivery"
+    # EXTENSION-INBOX §2.1, RATIFIED 2026-08-10: renamed from
+    # `system/protocol/inbox/delivery` — the `protocol/` prefix mis-homed a type
+    # that INBOX owns (SPECIFICATION-FORMAT §8.4.2). Coordinated cohort cut
+    # [MUST], one round, no dual-kind acceptance window.
+    TYPE = "system/inbox/delivery"
 
     original_request_id: str
     status: int

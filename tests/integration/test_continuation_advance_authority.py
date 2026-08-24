@@ -188,7 +188,7 @@ async def test_reactive_marker_is_per_dispatch_not_inherited() -> None:
             bounds=Bounds().apply_defaults(), _execute_dispatcher=_dispatcher,
         )
         await inbox_handler("system/inbox", "receive",
-                            {"type": "system/protocol/inbox/delivery",
+                            {"type": "system/inbox/delivery",
                              "data": {"original_request_id": "x", "status": 200,
                                       "result": {"v": 1}}}, ctx)
 

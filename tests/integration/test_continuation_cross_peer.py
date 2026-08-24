@@ -118,7 +118,7 @@ async def test_cross_peer_dispatch_uses_scoped_cap_and_bundles_chain(peer_b):
             uri=f"entity://{peer_b.peer_id}/system/inbox",
             operation="receive",
             params={
-                "type": "system/protocol/inbox/delivery",
+                "type": "system/inbox/delivery",
                 "data": {"original_request_id": "c3", "status": 200,
                          "result": {"probe": "x"}},
             },
@@ -179,7 +179,7 @@ async def test_out_of_scope_denied_no_silent_escalation(peer_b):
             conn.capability, *(conn.capability_chain or []),
         ]
         params = {
-            "type": "system/protocol/inbox/delivery",
+            "type": "system/inbox/delivery",
             "data": {"original_request_id": "c3", "status": 200,
                      "result": {"probe": "x"}},
         }

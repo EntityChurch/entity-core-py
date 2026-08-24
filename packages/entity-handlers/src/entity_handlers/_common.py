@@ -41,9 +41,15 @@ def error_response(
     }
 
 
-def ok_response(result_type: str, data: dict[str, Any]) -> dict[str, Any]:
-    """Build a 200 response wrapping ``data`` as ``result_type``."""
-    return {"status": 200, "result": {"type": result_type, "data": data}}
+def ok_response(
+    result_type: str, data: dict[str, Any], status: int = 200
+) -> dict[str, Any]:
+    """Build a success response wrapping ``data`` as ``result_type``.
+
+    ``status`` defaults to 200 and exists for the 2xx codes that carry a result
+    body but are not "done" — e.g. 202 for work accepted but not yet performed.
+    """
+    return {"status": status, "result": {"type": result_type, "data": data}}
 
 
 def params_data(params: Any) -> dict[str, Any]:

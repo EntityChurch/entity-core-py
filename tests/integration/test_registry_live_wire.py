@@ -120,7 +120,7 @@ async def test_live_register_wire_proof_failure(registry_peer: Peer):
             params={"type": "system/registry/register-request", "data": data},
             included=[attacker_id.to_dict(), bad_sig.to_dict()],
         )
-        assert resp.status == 403
+        assert resp.status == 401
         body = resp.result["data"] if "data" in resp.result else resp.result
         assert body["code"] == "proof_failed"
     finally:

@@ -55,7 +55,7 @@ class TestInboxDelivery:
     """Tests for InboxDelivery (v7.8)."""
 
     def test_type_constant(self):
-        assert InboxDelivery.TYPE == "system/protocol/inbox/delivery"
+        assert InboxDelivery.TYPE == "system/inbox/delivery"
 
     def test_to_dict(self):
         delivery = InboxDelivery(

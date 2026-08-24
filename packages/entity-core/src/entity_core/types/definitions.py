@@ -1844,16 +1844,19 @@ def type_system_delivery_spec() -> Entity:
     )
 
 
-def type_system_protocol_inbox_delivery() -> Entity:
+def type_system_inbox_delivery() -> Entity:
     """Type for inbox delivery (async result).
 
-    Per EXTENSION-INBOX v5.0 §3.1.
-    Delivers the result of a completed async operation.
+    Per EXTENSION-INBOX §2.1. Delivers the result of a completed async
+    operation. RATIFIED 2026-08-10: renamed from
+    `system/protocol/inbox/delivery` (the `protocol/` prefix mis-homed a type
+    INBOX owns, SPECIFICATION-FORMAT §8.4.2) — a coordinated cohort cut with no
+    dual-kind acceptance window.
     """
     return Entity(
         type="system/type",
         data={
-            "name": "system/protocol/inbox/delivery",
+            "name": "system/inbox/delivery",
             "fields": {
                 "original_request_id": {"type_ref": "primitive/string"},
                 "status": {"type_ref": "primitive/uint"},
@@ -7236,7 +7239,7 @@ ALL_TYPE_DEFINITIONS = [
     type_system_resource_limits,
     # Inbox extension types (EXTENSION-INBOX v5.0 - V7.8)
     type_system_delivery_spec,
-    type_system_protocol_inbox_delivery,
+    type_system_inbox_delivery,
     type_system_protocol_inbox_notification,
     # Durability contract types (EXTENSION-DURABILITY v0.1 — exploratory,
     # optional, extracted from EXTENSION-INBOX §10; depends V7 v7.46+)

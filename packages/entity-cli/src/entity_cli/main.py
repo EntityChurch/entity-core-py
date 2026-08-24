@@ -488,17 +488,14 @@ async def cmd_registry_issue_binding(args: argparse.Namespace) -> None:
 
 
 async def cmd_registry_set_policy(args: argparse.Namespace) -> None:
-    """EXTENSION-REGISTRY §6a.9.1 — install the registry's issuer-policy.
+    """EXTENSION-REGISTRY §6a.9.2 — install the registry's issuer-policy.
 
     Writing a policy is what turns a curated/static registry *live*: it begins
-    accepting `register-request`. `domain-control` is deferred (§6a.10) — use
-    `open` / `allowlist` / `manual`.
+    accepting `register-request`. `domain-control` is deferred (§6a.9.1) — the
+    registry rejects it with `400 unsupported_mode`, which we surface rather
+    than pre-empt, so the ratified server-side rule is the one under test.
     """
     host, port, _ = parse_target(args.target)
-    if args.mode == "domain-control":
-        print("domain-control mode is deferred (§6a.9.1) — use open/allowlist/manual",
-              file=sys.stderr)
-        sys.exit(1)
     data = {
         "mode": args.mode,
         "allowlist": json.loads(args.allowlist) if args.allowlist else None,

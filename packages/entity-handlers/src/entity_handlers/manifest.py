@@ -844,8 +844,11 @@ REGISTRY_HANDLER_MANIFEST = build_handler_manifest(
         "approve-request": {
             "output_type": "system/registry/register-result",
         },
+        # §6a.9.2 — `set` echoes the stored policy as written; `get` is 404 when
+        # unset (unset is not a mode).
         "set-issuer-policy": {
             "input_type": "system/registry/issuer-policy",
+            "output_type": "system/registry/issuer-policy",
         },
         "get-issuer-policy": {
             "output_type": "system/registry/issuer-policy",

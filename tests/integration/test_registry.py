@@ -672,8 +672,29 @@ async def test_reg_register_proof_1(peer):
     data = _register_data(reg_kp.peer_id, "billslab.com")
     _sign_into_store(peer, attacker_kp, "system/registry/register-request", data)
     r = await _call(peer, "register-request", data)
-    assert r["status"] == 403
+    # 401: layer-1 is authentication (proof of key control), so a failure there
+    # is "you did not prove it", not "policy says no" (403 not_entitled).
+    assert r["status"] == 401
     assert r["result"]["data"]["code"] == "proof_failed"
+
+
+@pytest.mark.asyncio
+async def test_reg_register_wholly_unsigned_rejected_401(peer):
+    """§6a.9 layer-1 — a request with NO system/signature at its invariant
+    pointer is refused 401, and issues nothing. Distinct from the wrong-signer
+    case above: an absent proof and a bad proof are the same answer, because
+    ownership proof is the floor beneath every policy mode. `open` mode is what
+    makes this non-vacuous — the name is free and the only thing standing
+    between the request and a signed binding is layer-1."""
+    _emit_issuer_policy(peer, "open")
+    reg_kp = Keypair.generate()
+    data = _register_data(reg_kp.peer_id, "unsigned.com")
+    # deliberately no _sign_into_store
+    r = await _call(peer, "register-request", data)
+    assert r["status"] == 401
+    assert r["result"]["data"]["code"] == "proof_failed"
+    resolved = (await _call(peer, "resolve", {"name": "unsigned.com"}))["result"]["data"]
+    assert resolved["status"] != "resolved"
 
 
 @pytest.mark.asyncio
@@ -803,7 +824,11 @@ async def test_reg_register_manual_queue_then_approve(peer):
     data = _register_data(reg_kp.peer_id, "queued.com")
     _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
 
-    queued = (await _call(peer, "register-request", data))["result"]["data"]
+    r = await _call(peer, "register-request", data)
+    # 202 accepted-for-review, not 200 done: manual mode's whole point is that
+    # nothing was signed yet.
+    assert r["status"] == 202
+    queued = r["result"]["data"]
     assert queued["status"] == "pending_review"
     pending_hash = queued["pending_hash"]
 
@@ -846,9 +871,12 @@ async def test_reg_revoke_request_by_registrant(peer):
     binding_hash = (await _call(peer, "register-request", data))["result"]["data"]["binding_hash"]
     assert (await _call(peer, "resolve", {"name": "gone.com"}))["result"]["data"]["status"] == "resolved"
 
-    rev = _register_data(reg_kp.peer_id, "gone.com")  # reuse for nonce/issued_at fields
-    revoke_data = {"binding_hash": binding_hash, "reason": "rotation",
-                   "nonce": rev["nonce"], "issued_at": rev["issued_at"]}
+    # The ratified §6a.9 revoke schema is `{binding_hash, reason}` and nothing
+    # else: revocation is monotonic on a content-addressed target, so replay is
+    # a provable no-op and `nonce` / `issued_at` are deliberately absent. They
+    # used to be sent here, which would have hashed to a request no sibling
+    # authors — the signed hash covers `{type, data}` as written.
+    revoke_data = {"binding_hash": binding_hash, "reason": "rotation"}
     _sign_into_store(peer, reg_kp, "system/registry/revoke-request", revoke_data)
     r = await _call(peer, "revoke-request", revoke_data)
     assert r["status"] == 200 and r["result"]["data"]["revoked"] is True
@@ -882,10 +910,51 @@ async def test_reg_renew_request_supersedes(peer):
 
 @pytest.mark.asyncio
 async def test_reg_set_get_issuer_policy(peer):
-    """`:set-issuer-policy` installs the policy `:get-issuer-policy` reads back;
-    a fresh registry reports mode=None (curated/static)."""
-    assert (await _call(peer, "get-issuer-policy", {}))["result"]["data"]["mode"] is None
+    """§6a.9.2 — `:set-issuer-policy` installs the policy `:get-issuer-policy`
+    reads back, and `set` echoes the stored policy as written."""
     r = await _call(peer, "set-issuer-policy", {"mode": "allowlist", "allowlist": ["p1"]})
-    assert r["status"] == 200 and r["result"]["data"]["mode"] == "allowlist"
+    assert r["status"] == 200
+    assert r["result"]["type"] == "system/registry/issuer-policy"
+    assert r["result"]["data"]["mode"] == "allowlist"
     got = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
     assert got["mode"] == "allowlist" and got["allowlist"] == ["p1"]
+
+
+@pytest.mark.asyncio
+async def test_reg_get_issuer_policy_unset_is_404(peer):
+    """§6a.9.2 [MUST] — unset is not a mode. A registry with no stored policy is
+    a conformant curated-only one (§6a.8); `get` MUST return 404 and MUST NOT
+    synthesize a default `open`, which would silently turn a curated registry
+    into first-come-first-serve."""
+    r = await _call(peer, "get-issuer-policy", {})
+    assert r["status"] == 404
+    assert r["result"]["data"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_reg_set_issuer_policy_domain_control_400(peer):
+    """§6a.9.2 [MUST] — `domain-control` is deferred until the challenge format
+    lands (§6a.9.1), so `set` refuses to *store* a policy the registry could not
+    enforce. The registry stays curated-only: nothing was written."""
+    r = await _call(peer, "set-issuer-policy", {"mode": "domain-control"})
+    assert r["status"] == 400
+    assert r["result"]["data"]["code"] == "unsupported_mode"
+    assert (await _call(peer, "get-issuer-policy", {}))["status"] == 404
+
+
+@pytest.mark.asyncio
+async def test_reg_set_issuer_policy_replaces_whole(peer):
+    """§6a.9.2 [MUST] — replace-whole, not merge. An optional field absent from
+    the second write means *unset*, not *unchanged*; merge semantics would make
+    the stored policy depend on write order, which two peers cannot
+    reconstruct."""
+    await _call(peer, "set-issuer-policy", {
+        "mode": "allowlist", "allowlist": ["p1"],
+        "name_constraints": "*.lab", "default_ttl": 60_000,
+    })
+    await _call(peer, "set-issuer-policy", {"mode": "open"})
+    got = (await _call(peer, "get-issuer-policy", {}))["result"]["data"]
+    assert got["mode"] == "open"
+    assert got["allowlist"] is None
+    assert got["name_constraints"] is None
+    assert got["default_ttl"] is None

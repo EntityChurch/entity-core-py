@@ -23,6 +23,7 @@ from typing import Any
 
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
+from entity_core.protocol.framing import HashValidationError, validate_entity_hash
 from entity_core.storage.emit import EmitContext
 from entity_core.storage.entity_tree import EntityTree
 from entity_core.types.deletion_marker import is_deletion_marker
@@ -372,8 +373,29 @@ async def _handle_put(
             },
         }
 
-    # Store entity
-    entity = Entity.from_dict(entity_data)
+    # Store entity.
+    #
+    # §1.8 strict entity fidelity: `put` is a WIRE-RECEIPT path, so a carried
+    # content_hash is validated and then trusted verbatim — never recomputed.
+    # `Entity.from_dict` drops it and re-derives on demand under this peer's
+    # HOME format, which is invisible while author and receiver share a format
+    # (the recompute coincides) and silently rewrites the reference the moment
+    # they do not: a SHA-384-authored entity read back as a SHA-256 hash, so no
+    # holder of the authored reference can resolve it (ENC-ROUNDTRIP-FORMAT-1,
+    # V7 §1.8 / v7.69 §4.5a). Validation is format-aware — it reads the claimed
+    # hash's own leading format byte, not our default.
+    if isinstance(entity_data, dict) and entity_data.get("content_hash") is not None:
+        try:
+            validate_entity_hash(entity_data)
+        except HashValidationError as exc:
+            return _error_response(
+                400, "hash_mismatch",
+                f"entity content_hash does not match its {{type, data}}: {exc}",
+            )
+        entity, _ = Entity.from_wire_dict(entity_data)
+    else:
+        # Locally-authored: no claimed hash to preserve, so author one.
+        entity = Entity.from_dict(entity_data)
     emit_ctx = EmitContext.from_handler_context(ctx, "put")
     emit_result = ctx.emit_pathway.emit(full_uri, entity, emit_ctx)
 

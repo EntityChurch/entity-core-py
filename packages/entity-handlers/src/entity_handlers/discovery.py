@@ -702,6 +702,50 @@ class DiscoveryExtension(Extension):
         )
         self._emit_candidate(backend, obs, at_ceiling=at_ceiling)
 
+    def _resolves_own_transport_profile(
+        self, ctx: HandlerContext, profile_ref: str,
+    ) -> bool:
+        """DISCOVERY §3.3 — does ``profile_ref`` name a transport profile this
+        peer publishes at ``system/peer/transport/{peer}/{profile-id}``?
+
+        Matched two ways, and deliberately: by the **profile-id** segment
+        (``primary``, ``primary-http-poll``) and by the profile entity's
+        **transport_type** (``tcp``, ``http-poll``). The cohort's own-profile
+        vocabularies diverge — py publishes its listener at profile-id
+        ``primary`` with ``transport_type: "tcp"``, while core-go's mDNS
+        resolver switches on the literal strings ``tcp`` / ``http-poll`` and
+        derives the port from the listen address without consulting the tree at
+        all. §3.3's MUST is observable only on the *negative* case, so both
+        readings pass it while meaning different things; accepting either
+        spelling resolves what a caller can reasonably mean without inventing a
+        transport entity we do not have. Routed upstream rather than guessed at
+        silently.
+
+        Fails **closed**: with no tree to read, nothing resolves.
+        """
+        pathway = getattr(ctx, "emit_pathway", None) or self._emit_pathway
+        if pathway is None:
+            return False
+        peer_id = getattr(ctx, "local_peer_id", None) or self._local_peer_id
+        if not peer_id:
+            return False
+        from entity_core.protocol.auth import compute_peer_identity_hash
+
+        try:
+            peer_hex = compute_peer_identity_hash(peer_id).hex()
+        except Exception:
+            return False
+        prefix = f"system/peer/transport/{peer_hex}/"
+        tree = pathway.entity_tree
+        for uri in tree.list_prefix(prefix):
+            if uri.rsplit("/", 1)[-1] == profile_ref:
+                return True
+            h = tree.get(uri)
+            profile = pathway.content_store.get(h) if h is not None else None
+            if profile is not None and profile.data.get("transport_type") == profile_ref:
+                return True
+        return False
+
     async def _handle_announce(
         self, ctx: HandlerContext, params: dict[str, Any],
     ) -> dict[str, Any]:
@@ -715,6 +759,15 @@ class DiscoveryExtension(Extension):
         profile_ref = data.get("profile_ref")
         if not isinstance(profile_ref, str) or not profile_ref:
             return _error(400, "invalid_params", "announce requires a profile_ref")
+        if not self._resolves_own_transport_profile(ctx, profile_ref):
+            # §3.3 [added 2026-08-10]: a profile_ref naming no transport profile
+            # of ours is a caller error — 400, never 500. `announce` advertises
+            # something real; a synthetic label has nothing to publish, and a
+            # 500 would invite a retry that can never succeed.
+            return _error(
+                400, "unknown_profile_ref",
+                f"no transport profile {profile_ref!r} published by this peer",
+            )
         txt = data.get("txt") if isinstance(data.get("txt"), dict) else {}
         try:
             session = await backend.announce(profile_ref, txt)

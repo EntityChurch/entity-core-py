@@ -463,7 +463,19 @@ async def test_decide_grant_outcome_stores_refless_bare_hash(ext, peer):
 # ---------------------------------------------------------------------------
 
 
+def _publish_own_transport(peer, profile_id="p1", transport_type="tcp"):
+    """Publish one of THIS peer's transport profiles at the §6.5.1 path, which
+    is what `:announce` resolves `profile_ref` against (§3.3). `start()` does
+    this for real; these tests never bind a socket."""
+    peer._publish_tcp_profile(
+        peer.peer_id, "127.0.0.1:9999",
+        public_key=peer.keypair.public_key_bytes(),
+        profile_id=profile_id,
+    )
+
+
 async def test_announce_and_stop(ext, peer, backend):
+    _publish_own_transport(peer)
     resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "p1"})
     assert resp["status"] == 200 and resp["result"]["data"]["announced"] is True
     assert len(backend.announces) == 1 and backend.announces[0].stopped is False
@@ -472,7 +484,45 @@ async def test_announce_and_stop(ext, peer, backend):
     assert backend.announces[0].stopped is True
 
 
+async def test_announce_resolves_profile_ref_by_transport_type(ext, peer, backend):
+    """§3.3 — a profile published at profile-id `p1` with `transport_type: tcp`
+    resolves under EITHER spelling. core-go's mDNS resolver takes the literal
+    `tcp`; py's own listener profile is keyed `primary`. Accepting both is what
+    keeps one cohort vocabulary from silently failing the other's."""
+    _publish_own_transport(peer, profile_id="p1")
+    resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "tcp"})
+    assert resp["status"] == 200
+
+
+async def test_announce_unknown_profile_ref_400(ext, peer):
+    """§3.3 [added 2026-08-10] — a profile_ref that resolves to no transport
+    profile of ours is a caller error: 400 `unknown_profile_ref`, NOT 500. Same
+    Ruling-5 class as an unknown `backend`; a 500 tells the caller to retry
+    something that can never succeed."""
+    _publish_own_transport(peer)
+    resp = await _call(ext, peer, "announce",
+                       {"backend": "fake", "profile_ref": "no-such-transport-profile"})
+    assert resp["status"] == 400
+    assert resp["result"]["data"]["code"] == "unknown_profile_ref"
+
+
+async def test_announce_fails_closed_with_no_published_profile(ext, peer):
+    """The negative half: a peer publishing NO transport profile resolves
+    nothing, so announce 400s rather than advertising a profile that does not
+    exist. Fail-closed is the point — the check is worthless if an empty tree
+    means 'sure, anything'."""
+    resp = await _call(ext, peer, "announce", {"backend": "fake", "profile_ref": "tcp"})
+    assert resp["status"] == 400
+    assert resp["result"]["data"]["code"] == "unknown_profile_ref"
+
+
 async def test_announce_stop_idempotent(ext, peer):
+    """§3, §8.1 — announce-stop on a never-announced profile is a 200 no-op,
+    and deliberately does NOT resolve profile_ref. §3.3's sentence names
+    announce-stop too, but stopping something that was never started cannot
+    require the ref to resolve without contradicting idempotency; core-go
+    applies the check to `announce` only (ext/discovery/discovery.go
+    handleAnnounce vs handleAnnounceStop). Routed upstream."""
     resp = await _call(ext, peer, "announce-stop", {"backend": "fake", "profile_ref": "ghost"})
     assert resp["status"] == 200 and resp["result"]["data"]["stopped"] is False
 
