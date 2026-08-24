@@ -1,9 +1,23 @@
 # syntax=docker/dockerfile:1.7
 ARG PYTHON_VERSION=3.12
+# Pinned uv release, copied in below rather than floating on the
+# astral-sh/uv:pythonX.Y-bookworm-slim tag (which tracks uv's latest release
+# and drifted onto a uv 0.9.30 that fails `uv sync --frozen --no-editable`
+# for this workspace — hatchling's build-isolation venv came up missing
+# `packaging`, `ModuleNotFoundError: No module named 'packaging.version'` at
+# entity-handlers' wheel build. uv 0.10.12 builds this workspace cleanly;
+# pinning keeps the build reproducible instead of re-drifting on the next
+# upstream uv release.
+ARG UV_VERSION=0.10.12
 
 # ---------- builder ----------
 # Installs the workspace into /opt/venv. Used as the base for both runtime and dev.
-FROM ghcr.io/astral-sh/uv:python${PYTHON_VERSION}-bookworm-slim AS builder
+# Same base image as the runtime stage (python:${PYTHON_VERSION}-slim-bookworm)
+# so the venv built here and the interpreter it runs under at runtime match
+# exactly — no ABI drift between a separate uv-vendor image and this one.
+FROM python:${PYTHON_VERSION}-slim-bookworm AS builder
+ARG UV_VERSION
+COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
 
 ENV UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \

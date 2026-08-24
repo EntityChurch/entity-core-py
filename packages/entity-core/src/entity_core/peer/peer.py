@@ -2259,9 +2259,21 @@ class Peer:
         params = data.get("params", {})
 
         if conn_state.connect.is_complete:
+            if operation == "authenticate":
+                # V7 §4.6 Hardening / 0.8.1 RT-6 — same single-use-nonce
+                # replay rejection as the post-established-connection path
+                # in _handle_execute; see the comment there.
+                response = ExecuteResponse.unauthorized(
+                    request_id=request_id,
+                    message="Connect nonce already consumed",
+                    code="invalid_nonce",
+                )
+                await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
+                return
             response = ExecuteResponse.conflict(
                 request_id=request_id,
                 message="Connect already complete",
+                code="connection_already_established",
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return
@@ -2853,9 +2865,24 @@ class Peer:
                     writer, conn_state, Envelope(root=response.to_entity())
                 )
                 return
+            if operation == "authenticate":
+                # V7 §4.6 Hardening / 0.8.1 RT-6 — the issued handshake nonce
+                # is single-use; a second `authenticate` on an established
+                # connection is a replay of the (now-consumed) nonce, not a
+                # generic state conflict. MUST reject with 401 invalid_nonce,
+                # not 409 (a 409/state-conflict status under-signals a
+                # replay and is non-conformant per §4.6 Hardening).
+                response = ExecuteResponse.unauthorized(
+                    request_id=request_id,
+                    message="Connect nonce already consumed",
+                    code="invalid_nonce",
+                )
+                await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
+                return
             response = ExecuteResponse.conflict(
                 request_id=request_id,
                 message="Connect already complete",
+                code="connection_already_established",
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return

@@ -388,14 +388,35 @@ class ExecuteResponse:
         return cls(request_id=request_id, status=Uint(400), result={"code": code, "message": message})
 
     @classmethod
-    def unauthorized(cls, request_id: str, message: str = "Unauthorized") -> ExecuteResponse:
-        """Create a 401 unauthorized response."""
-        return cls(request_id=request_id, status=Uint(401), result={"code": "unauthorized", "message": message})
+    def unauthorized(
+        cls, request_id: str, message: str = "Unauthorized",
+        *, code: str = "unauthorized",
+    ) -> ExecuteResponse:
+        """Create a 401 unauthorized response.
+
+        ``code`` defaults to the generic ``"unauthorized"`` but callers
+        emitting a V7 §4.6/§4.7 connect-auth or §5.5 authz-boundary
+        subcode (e.g. ``"invalid_nonce"``, ``"authentication_failed"``,
+        ``"identity_mismatch"``, ``"unresolvable_grantee"``) pass the
+        spec-canonical identifier so cross-impl conformance vectors see
+        the right wire surface.
+        """
+        return cls(request_id=request_id, status=Uint(401), result={"code": code, "message": message})
 
     @classmethod
-    def conflict(cls, request_id: str, message: str = "Conflict") -> ExecuteResponse:
-        """Create a 409 conflict response."""
-        return cls(request_id=request_id, status=Uint(409), result={"code": "conflict", "message": message})
+    def conflict(
+        cls, request_id: str, message: str = "Conflict",
+        *, code: str = "conflict",
+    ) -> ExecuteResponse:
+        """Create a 409 conflict response.
+
+        ``code`` defaults to the generic ``"conflict"`` but callers emitting
+        a V7 §4.7 connection-error subcode (e.g.
+        ``"connection_already_established"``) pass the spec-canonical
+        identifier so cross-impl conformance vectors see the right wire
+        surface.
+        """
+        return cls(request_id=request_id, status=Uint(409), result={"code": code, "message": message})
 
     @classmethod
     def error(cls, request_id: str, message: str) -> ExecuteResponse:

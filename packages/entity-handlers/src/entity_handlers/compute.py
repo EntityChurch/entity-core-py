@@ -2415,6 +2415,34 @@ def _unwrap_entity_native_result(result: Any) -> dict[str, Any]:
 # Compute Handler (§3)
 # ---------------------------------------------------------------------------
 
+def _included_entities(handler_ctx: HandlerContext) -> dict[bytes, Entity]:
+    """Build the resolution tier-1 map from the request envelope's ``included``
+    (§4.2 — pre-authorized, always available during EXECUTE eval).
+
+    ``handler_ctx.included`` is a hash → raw-entity-dict map preserved from the
+    inbound envelope (peer.py::included=request_included). The evaluator's
+    ``EvalContext.resolve`` expects hash → :class:`Entity`, so convert here,
+    byte-faithfully: carry the validated wire hash via ``from_wire_dict`` (§1.8)
+    and fall back to ``from_dict`` only for dicts without a ``content_hash``.
+    Robust to a missing/non-dict attribute (e.g. a test mock) → empty map.
+    """
+    raw = getattr(handler_ctx, "included", None)
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[bytes, Entity] = {}
+    for h, d in raw.items():
+        if not isinstance(h, bytes) or not isinstance(d, dict):
+            continue
+        try:
+            out[h] = Entity.from_wire_dict(d)[0]
+        except Exception:
+            try:
+                out[h] = Entity.from_dict(d)
+            except Exception:
+                continue
+    return out
+
+
 async def _handle_eval(
     params_data: dict[str, Any],
     handler_ctx: HandlerContext,
@@ -2488,6 +2516,7 @@ async def _handle_eval(
         caller_capability=handler_ctx.caller_capability,
         emit_pathway=ep,
         has_content_store_access=has_cs_access,
+        included=_included_entities(handler_ctx),  # §4.2 tier 1
         subgraph_root=expression_uri,
         _execute_fn=dispatch_fn,
     )
@@ -2571,6 +2600,7 @@ async def _handle_install(
         capability=capability,
         emit_pathway=ep,
         has_content_store_access=True,
+        included=_included_entities(handler_ctx),  # §4.2 tier 1 / §2.3 N7 closure transfer
     )
 
     # Phase 1: Audit (relative paths resolved against root_path)
@@ -3540,6 +3570,7 @@ class ComputeExtension(Extension):
             caller_capability=handler_ctx.caller_capability,
             emit_pathway=ep,
             has_content_store_access=has_cs_access,
+            included=_included_entities(handler_ctx),  # §4.2 tier 1
             subgraph_root=expression_path,
             _execute_fn=dispatch_fn,
         )

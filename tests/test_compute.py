@@ -2493,6 +2493,53 @@ class TestHandleEval:
         assert result["result"]["data"]["code"] == ERR_INDEX_OUT_OF_RANGE
 
     @pytest.mark.asyncio
+    async def test_eval_resolves_subentity_from_included_map(self, setup):
+        """F-3 (compute corpus, EXTENSION-COMPUTE §4.2): tier-1 resolution from
+        the request envelope's `included` map.
+
+        A construct's field references a sub-entity carried ONLY in the
+        envelope `included` map — not resident in this peer's store or tree —
+        under a capability WITHOUT content_store_access (so tiers 2/3 cannot
+        reach it). It MUST resolve from tier 1, not answer not_found.
+
+        This is the round-blocker the first cross-impl compute-corpus run
+        found: every compute graph has >=2 entities, so without tier-1
+        resolution every wire-driven eval fails at its first hash reference.
+        """
+        from entity_handlers.compute import ComputeExtension
+        cs, et, ep = setup
+        handler = ComputeExtension().handler()
+
+        # Sub-entity lives ONLY in the envelope included map (never put()).
+        lit = Entity(type="compute/literal", data={"value": 42})
+        lit_h = lit.compute_hash()
+
+        # Root construct at a tree path; its field references the literal.
+        root = Entity(type="compute/construct",
+                      data={"entity_type": "app/x", "fields": {"v": lit_h}})
+        root_h = cs.put(root)
+        et.set("test/f3root", root_h)
+
+        # No content_store_access: tier 2/3 cannot resolve lit_h.
+        # Control — without `included`, the field hash is unresolvable.
+        ctx = self._make_handler_ctx(ep, resource_targets=["test/f3root"])
+        ctx.included = {}
+        res = await handler("system/compute/eval", "eval", {"data": {}}, ctx)
+        assert res["status"] == 200
+        assert res["result"]["type"] == "compute/error"
+        assert res["result"]["data"]["code"] == ERR_NOT_FOUND
+
+        # F-3 — with the literal carried in `included`, tier 1 resolves it and
+        # the construct materializes.
+        ctx2 = self._make_handler_ctx(ep, resource_targets=["test/f3root"])
+        ctx2.included = {lit_h: lit.to_dict()}  # wire dict with content_hash
+        res2 = await handler("system/compute/eval", "eval", {"data": {}}, ctx2)
+        assert res2["result"].get("type") != "compute/error", res2["result"]
+        assert res2["status"] == 200
+        assert res2["result"]["type"] == "app/x"
+        assert res2["result"]["data"]["v"] == 42
+
+    @pytest.mark.asyncio
     async def test_unsupported_operation(self, setup):
         from entity_handlers.compute import ComputeExtension
         cs, et, ep = setup

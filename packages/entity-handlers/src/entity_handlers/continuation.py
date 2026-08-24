@@ -85,6 +85,7 @@ import re
 import hashlib
 import secrets
 import time
+import weakref
 from typing import Any
 
 from entity_core.protocol.bounds import (
@@ -202,6 +203,26 @@ ENGINE_CODE_MERGE_VALUE_NOT_MAP = "merge_value_not_map"
 ENGINE_CODE_TRANSFORM_FAILED = "transform_failed"
 ENGINE_CODE_CHAIN_CONSTRUCTION_INVALID = "chain_construction_invalid"
 
+# PROPOSAL-CONTINUATION-STANDING-MODEL §4 (join completion policy) codes.
+# ENGINE_CODE_JOIN_LATE is the §4.1 R3 pin (Go's oracle spelling
+# "join_late" — a stale-round slot dropped by the round_id guard).
+ENGINE_CODE_JOIN_ABANDONED = "join_abandoned"
+ENGINE_CODE_JOIN_LATE = "join_late"
+ENGINE_CODE_JOIN_ERROR_SLOT = "join_error_slot"
+
+# §4 mechanism 2 on_incomplete policy values + the fire-partial dispatch
+# payload's incomplete-marker field name. Go: JoinOnIncompleteAbandon /
+# JoinOnIncompleteFirePartial / JoinIncompleteField (core/types/continuation.go);
+# rust mirrors the same three strings (extensions/continuation/src/lib.rs).
+JOIN_ON_INCOMPLETE_ABANDON = "abandon"
+JOIN_ON_INCOMPLETE_FIRE_PARTIAL = "fire-partial"
+JOIN_INCOMPLETE_FIELD = "incomplete"
+
+# O5 (STANDING-MODEL §4, RULED 2026-07-28): throttle floor for the sweep-all
+# pass over tracked deadline-carrying joins. Matches Go's joinSweepThrottle —
+# a 1-minute floor so a busy peer doesn't pay a full sweep per advance.
+JOIN_SWEEP_THROTTLE_MS = 60_000
+
 # V7 §6.12 per-request transport codes (status pinned in spec).
 TRANSPORT_CODE_RECV_TIMEOUT = "recv_timeout"          # 503
 TRANSPORT_CODE_CONNECTION_BROKEN = "connection_broken"  # 503
@@ -219,7 +240,39 @@ CONTINUATION_HANDLER_PATTERN = "system/continuation"
 # with different maxima still terminate, the lower one governs). 64 mirrors
 # entity-core-go's DefaultMaxChainDepth for cohort parity.
 DEFAULT_MAX_CHAIN_DEPTH = 64
+# Internal suspension reason (spec §3.9 line: `suspend(reason="chain_depth_exceeded")`)
+# — recorded on the suspended entity so the *cause* stays attributable (depth vs. a
+# local ttl/budget bound; the §4a O1 discipline). This is NOT the outward wire code.
 CHAIN_DEPTH_EXCEEDED_REASON = "chain_depth_exceeded"
+# Outward/observable code for the continuation depth brake. EXTENSION-CONTINUATION
+# §3.9 pins the 429 result as `{code: "bounds_exceeded", suspended_at: …}` for ALL
+# three suspension causes; §3.10.5 makes the lost-marker `{reason}` == that `code`.
+# So the depth brake's caller-observed 429 and its cross-impl lost-marker carry
+# `bounds_exceeded` (matching Go — PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Ruling 3),
+# while the suspended entity retains `chain_depth_exceeded` internally (line above).
+# This supersedes the earlier in-flight "proposal §8 anchor" spelling; the landed
+# spec text (§3.9 / §3.10.5) governs. O1 attributability is preserved because the
+# local-bound brakes still surface their own distinct codes (ttl_exhausted /
+# budget_exhausted), never bounds_exceeded — those paths are unchanged here.
+# NOTE: the *capability*-delegation depth ceiling is a SEPARATE mechanism that stays
+# `chain_depth_exceeded` at 400 (capability/delegation.py → peer.py) — do not conflate.
+CHAIN_DEPTH_BRAKE_CODE = "bounds_exceeded"
+
+# §4a de-confound (PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Ruling 2): a continuation
+# chain seeds its TTL well ABOVE the chain_depth ceiling so DEPTH — deterministic,
+# inherited globally — is the PRIMARY brake, and TTL is only a fan-out resource
+# backstop. Without the headroom, TTL (default 64 == the ceiling) exhausts first on a
+# same-peer self-loop (~2 dispatches/advance) and MASKS the depth brake, so cb2's
+# depth-brake marker never surfaces single-peer. 8× the ceiling matches Go's shipped
+# `DefaultChainTTL` and tolerates several decrements/hop while depth still binds first.
+#
+# PROVISIONAL magnitude: the seed value and the decrement rate are BOTH arch-unpinned
+# (entity-core-go spec-issues 2026-07-19 chain-ttl-seed-magnitude-unpinned /
+# 2026-07-21 ttl-decrement-rate-per-hop-vs-per-dispatch — "arch cannot pin the
+# magnitude without first pinning the rate"). We track Go's 512 for cohort convergence;
+# retune this one constant when arch pins it. The de-confound INVARIANT (seed > ceiling)
+# is what Ruling 2 fixes; only the exact number is provisional.
+DEFAULT_CHAIN_TTL = 8 * DEFAULT_MAX_CHAIN_DEPTH  # 512
 
 # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4a (arch ruling 2026-07-18): the
 # chain_depth brake is GLOBAL and independent; TTL/budget exhaustion is an
@@ -402,6 +455,46 @@ async def _handle_install(
             "result_merge is mutually exclusive with result_field (§3.2)",
         )
 
+    # Step 3d (PROPOSAL-CONTINUATION-STANDING-MODEL §4): a join's optional
+    # completion_deadline_ms/on_incomplete govern its round lifecycle.
+    # "abandon" (default/absent) and "fire-partial" (opt-in, §4 mechanism 2)
+    # are the only two legal values — fail-closed on anything else, same
+    # discipline as unknown_transform_op: an unrecognized value is rejected
+    # at install rather than silently defaulting to abandon at the deadline.
+    # Both gates below share Go/rust's `invalid_continuation` code (mirrors
+    # validOnIncomplete / core/types/continuation.go and rust's install match
+    # arm — cross-impl convergence, not independently invented).
+    completion_deadline_ms = params.get("completion_deadline_ms")
+    on_incomplete = params.get("on_incomplete")
+    if params_type == CONTINUATION_JOIN_TYPE:
+        if on_incomplete is not None and on_incomplete not in (
+            JOIN_ON_INCOMPLETE_ABANDON, JOIN_ON_INCOMPLETE_FIRE_PARTIAL,
+        ):
+            return _error_response(
+                400,
+                "invalid_continuation",
+                f"unrecognized on_incomplete {on_incomplete!r}: expected "
+                f"{JOIN_ON_INCOMPLETE_ABANDON!r} or {JOIN_ON_INCOMPLETE_FIRE_PARTIAL!r}",
+            )
+        # A policy with no deadline can never fire — the round never ends.
+        if on_incomplete is not None and completion_deadline_ms is None:
+            return _error_response(
+                400,
+                "invalid_continuation",
+                "on_incomplete requires completion_deadline_ms — without a "
+                "deadline no round is ever incomplete",
+            )
+        if completion_deadline_ms is not None and (
+            isinstance(completion_deadline_ms, bool)
+            or not isinstance(completion_deadline_ms, int)
+            or completion_deadline_ms <= 0
+        ):
+            return _error_response(
+                400,
+                "invalid_completion_deadline_ms",
+                "completion_deadline_ms must be a positive integer (milliseconds)",
+            )
+
     # Step 4: resolve dispatch_capability and run the §3.1a in-chain check.
     cap_entity = ctx.emit_pathway.content_store.get(dispatch_capability)
     if cap_entity is None:
@@ -466,17 +559,47 @@ async def _handle_install(
             ctx.emit_pathway.put_content_only(chain_entity)
 
     # Step 5: persist the continuation entity (params is the entity data).
-    continuation_entity = Entity(type=params_type, data=dict(params))
+    # §4.1: round_id/round_started_at_ms are synthesized bookkeeping, added
+    # only for a deadline-carrying join — a join without
+    # completion_deadline_ms stays byte-identical to a pre-§4 join.
+    entity_data = dict(params)
+    if params_type == CONTINUATION_JOIN_TYPE and completion_deadline_ms is not None:
+        entity_data["round_id"] = 0
+        entity_data["round_started_at_ms"] = int(time.time() * 1000)
+    continuation_entity = Entity(type=params_type, data=entity_data)
 
     full_uri = ctx.emit_pathway.entity_tree.normalize_uri(install_path)
     emit_ctx = EmitContext.from_handler_grant(ctx, "install")
     ctx.emit_pathway.emit(full_uri, continuation_entity, emit_ctx)
+
+    # O5: register a deadline-carrying join as sweepable from install too —
+    # not only from its own advance traffic — so an installed-but-untouched
+    # join is still in the sweep set (mirrors Go's noteJoinPath call site).
+    if params_type == CONTINUATION_JOIN_TYPE and completion_deadline_ms is not None:
+        _note_join_path(ctx, install_path, completion_deadline_ms)
 
     return {
         "status": 200,
         "result": {
             "type": "system/continuation/install-result",
             "data": {"path": install_path},
+        },
+    }
+
+
+def _advancement_not_found() -> dict[str, Any]:
+    """The shared 200/no-op response for 'nothing here to advance' — either
+    no continuation ever existed at the path, or a fire-partial reap just
+    exhausted and deleted the join this advance was about to touch (Go's
+    ``advancementNotFound``)."""
+    return {
+        "status": 200,
+        "result": {
+            "type": "system/continuation/advance-result",
+            "data": {
+                "advanced": False,
+                "reason": "no_continuation",
+            },
         },
     }
 
@@ -503,6 +626,14 @@ async def _handle_advance(
     Returns:
         Response dict with status and result.
     """
+    # O5 (STANDING-MODEL §4, RULED 2026-07-28): throttled sweep over ALL
+    # tracked deadline-carrying joins, before touching THIS advance's own
+    # path — reaping a foreign join is this peer's own housekeeping on its
+    # own tree, not something the caller is authorized for (mirrors Go's
+    # placement of maybeSweepJoins at the very top of handleAdvance, before
+    # the resource-path read and the cap check).
+    await _maybe_sweep_joins(ctx)
+
     # Per EXTENSION-CONTINUATION §3.1: path from resource.targets[0]
     # Fall back to params for backwards compatibility with internal dispatch
     continuation_path = None
@@ -541,16 +672,7 @@ async def _handle_advance(
     if content_hash is None:
         # No continuation at path or parent - no-op
         logger.debug(f"No continuation at {continuation_path}")
-        return {
-            "status": 200,
-            "result": {
-                "type": "system/continuation/advance-result",
-                "data": {
-                    "advanced": False,
-                    "reason": "no_continuation",
-                },
-            },
-        }
+        return _advancement_not_found()
 
     continuation_entity = ctx.emit_pathway.content_store.get(content_hash)
     if continuation_entity is None:
@@ -595,6 +717,18 @@ async def _handle_advance(
     # here (not treated as "grants nothing"). The gate therefore fires only for
     # an ADMINISTRATIVE advance that arrived with a real caller capability which
     # does not cover `advance` on the continuation's path.
+    #
+    # O1 (2026-07-28, RESOLVED — fail-closed): confirmed end-to-end, not
+    # assumed. `check_handler_scope` (peer.py `_handle_execute`, unconditional
+    # Steps 1-2, before any resource-target check and before this handler
+    # runs) denies a caller presenting an EMPTY/absent capability regardless
+    # of whether `resource.targets` is set — so a genuine external caller
+    # with zero capability never reaches this branch with `caller_capability`
+    # falsy; that state is reserved for a truly internal/synthesized advance.
+    # AT-4 (administrative, zero capability -> 403) and its companion
+    # (administrative, present-but-insufficient capability, no
+    # `resource.targets` -> still 403 via THIS gate) are proven live over a
+    # real connection in `tests/integration/test_continuation_advance_authority_wire.py`.
     if not ctx.reactive_trigger and ctx.caller_capability:
         if not ctx.check_caller_permission("advance", continuation_path):
             return _error_response(
@@ -681,6 +815,15 @@ def _step6_chain_context(ctx: HandlerContext) -> HandlerContext:
     new_bounds = ctx.bounds.copy() if ctx.bounds is not None else Bounds()
     new_bounds.chain_id = chain_id
     new_bounds.chain_depth = inherited_depth + 1
+    # §4a de-confound: at chain ORIGIN (no inherited depth) seed the chain TTL
+    # above the depth ceiling so depth is the primary, observable brake (Ruling
+    # 2; mirrors Go's seed-at-origin). Only raise — never reduce an already-
+    # higher inherited budget (a cross-peer chain carries its origin's TTL over
+    # the wire and just decrements). Downstream hops inherit depth>0 → no re-seed.
+    if inherited_depth == 0 and (
+        new_bounds.ttl is None or new_bounds.ttl < DEFAULT_CHAIN_TTL
+    ):
+        new_bounds.ttl = DEFAULT_CHAIN_TTL
     ctx.bounds = new_bounds
     return ctx
 
@@ -710,10 +853,12 @@ def _suspend_chain_depth_exceeded(
 
     Persists a ``system/continuation/suspended`` entity (operator-resumable via
     the resume op, which roots ``chain_depth`` at 0 per §7 so it does not
-    immediately re-suspend) and returns a terminal 429. Go returns
-    ``429 bounds_exceeded`` at this seam; the ``reason``/``code`` string is
-    ``chain_depth_exceeded`` per the proposal §8 anchor. This is what makes the
-    self-referential runaway *terminate* rather than recurse to stack overflow.
+    immediately re-suspend) and returns a terminal 429. Per landed spec §3.9 the
+    429 result code is ``bounds_exceeded`` (and §3.10.5 makes the lost-marker
+    ``{reason}`` == that code), matching Go (Ruling 3); the suspended entity
+    keeps ``chain_depth_exceeded`` as its internal ``reason`` (§3.9 line, O1
+    attributability). This is what makes the self-referential runaway
+    *terminate* rather than recurse to stack overflow.
     """
     chain_id = ctx.chain_id or CHAIN_ID_UNSPECIFIED
     suspended_path = f"system/continuation/suspended/{chain_id}"
@@ -734,12 +879,12 @@ def _suspend_chain_depth_exceeded(
     ctx.emit_pathway.emit(full_uri, suspended, emit_ctx)
     # §4a observability: bind a chain-error-lost marker so the depth brake is
     # attributable in the tree event log — the signal a cross-impl probe reads
-    # to confirm the *depth* brake fired (Go binds a `bounds_exceeded` marker at
-    # its 429 seam; Python's `{reason}` is `chain_depth_exceeded`, matching the
-    # proposal §8 anchor and this suspend's own reason). Without this the depth
-    # suspension persisted a resumable entity but left no marker in the lost
-    # sink, so a probe watching that sink could not distinguish depth from a
-    # local-bound brake (the divergence §4a O1 is about).
+    # to confirm the *depth* brake fired. Per §3.10.5 the marker `{reason}`
+    # segment IS the result `code` (§3.9 → `bounds_exceeded`), so this marker
+    # lands at `.../bounds_exceeded/…`, byte-agreeing with Go's depth-brake
+    # marker. It stays distinct from a local-bound brake because ttl/budget
+    # exhaustion bind `ttl_exhausted`/`budget_exhausted` markers (unchanged) —
+    # the depth-vs-local distinction §4a O1 is about is preserved.
     request_id_for_marker = (
         ctx.request_id
         if getattr(ctx, "request_id", None)
@@ -747,7 +892,7 @@ def _suspend_chain_depth_exceeded(
     )
     _bind_lost_marker(
         ctx,
-        code=CHAIN_DEPTH_EXCEEDED_REASON,
+        code=CHAIN_DEPTH_BRAKE_CODE,
         status=429,
         request_id=request_id_for_marker,
         continuation_path=continuation_path,
@@ -759,9 +904,9 @@ def _suspend_chain_depth_exceeded(
     )
     return _error_response(
         429,
-        CHAIN_DEPTH_EXCEEDED_REASON,
+        CHAIN_DEPTH_BRAKE_CODE,
         f"continuation chain_depth exceeded ceiling {DEFAULT_MAX_CHAIN_DEPTH}",
-        reason=CHAIN_DEPTH_EXCEEDED_REASON,
+        reason=CHAIN_DEPTH_BRAKE_CODE,
         chain_id=chain_id,
         suspended_path=suspended_path,
     )
@@ -1174,6 +1319,303 @@ async def _advance_forward(
     }
 
 
+def _persist_join_progress(
+    ctx: HandlerContext,
+    full_uri: str,
+    cont_data: dict[str, Any],
+    received: dict[str, Any],
+    round_id: int | None,
+    round_started_at_ms: int | None,
+    completion_deadline_ms: int | None,
+) -> None:
+    """Write the join's accumulation/round state without changing lifecycle
+    fields (target/operation/expected/dispatch_capability/etc. untouched)."""
+    new_cont_data = dict(cont_data)
+    new_cont_data["received"] = received
+    if completion_deadline_ms is not None:
+        new_cont_data["round_id"] = round_id
+        new_cont_data["round_started_at_ms"] = round_started_at_ms
+    new_cont_entity = Entity(type=CONTINUATION_JOIN_TYPE, data=new_cont_data)
+    emit_ctx = EmitContext.from_handler_grant(ctx, "advance")
+    ctx.emit_pathway.emit(full_uri, new_cont_entity, emit_ctx)
+
+
+class _JoinSweepState:
+    """Per-peer O5 sweep bookkeeping: the set of tracked deadline-carrying
+    join paths, plus the throttle timestamp. Keyed off ``ctx.emit_pathway``
+    identity (one EmitPathway per peer, alive for the peer's lifetime) via a
+    WeakKeyDictionary — no Extension/peer-lifecycle hook needed, and state
+    for a torn-down peer/test fixture is reclaimed automatically."""
+
+    __slots__ = ("paths", "last_sweep_ms")
+
+    def __init__(self) -> None:
+        self.paths: set[str] = set()
+        self.last_sweep_ms: int = 0
+
+
+_join_sweep_states: "weakref.WeakKeyDictionary[Any, _JoinSweepState]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _join_sweep_state_for(ctx: HandlerContext) -> _JoinSweepState:
+    emit_pathway = ctx.emit_pathway
+    state = _join_sweep_states.get(emit_pathway)
+    if state is None:
+        state = _JoinSweepState()
+        _join_sweep_states[emit_pathway] = state
+    return state
+
+
+def _note_join_path(
+    ctx: HandlerContext, continuation_path: str, completion_deadline_ms: Any,
+) -> None:
+    """O5: register a deadline-carrying join as sweepable — called from
+    install and from every advance that touches it, so the index fills from
+    ordinary traffic (mirrors Go's ``noteJoinPath``). A wait-forever join
+    (no ``completion_deadline_ms``) is never reapable and is not tracked."""
+    if completion_deadline_ms is None:
+        return
+    _join_sweep_state_for(ctx).paths.add(continuation_path)
+
+
+async def _maybe_sweep_joins(ctx: HandlerContext) -> None:
+    """O5 (STANDING-MODEL §4, RULED 2026-07-28): a throttled pass over ALL
+    tracked deadline-carrying joins, reaping any whose round has expired —
+    not just the one the current advance is about to touch. A standing join
+    that goes silent while the peer stays continuation-active must still be
+    reaped off SOMEONE ELSE's traffic, or the cross-peer `join_incomplete`
+    marker becomes a permanent, unobservable divergence (the touched-only
+    predecessor's defect, ARCH-ruled 2026-07-28 third pass).
+
+    Bind-time and throttled: nothing here owns a background timer/goroutine
+    (mirrors Go/rust; O6 quiescent-peer abandon stays deferred). An expired
+    round is therefore reaped at the next continuation traffic ANYWHERE on
+    this peer, not at the instant of the deadline — the deadline is an
+    eligibility threshold, never reaped early. A peer restart forgets joins
+    installed before it, but that only delays the marker: the touched-only
+    reap-on-touch in ``_advance_join`` still self-heals on that join's own
+    next arrival.
+    """
+    emit_pathway = getattr(ctx, "emit_pathway", None)
+    if emit_pathway is None:
+        return
+    state = _join_sweep_state_for(ctx)
+    now_ms = int(time.time() * 1000)
+    if state.last_sweep_ms and (now_ms - state.last_sweep_ms) < JOIN_SWEEP_THROTTLE_MS:
+        return
+    state.last_sweep_ms = now_ms
+    for continuation_path in list(state.paths):
+        await _sweep_one_join(ctx, continuation_path, state)
+
+
+async def _sweep_one_join(
+    ctx: HandlerContext, continuation_path: str, state: _JoinSweepState,
+) -> None:
+    """Reap a single tracked join, dropping it from the sweep set if it is
+    no longer a deadline-carrying join at that path (exhausted, deleted, or
+    replaced by a non-join entity)."""
+    full_uri = ctx.emit_pathway.entity_tree.normalize_uri(continuation_path)
+    content_hash = ctx.emit_pathway.entity_tree.get(full_uri)
+    if content_hash is None:
+        state.paths.discard(continuation_path)
+        return
+    entity = ctx.emit_pathway.content_store.get(content_hash)
+    if entity is None or entity.type != CONTINUATION_JOIN_TYPE:
+        state.paths.discard(continuation_path)
+        return
+    cont_data = entity.data
+    if cont_data.get("completion_deadline_ms") is None:
+        state.paths.discard(continuation_path)
+        return
+    # A fresh chain id per swept join (mirrors Go's dispatchChainID: inherit
+    # the advancing request's chain if it already carries one, else mint
+    # fresh) — this is housekeeping on a DIFFERENT join than the one this
+    # advance is for, so it must not pollute the advancing continuation's
+    # own chain_id. ctx is shared with the caller, so restore it after.
+    saved_chain_id = ctx.chain_id
+    ctx.chain_id = ctx.chain_id or f"chain-{secrets.token_hex(8)}"
+    try:
+        await _reap_expired_join_round(ctx, full_uri, continuation_path, cont_data)
+    finally:
+        ctx.chain_id = saved_chain_id
+
+
+async def _reap_expired_join_round(
+    ctx: HandlerContext,
+    full_uri: str,
+    continuation_path: str,
+    cont_data: dict[str, Any],
+) -> tuple[bool, dict[str, Any] | None]:
+    """§4 mechanism 2 / O5: if ``cont_data``'s round has exceeded its
+    ``completion_deadline_ms`` with slots still missing, apply the join's
+    ``on_incomplete`` policy (default ``abandon``, opt-in ``fire-partial``)
+    and persist the outcome. Shared by the touched-only reap-on-touch path
+    (``_advance_join``) and the O5 sweep-all pass (``_sweep_one_join``) so
+    both reap identically regardless of which traffic discovers the expiry.
+
+    Returns ``(False, cont_data)`` unchanged when the round has not expired.
+    Returns ``(True, new_cont_data)`` when it acted — ``new_cont_data`` is
+    the freshly-reset/aged state, or ``None`` if a fire-partial reap
+    exhausted the join's ``remaining_executions`` and deleted it.
+    """
+    completion_deadline_ms = cont_data.get("completion_deadline_ms")
+    round_started_at_ms = cont_data.get("round_started_at_ms")
+    expected = cont_data.get("expected", [])
+    received = dict(cont_data.get("received") or {})
+    round_id = cont_data.get("round_id")
+    now_ms = int(time.time() * 1000)
+
+    if not (
+        completion_deadline_ms is not None
+        and round_started_at_ms is not None
+        and expected
+        and set(received.keys()) != set(expected)
+        and (now_ms - round_started_at_ms) >= completion_deadline_ms
+    ):
+        return False, cont_data
+
+    missing = [s for s in expected if s not in received]
+    on_incomplete = cont_data.get("on_incomplete")
+
+    if on_incomplete == JOIN_ON_INCOMPLETE_FIRE_PARTIAL:
+        new_cont_data = await _fire_partial_round(
+            ctx, full_uri, continuation_path, cont_data, received, missing, expected,
+        )
+        return True, new_cont_data
+
+    # abandon (default/absent): bind a lost marker naming the missing slots,
+    # reset the round — the next round starts clean.
+    _bind_lost_marker(
+        ctx,
+        code=ENGINE_CODE_JOIN_ABANDONED,
+        status=408,
+        request_id=_synthesized_step_key("join-abandon", continuation_path),
+        continuation_path=continuation_path,
+        extra_body={"missing_slots": missing, "abandoned_round": round_id or 0},
+    )
+    new_round_id = (round_id or 0) + 1
+    new_round_started_at_ms = now_ms
+    # Persist the round turnover immediately (write-through) so it survives
+    # even if the rest of this call later fails (e.g. a terminal dispatch
+    # throws a transport error).
+    _persist_join_progress(
+        ctx, full_uri, cont_data, {}, new_round_id, new_round_started_at_ms,
+        completion_deadline_ms,
+    )
+    new_cont_data = dict(cont_data)
+    new_cont_data["received"] = {}
+    new_cont_data["round_id"] = new_round_id
+    new_cont_data["round_started_at_ms"] = new_round_started_at_ms
+    return True, new_cont_data
+
+
+async def _fire_partial_round(
+    ctx: HandlerContext,
+    full_uri: str,
+    continuation_path: str,
+    cont_data: dict[str, Any],
+    received: dict[str, Any],
+    missing: list[str],
+    expected: list[str],
+) -> dict[str, Any] | None:
+    """§4 mechanism 2 (opt-in): dispatch the join's target with the partial
+    ``received`` plus an explicit ``incomplete`` marker naming the missing
+    slots — riding IN the assembled payload next to the slot values, not
+    beside them, so a target that opted into fire-partial and then ignores
+    the marker has chosen partial input by that choice (mirrors Go's
+    ``firePartialRound`` / rust's ``fire_partial_round``; ``JOIN_INCOMPLETE_FIELD``
+    == Go's ``JoinIncompleteField`` == ``"incomplete"``). Best-effort: a
+    dispatch failure logs and still ages the join — a short round that could
+    not be delivered is not retried, it is aged like any other fire.
+
+    Returns the freshly-aged cont_data (standing reset, or finite-remaining
+    decremented), or None if this fire exhausted remaining_executions and
+    the join entity was deleted.
+    """
+    target = cont_data.get("target")
+    operation = cont_data.get("operation")
+    dispatch_cap_hash = cont_data.get("dispatch_capability")
+    dispatch_cap_entity = (
+        ctx.emit_pathway.content_store.get(dispatch_cap_hash)
+        if dispatch_cap_hash is not None else None
+    )
+    if target and operation and dispatch_cap_entity is not None:
+        payload = dict(received)
+        payload[JOIN_INCOMPLETE_FIELD] = {"missing": missing, "expected": expected}
+
+        resource_data = cont_data.get("resource")
+        dispatch_resource_targets = (
+            resource_data.get("targets")
+            if isinstance(resource_data, dict) and resource_data.get("targets")
+            else None
+        )
+        cross_peer_kwargs: dict[str, Any] = {}
+        if _remote_peer_of(ctx, target) is not None:
+            cross_peer_kwargs = {
+                "dispatch_capability_entity": dispatch_cap_entity.to_dict(),
+                "dispatch_capability_chain": _dispatch_chain_bundle(
+                    ctx, dispatch_cap_entity
+                ),
+            }
+        try:
+            await ctx.execute_with_capability(
+                target, operation, payload,
+                capability_data=dispatch_cap_entity.data,
+                resource_targets=dispatch_resource_targets,
+                **cross_peer_kwargs,
+            )
+        except Exception as e:
+            logger.warning(
+                "join %s: fire-partial dispatch failed: %s", continuation_path, e,
+            )
+    else:
+        logger.warning(
+            "join %s: fire-partial missing target/operation/dispatch_capability "
+            "— firing skipped, join still ages", continuation_path,
+        )
+
+    return _age_join_after_fire(ctx, full_uri, cont_data)
+
+
+def _age_join_after_fire(
+    ctx: HandlerContext,
+    full_uri: str,
+    cont_data: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Age a join after ANY terminal fire of a round — clean, abandoned, or
+    fire-partial: decrement a finite join's ``remaining_executions``
+    (deleting it at zero) or reset a standing one for the next round.
+    Extracted so a deadline-driven fire-partial ages the join exactly like a
+    slot-driven fire (mirrors Go's ``advanceJoinLifecycle`` / rust's
+    ``finish_join_round``) — a fire-partial that skipped this would let a
+    counted join fire more times than it was installed for.
+
+    Returns the freshly-persisted cont_data, or None if the join was deleted
+    (``remaining_executions`` exhausted).
+    """
+    remaining = cont_data.get("remaining_executions")
+    completion_deadline_ms = cont_data.get("completion_deadline_ms")
+    round_id = cont_data.get("round_id")
+    emit_ctx = EmitContext.from_handler_grant(ctx, "advance")
+
+    if remaining is not None and remaining - 1 <= 0:
+        ctx.emit_pathway.delete(full_uri, emit_ctx)
+        return None
+
+    new_cont_data = dict(cont_data)
+    if remaining is not None:
+        new_cont_data["remaining_executions"] = remaining - 1
+    new_cont_data["received"] = {}
+    if completion_deadline_ms is not None:
+        new_cont_data["round_id"] = (round_id or 0) + 1
+        new_cont_data["round_started_at_ms"] = int(time.time() * 1000)
+    new_cont_entity = Entity(type=CONTINUATION_JOIN_TYPE, data=new_cont_data)
+    ctx.emit_pathway.emit(full_uri, new_cont_entity, emit_ctx)
+    return new_cont_data
+
+
 async def _advance_join(
     params: dict[str, Any],
     cont_data: dict[str, Any],
@@ -1211,12 +1653,46 @@ async def _advance_join(
     deliver_to_data = cont_data.get("deliver_to")
     on_error_data = cont_data.get("on_error")
 
+    # PROPOSAL-CONTINUATION-STANDING-MODEL §4/§4.1 — round bookkeeping.
+    # Absent completion_deadline_ms these stay None and every branch below
+    # that reads them is a no-op: byte-identical to a pre-§4 join.
+    completion_deadline_ms = cont_data.get("completion_deadline_ms")
+    round_id = cont_data.get("round_id")
+    round_started_at_ms = cont_data.get("round_started_at_ms")
+
     if not target or not operation:
         return _error_response(400, "invalid_continuation", "Continuation missing target or operation")
 
     # Check lifecycle - exhausted?
     if remaining is not None and remaining <= 0:
         return _error_response(410, "continuation_exhausted", "Continuation has no remaining executions")
+
+    # O5: register this deadline-carrying join as sweepable from ordinary
+    # advance traffic too (install already does this at its own site) — the
+    # sweep index fills without a separate registration subsystem.
+    _note_join_path(ctx, continuation_path, completion_deadline_ms)
+
+    # §4 mechanism 2 — lazy reap-on-touch, the same-join fallback for the
+    # round THIS advance is about to touch (the O5 sweep at the top of
+    # _handle_advance already reaps independent of this join's own traffic,
+    # but a throttled sweep can legitimately skip a round that just expired,
+    # so this re-checks). The wire-observable outcome (self-heal: `lost`
+    # marker, received reset, round_id turned over — or a fire-partial
+    # dispatch) is what's cross-impl-pinned, not which of the two call sites
+    # actually reaped it.
+    acted, new_cont_data = await _reap_expired_join_round(
+        ctx, full_uri, continuation_path, cont_data,
+    )
+    if acted:
+        if new_cont_data is None:
+            # A fire-partial reap exhausted remaining_executions and deleted
+            # the join — nothing left for this slot to accumulate into.
+            return _advancement_not_found()
+        cont_data = new_cont_data
+        received = dict(cont_data.get("received") or {})
+        round_id = cont_data.get("round_id")
+        round_started_at_ms = cont_data.get("round_started_at_ms")
+        remaining = cont_data.get("remaining_executions")
 
     # Extract slot from params or path
     slot = params.get("slot")
@@ -1230,9 +1706,58 @@ async def _advance_join(
     if not slot or slot not in expected:
         return _error_response(400, "invalid_slot", f"Invalid or missing slot: {slot}")
 
+    # §4.1 — round_id straggler guard (MUST). Engages only when the join is
+    # deadline-carrying AND this advance is round-tagged; an untagged
+    # advance into a deadline-carrying join stays admitted as before
+    # (additive, no-silent-change).
+    advance_round_id = params.get("round_id")
+    if (
+        completion_deadline_ms is not None
+        and advance_round_id is not None
+        and advance_round_id != round_id
+    ):
+        _bind_lost_marker(
+            ctx,
+            code=ENGINE_CODE_JOIN_LATE,
+            status=200,
+            request_id=_synthesized_step_key("join-late", continuation_path),
+            continuation_path=continuation_path,
+            extra_body={
+                "slot": slot,
+                "targeted_round": advance_round_id,
+                "current_round": round_id,
+            },
+        )
+        return {
+            "status": 200,
+            "result": {
+                "type": "system/continuation/advance-result",
+                "data": {
+                    "advanced": False,
+                    "dropped": "stale_round",
+                    "slot": slot,
+                    "targeted_round": advance_round_id,
+                    "current_round": round_id,
+                },
+            },
+        }
+
     # Exactly-once: reject if slot already filled
     if slot in received:
         return _error_response(409, "slot_already_filled", f"Slot {slot} already received")
+
+    # §4 mechanism 1 — preserve a delivered-error slot's status rather than
+    # coercing it; the downstream target/stitch decides whether to reject
+    # on it (the join itself still fires normally — §4 mechanism 1).
+    if status is not None and status >= 300:
+        _bind_lost_marker(
+            ctx,
+            code=ENGINE_CODE_JOIN_ERROR_SLOT,
+            status=status,
+            request_id=_synthesized_step_key("join-error-slot", continuation_path),
+            continuation_path=continuation_path,
+            extra_body={"slot": slot},
+        )
 
     # Accumulate result in slot
     received[slot] = result
@@ -1346,17 +1871,14 @@ async def _advance_join(
                 )
             return _error_response(transport_status, transport_code, str(e))
 
-        # Update lifecycle
-        if remaining is not None:
-            new_cont_data = dict(cont_data)
-            new_cont_data["remaining_executions"] = remaining - 1
-            new_cont_data["received"] = {}  # Reset for next round
-            new_cont_entity = Entity(
-                type=CONTINUATION_JOIN_TYPE,
-                data=new_cont_data,
-            )
-            emit_ctx = EmitContext.from_handler_grant(ctx, "advance")
-            ctx.emit_pathway.emit(full_uri, new_cont_entity, emit_ctx)
+        # Update lifecycle via the same aging shared with fire-partial's
+        # terminal fire (mirrors Go's advanceJoinLifecycle / rust's
+        # finish_join_round): decrement a finite join's remaining_executions,
+        # deleting it at zero, or reset a standing one (remaining is None)
+        # for the next round — a standing join owns its completion policy
+        # the same as a bounded one (§4's "owns its liveness independent of
+        # any trigger").
+        _age_join_after_fire(ctx, full_uri, cont_data)
 
         # Chain to deliver_to
         if deliver_to_data and dispatch_result.ok:
@@ -1395,6 +1917,9 @@ async def _advance_join(
         # Not all slots filled - update and wait
         new_cont_data = dict(cont_data)
         new_cont_data["received"] = received
+        if completion_deadline_ms is not None:
+            new_cont_data["round_id"] = round_id
+            new_cont_data["round_started_at_ms"] = round_started_at_ms
         new_cont_entity = Entity(
             type=CONTINUATION_JOIN_TYPE,
             data=new_cont_data,

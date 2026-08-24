@@ -37,6 +37,7 @@ from entity_core.storage.entity_tree import EntityTree
 from entity_core.utils.ecf import ecf_encode
 from entity_handlers.continuation import (
     BUDGET_EXHAUSTED_REASON,
+    CHAIN_DEPTH_BRAKE_CODE,
     CHAIN_DEPTH_EXCEEDED_REASON,
     DEFAULT_MAX_CHAIN_DEPTH,
     TTL_EXHAUSTED_REASON,
@@ -206,7 +207,10 @@ class TestChainDepthCeilingBrake:
             content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
         )
         assert resp["status"] == 429, "runaway must terminate, not recurse"
-        assert resp["result"]["data"]["reason"] == "chain_depth_exceeded"
+        # Outward 429: code/reason == `bounds_exceeded` per landed §3.9 (Ruling 3,
+        # Go parity), NOT `chain_depth_exceeded` (that stays the internal reason).
+        assert resp["result"]["data"]["code"] == CHAIN_DEPTH_BRAKE_CODE
+        assert resp["result"]["data"]["reason"] == CHAIN_DEPTH_BRAKE_CODE
         # The suspend persisted a resumable entity keyed on the chain id.
         suspended_uri = emit_pathway.entity_tree.normalize_uri(
             "system/continuation/suspended/chain-run"
@@ -215,7 +219,9 @@ class TestChainDepthCeilingBrake:
         assert h is not None, "suspend must persist a resumable entity (§3.9)"
         ent = emit_pathway.content_store.get(h)
         assert ent.type == "system/continuation/suspended"
-        assert ent.data["reason"] == "chain_depth_exceeded"
+        # The suspended entity keeps the internal cause for O1 attributability
+        # (spec §3.9 `suspend(reason="chain_depth_exceeded")`).
+        assert ent.data["reason"] == CHAIN_DEPTH_EXCEEDED_REASON
 
     @pytest.mark.asyncio
     async def test_brake_is_confirmed_capable_of_failing(self) -> None:
@@ -271,7 +277,8 @@ class TestQ1DepthBrakeIsObservable:
     bound no chain-error-lost marker, so a cross-impl probe watching the lost
     sink could not confirm the *depth* brake fired. Go binds a `bounds_exceeded`
     marker at its 429 seam; Python now binds one with `{reason}` =
-    `chain_depth_exceeded` (matching the suspend's own reason + proposal §8).
+    `bounds_exceeded` too (landed §3.9 result code + §3.10.5 `{reason}` == code;
+    Ruling 3), byte-agreeing with Go on the marker reason.
     """
 
     @pytest.mark.asyncio
@@ -287,14 +294,14 @@ class TestQ1DepthBrakeIsObservable:
         assert resp["status"] == 429
         markers = _chain_error_markers(emit_pathway)
         depth_markers = [
-            m for m in markers if m.get("reason") == CHAIN_DEPTH_EXCEEDED_REASON
+            m for m in markers if m.get("reason") == CHAIN_DEPTH_BRAKE_CODE
         ]
         assert len(depth_markers) == 1, (
             "the depth brake MUST leave an observable chain-error-lost marker "
             "(§4a) — a probe reads the lost sink to confirm depth, not TTL, "
             "terminated the chain"
         )
-        assert depth_markers[0]["code"] == CHAIN_DEPTH_EXCEEDED_REASON
+        assert depth_markers[0]["code"] == CHAIN_DEPTH_BRAKE_CODE
 
     @pytest.mark.asyncio
     async def test_no_depth_marker_when_rooted_fresh(self) -> None:
@@ -308,7 +315,7 @@ class TestQ1DepthBrakeIsObservable:
         )
         assert not [
             m for m in _chain_error_markers(emit_pathway)
-            if m.get("reason") == CHAIN_DEPTH_EXCEEDED_REASON
+            if m.get("reason") == CHAIN_DEPTH_BRAKE_CODE
         ]
 
 

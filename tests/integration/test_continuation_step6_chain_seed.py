@@ -30,7 +30,11 @@ from entity_core.protocol.entity import Entity
 from entity_core.storage.content_store import ContentStore
 from entity_core.storage.emit import EmitPathway
 from entity_core.storage.entity_tree import EntityTree
-from entity_handlers.continuation import _advance_forward
+from entity_handlers.continuation import (
+    DEFAULT_CHAIN_TTL,
+    DEFAULT_MAX_CHAIN_DEPTH,
+    _advance_forward,
+)
 
 
 def _make_ctx(chain_id: str | None, bounds: Bounds | None = None):
@@ -214,3 +218,57 @@ async def test_marker_keys_on_the_generated_chain_not_the_sentinel() -> None:
         "fallback sentinel, which means the dispatch ran with chain_id absent. "
         "The sentinel is not the bug — step 6 not seeding a chain is."
     )
+
+
+# ---------------------------------------------------------------------------
+# §4a TTL de-confound (PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Ruling 2):
+# the chain seeds a TTL above the depth ceiling AT ORIGIN so depth is the
+# primary, observable brake. Magnitude provisional (tracks Go's 512).
+# ---------------------------------------------------------------------------
+
+def test_chain_ttl_is_deconfounded_from_the_depth_ceiling() -> None:
+    """The invariant Ruling 2 fixes: seed strictly ABOVE the ceiling, so depth
+    binds first. Only the number is provisional; this relation is not."""
+    assert DEFAULT_CHAIN_TTL > DEFAULT_MAX_CHAIN_DEPTH
+
+
+async def _dispatched_ttl(ctx, cap_hash) -> int | None:
+    """Run one forward advancement; return the TTL the dispatch carried."""
+    seen: dict = {}
+    orig = HandlerContext.execute_with_capability
+
+    async def _patched(self, *a, **k) -> ExecuteResult:
+        seen["ttl"] = self.bounds.ttl if self.bounds else None
+        return ExecuteResult(status=200, result={})
+
+    HandlerContext.execute_with_capability = _patched  # type: ignore[method-assign]
+    try:
+        await _advance_forward(
+            cont_data=_cont(cap_hash), result={"data": {}}, status=200,
+            continuation_path="test-cont", full_uri="/peer/test-cont",
+            content_hash=b"\x00" + b"\x02" * 32, ctx=ctx,
+        )
+    finally:
+        HandlerContext.execute_with_capability = orig  # type: ignore[method-assign]
+    return seen.get("ttl")
+
+
+@pytest.mark.asyncio
+async def test_origin_seeds_chain_ttl_above_ceiling() -> None:
+    """A fresh-rooted advancement (no inherited chain_depth) seeds the chain TTL
+    to DEFAULT_CHAIN_TTL, so the depth ceiling — not TTL — is the primary brake
+    on a same-peer self-loop (the cb2 masking fix)."""
+    _, ctx, cap_hash = _make_ctx(chain_id=None, bounds=Bounds(chain_id="c1"))
+    assert await _dispatched_ttl(ctx, cap_hash) == DEFAULT_CHAIN_TTL
+
+
+@pytest.mark.asyncio
+async def test_inherited_chain_does_not_reseed_ttl() -> None:
+    """A causal advancement (inherited chain_depth present) does NOT re-seed —
+    the chain carries its origin's TTL and just decrements it. A low inherited
+    TTL is preserved (not raised back to the seed), so the count is honest."""
+    _, ctx, cap_hash = _make_ctx(
+        chain_id="c1", bounds=Bounds(chain_id="c1", chain_depth=5, ttl=40)
+    )
+    ttl = await _dispatched_ttl(ctx, cap_hash)
+    assert ttl == 40, "inherited mid-chain TTL must be preserved, not re-seeded"

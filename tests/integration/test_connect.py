@@ -123,6 +123,53 @@ async def test_connect_already_complete(server_peer: Peer):
 
 
 @pytest.mark.asyncio
+async def test_replayed_authenticate_rejected_401_invalid_nonce(server_peer: Peer):
+    """0.8.1 RT-6 (§4.6 Hardening): the issued handshake nonce is single-use.
+    Replaying a second `authenticate` against an already-established
+    connection (same consumed nonce) MUST be rejected with 401
+    invalid_nonce, not a generic 409 state conflict."""
+    from entity_core.handlers.connect import (
+        create_connect_authenticate_execute,
+        create_connect_hello_execute,
+    )
+
+    client_keypair = Keypair.generate()
+    reader, writer = await asyncio.open_connection("127.0.0.1", 19000)
+
+    try:
+        hello_execute, _our_nonce = create_connect_hello_execute(client_keypair)
+        await send_envelope(writer, Envelope(root=hello_execute.to_entity()))
+
+        hello_response_env = await recv_envelope(reader)
+        hello_response = ExecuteResponse.from_entity(hello_response_env.root)
+        their_nonce = hello_response.result["data"]["nonce"]
+
+        authenticate_execute, sig_entity, identity_entity = create_connect_authenticate_execute(
+            client_keypair, their_nonce,
+        )
+        auth_envelope = Envelope(
+            root=authenticate_execute.to_entity(),
+            included=[sig_entity.to_dict(), identity_entity.to_dict()],
+        )
+
+        # First authenticate consumes the nonce and completes the connection.
+        await send_envelope(writer, auth_envelope)
+        first_response_env = await recv_envelope(reader)
+        first_response = ExecuteResponse.from_entity(first_response_env.root)
+        assert first_response.status == 200
+
+        # Replay the identical authenticate (same nonce, same signature).
+        await send_envelope(writer, auth_envelope)
+        replay_response_env = await recv_envelope(reader)
+        replay_response = ExecuteResponse.from_entity(replay_response_env.root)
+        assert replay_response.status == 401
+        assert replay_response.result["data"]["code"] == "invalid_nonce"
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_pre_connect_execute_rejected(server_peer: Peer):
     """EXECUTE before connect is rejected with 403."""
     reader, writer = await asyncio.open_connection("127.0.0.1", 19000)
