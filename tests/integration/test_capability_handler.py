@@ -641,9 +641,10 @@ async def test_configure_rejects_non_hex(peer) -> None:
 # ---------------------------------------------------------------------------
 # CAP-6 — ttl_ms zero and overflow (§5.6 "overflow contributes no ceiling")
 #
-# Found by `entity-core-go`'s wire probe, report
-# docs/validation/reports/2026-08-17-g-core-py-cap-fold-validation.md, against
-# py a7deda6. We minted `expires_at = 18446745860712217718` — larger than
+# Found by `entity-core-go`'s wire probe (its own
+# `docs/validation/reports/2026-08-17-g-core-py-cap-fold-validation.md`, in
+# that repo), against py a7deda6. The finding, so it does not depend on the
+# report: we minted `expires_at = 18446745860712217718` — larger than
 # uint64 max — where go and rust mint no expiry at all.
 #
 # Python's ints are arbitrary-precision, so the overflow every other

@@ -984,9 +984,9 @@ def _matching_merge_configs(ctx: HandlerContext, full_path: str):
     `fnmatch.fnmatch` until SA-PY-12, which accepts `?`, character classes and
     infix `a*b` — none of which any conformant peer can evaluate, and all of
     which select a merge *strategy*, so they reach the merged content and its
-    hash. See `docs/SPEC-AMBIGUITIES.md` SA-PY-12 for the tension this sits on:
-    §2.4 scopes the four forms to `exclude`/`exclude_types` "and nowhere else",
-    while §2.3 invokes the function by name here.
+    hash. Filed upstream as spec ambiguity SA-PY-12, for the tension this sits
+    on: §2.4 scopes the four forms to `exclude`/`exclude_types` "and nowhere
+    else", while §2.3 invokes the function by name here.
     """
     cs = ctx.emit_pathway.content_store
     tree = ctx.emit_pathway.entity_tree

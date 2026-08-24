@@ -1,0 +1,31 @@
+# .release-removals — deliberate deletions against the PUBLISHED tree.
+#
+# One path or path-prefix per line; `#` comments allowed. The `[6/6] public-regress`
+# gate blocks any release that removes a file already on public `master` unless it is
+# declared here. A deletion is not forbidden — it must be intended, and this file is
+# the reviewed record that it was. Read by dev-pipeline/promote/promote.sh.
+#
+# A comment-only or blank file is NOT an allow-all; it declares nothing.
+
+# ── [ADR-0031] — the rolling status log moved to `docs/STATUS.md` ──────────────
+# `docs/status/STATUS.md` has been public since the last release. It is not gone: it
+# moved one directory up, to `docs/STATUS.md`, and its `[[doc]]` block in
+# CANONICAL-DOCS.toml was repointed in the same commit as this line. A reader loses
+# nothing — the same rolling log publishes, at a shorter path.
+#
+# Why move it at all. [ADR-0031] as first written banned `docs/status/` outright; it
+# was corrected the same day. The DATED snapshots that live there — HANDOFF-*,
+# CHECKPOINT-*, REVIEW-*, ROUTING-* — are working memory and publish nothing. The
+# single rolling STATUS.md is the opposite: it is how this repo says publicly what it
+# is working on, and it is canonical everywhere in the ecosystem. Two kinds of
+# document, one directory, and the only thing separating them was remembering a
+# filename. After the move they separate by PATH: `docs/status/` is uniformly
+# internal, `docs/STATUS.md` is the published log. That is a property a tool can
+# check, which is what the original overreach was reaching for.
+#
+# Declared even though the gate may not ask for it. `public_regression_ok` runs
+# `git diff --diff-filter=D` with rename detection at its default (ON), so a pure
+# move like this one is likely to surface as a rename and pass silently. Declaring
+# only what the gate happens to see would make this file a record of the tool's blind
+# spot rather than of our intent. Reversible: `git mv` it back and drop this line.
+docs/status/STATUS.md

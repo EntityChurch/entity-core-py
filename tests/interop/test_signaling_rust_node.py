@@ -115,8 +115,6 @@ async def _authority_blocker(port: int) -> str | None:
     caller's own authority, never widen it. Closed is the deliberate default
     (brief §7.1): on the wrapped surface the capability grant *is* the admission
     control (§2.1).
-
-    See ``docs/status/HANDOFF-2026-07-30-signaling-client-stage1-python.md``.
     """
     if not await _reachable(port):
         return f"no Rust signaling node reachable at 127.0.0.1:{port}"

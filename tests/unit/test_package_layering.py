@@ -3,9 +3,8 @@
 `AGENTS.md` declares a strict dependency direction and, until this file, had no
 enforcement point for it — which is the shape `AGENTS-STANDARD.md` names as
 theater. The direction was already violated when these gates were written
-(37 function-local imports of ``entity_handlers`` from inside ``entity-core``);
-see ``docs/architecture/reviews/REVIEW-THE-SDK-AND-APPLICATION-TIER-GAP-2026-08-17.md``
-§5.
+(37 function-local imports of ``entity_handlers`` from inside ``entity-core``,
+measured 2026-08-17) — which is why the ledger below starts non-empty.
 
 The gates are written *before* the tier migration rather than after, so the
 known violations enter as a dated, itemized ledger that can only shrink. A gate

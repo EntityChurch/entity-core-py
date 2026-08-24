@@ -3,8 +3,7 @@
 This is the surface that did not exist. Every tree operation in this repo was,
 until now, a hand-assembled ``{"type": "system/tree/get-request", "data": …}``
 envelope written at the call site — seventeen times in the CLI, and nowhere
-reusable (see `docs/architecture/reviews/REVIEW-THE-SDK-AND-APPLICATION-TIER-GAP-2026-08-17.md`
-§4). :class:`EntityClient` is that knowledge, written once.
+reusable. :class:`EntityClient` is that knowledge, written once.
 
 **It composes over the `Dispatcher` Protocol**, not over a connection or a peer.
 That is why one client serves the whole §2.6 peer spectrum: wrap a

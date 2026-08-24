@@ -13,7 +13,7 @@ Produces two sibling files in this directory:
 
 Run from the repo root:
 
-    uv run python docs/conformance/type-v1.1/generate_vectors.py
+    uv run python tests/conformance/type-v1.1/generate_vectors.py
 """
 
 from __future__ import annotations

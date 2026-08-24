@@ -9,9 +9,10 @@ went out with ``chain_id`` absent and every downstream marker binder fell down
 its own fallback ladder onto a meaningless key — Python's was ``"unknown"``
 (``_bind_chain_error_marker``), Rust's ``"internal"``, Go's the request id.
 That divergence was read cross-impl as a marker-coordinate disagreement; the
-root cause was this step being unimplemented on all three. Per Go's
-``docs/validation/reports/2026-07-16-retry-survival-cohort.md`` §3 and
-``docs/validation/spec-issues/2026-07-16-marker-coordinate-root-cause.md``.
+root cause was this step being unimplemented on all three. Per Go's cohort
+reports in the `entity-core-go` repo
+(``docs/validation/reports/2026-07-16-retry-survival-cohort.md`` §3 and
+``docs/validation/spec-issues/2026-07-16-marker-coordinate-root-cause.md``).
 
 The sentinels are NOT the bug and are deliberately not asserted away here:
 they remain correct for a genuinely-absent chain, they simply stop firing once

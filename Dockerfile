@@ -70,10 +70,19 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 COPY tests/ tests/
-# Conformance corpora + test vectors the suite reads at import time. Without
-# these the dev image's pytest collection aborts (FileNotFoundError).
-COPY docs/ docs/
+# The wire-conformance corpus the suite reads at import time. Without it the
+# dev image's pytest collection aborts (FileNotFoundError). The type-v1.1 and
+# content-v3.5 corpora live under `tests/conformance/` and ride in with
+# `tests/` above — they are NOT under `docs/`, despite what this comment used
+# to claim.
 COPY test-vectors/ test-vectors/
+# `scripts/` is not tooling here: `tests/unit/test_cross_impl_pins_are_real.py`
+# loads `scripts/fetch_published_fixture.py` as a module to read its pins, and
+# that row carries no `skipif` on purpose — "it needs no Go, no network, and no
+# fixture" is its whole argument. Omitting this COPY made it a hard collection
+# ERROR in `make test` while `uv run pytest` on a host checkout stayed green,
+# so the canonical entry point was red and the convenience one was not.
+COPY scripts/ scripts/
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen

@@ -1,7 +1,7 @@
 # EXTENSION-CONTENT v3.5 — cross-impl conformance vectors
 
 **Spec reference:** `EXTENSION-CONTENT.md` v3.5 §3.6.5
-**Generator:** `entity-core-py` (regenerate via `docs/conformance/content-v3.5/generate_vectors.py`)
+**Generator:** `entity-core-py` (regenerate via `tests/conformance/content-v3.5/generate_vectors.py`)
 
 These are the four conformance-vector surfaces named in §3.6.5. Sibling-impl regeneration MUST produce byte-identical values in every field. Mismatches indicate cross-impl divergence at the boundary the field grades (gear table → §3.6.1 derivation; boundary vectors → §3.6.3 algorithm; ECF byte equality → `ENTITY-CBOR-ENCODING.md` §4.2 + the §2.8 wire-shape pin).
 

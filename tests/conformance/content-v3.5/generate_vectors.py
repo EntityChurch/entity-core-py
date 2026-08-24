@@ -18,7 +18,7 @@ Vectors emit to:
 
 Run from the repo root::
 
-    uv run python docs/conformance/content-v3.5/generate_vectors.py
+    uv run python tests/conformance/content-v3.5/generate_vectors.py
 
 Cross-impl: Go and Rust generators (when they write them) MUST produce
 the same JSON for the same canonical input definitions.
@@ -325,7 +325,7 @@ def render_markdown(payload: dict) -> str:
         "",
         "**Spec reference:** `EXTENSION-CONTENT.md` v3.5 §3.6.5",
         f"**Generator:** `{payload['generated_by']}` (regenerate via "
-        "`docs/conformance/content-v3.5/generate_vectors.py`)",
+        "`tests/conformance/content-v3.5/generate_vectors.py`)",
         "",
         "These are the four conformance-vector surfaces named in §3.6.5. "
         "Sibling-impl regeneration MUST produce byte-identical values in "

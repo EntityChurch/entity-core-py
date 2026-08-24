@@ -1,8 +1,9 @@
 """Live interop: the Python client decoding Go's `reflection_endpoints`.
 
 EXTENSION-SIGNALING §4.5.1 (added v1.1). Go built the reference and routed this
-field to Rust and Python (`entity-core-go` @ `c9f2fe0`,
-`docs/validation/reports/2026-08-15-b-reflection-endpoints-*`). Everything in
+field to Rust and Python (`entity-core-go` @ `c9f2fe0`, whose own
+`docs/validation/reports/2026-08-15-b-reflection-endpoints-*` carry the
+routing). Everything in
 `tests/integration/test_signaling_node.py` is same-impl — this repo's node
 talking to this repo's codec — and the entire point of the field is that a
 *foreign* consumer reads it, so a wrong-but-self-consistent pair would pass

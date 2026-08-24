@@ -5557,8 +5557,7 @@ def type_system_signaling_advertise_result() -> Entity:
     and empty are the same thing, and both are valid") rather than the §4.5
     field block, which annotates OPTIONAL in a comment but omits the
     `optional: true` marker its own `lobby_constant` carries two lines down.
-    Logged for upstream in `docs/status/`; the semantics are not in doubt, only
-    the notation.
+    Logged for upstream; the semantics are not in doubt, only the notation.
     """
     return Entity(
         type="system/type",

@@ -665,8 +665,9 @@ class TestNoEscalationWithoutEpisode:
     on the §5.5a probe last cycle: it varied scope while holding form fixed,
     and could not have failed.
 
-    Recorded in `docs/CONFORMANCE-EXCLUSIONS.md` as well, because an exclusion
-    that lives only in a test docstring is one report away from being lost —
+    Recorded in this repo's conformance-exclusions log as well, because an
+    exclusion that lives only in a test docstring is one report away from
+    being lost —
     and an in-process result reported as a cross-impl vector pass is a false
     conformance claim.
     """

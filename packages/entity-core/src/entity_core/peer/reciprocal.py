@@ -44,7 +44,7 @@ by nobody. A third implementation reading only the spec diverges on all
 three choices, silently — so this one matched the shipped shape to stay
 runnable against the cohort, and seconds Go's routed spec issue with a
 from-scratch reader's evidence rather than treating cohort agreement as
-conformance. See `docs/status/HANDOFF-2026-08-05-reciprocal-grant-python.md`.
+conformance.
 """
 
 from __future__ import annotations
