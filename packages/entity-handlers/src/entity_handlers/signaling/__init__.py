@@ -131,6 +131,13 @@ from entity_handlers.signaling.pool import (
     select_top,
     weight,
 )
+from entity_handlers.signaling.reflection import (
+    SCHEME_STUN,
+    SCHEME_STUNS,
+    ReflectionEndpointError,
+    normalize_reflection_endpoints,
+    validate_reflection_endpoint,
+)
 
 __all__ = [
     # constants / errors
@@ -208,6 +215,12 @@ __all__ = [
     "TYPE_ADVERTISE_RESULT",
     "Limits",
     "Advertisement",
+    # reflection (§4.5.1)
+    "SCHEME_STUN",
+    "SCHEME_STUNS",
+    "ReflectionEndpointError",
+    "validate_reflection_endpoint",
+    "normalize_reflection_endpoints",
     # client
     "SignalingClient",
     "ClientError",

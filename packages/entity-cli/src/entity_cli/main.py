@@ -793,6 +793,23 @@ def _keepalive_config_from_args(args: argparse.Namespace) -> dict[str, int] | No
     return kwargs or None
 
 
+def _reflection_endpoints_from_args(args: argparse.Namespace) -> list[str]:
+    """Split ``--reflection-endpoint``'s comma-separated value (§4.5.1).
+
+    Returns ``[]`` when the flag is absent — the no-reflection state, which the
+    node emits as an **absent** field rather than an empty array. Surrounding
+    whitespace is stripped and empty segments dropped so a trailing comma is
+    not a "" endpoint; the URI itself is never otherwise touched, because
+    §4.5.1 publishes the operator's bytes verbatim and the node runs no
+    transform. Validation is the node's (`normalize_reflection_endpoints`) —
+    this only splits.
+    """
+    raw = getattr(args, "reflection_endpoint", None)
+    if not raw:
+        return []
+    return [uri.strip() for uri in raw.split(",") if uri.strip()]
+
+
 async def cmd_start(args: argparse.Namespace) -> None:
     """Start a peer and listen for connections."""
     host, port_str = args.listen.rsplit(":", 1)
@@ -881,13 +898,34 @@ async def cmd_start(args: argparse.Namespace) -> None:
     # `-signaling-node` is off for the same reason). The caller's grant must
     # cover system/signaling:{offer,collect,advertise}, so pair it with
     # --open-access or a seed policy.
+    reflection_endpoints = _reflection_endpoints_from_args(args)
+    if reflection_endpoints and not getattr(args, "signaling_node", False):
+        # §4.5.1 publishes these on the node's own `advertise`, so without the
+        # node there is nowhere for them to go. Refuse rather than accept a
+        # flag that would silently do nothing — same call as Go's entity-peer.
+        print("Error: --reflection-endpoint requires --signaling-node "
+              "(§4.5.1 publishes on the node's advertise)")
+        return 1
     if getattr(args, "signaling_node", False):
-        builder.with_signaling_node_handler(
-            endpoint=getattr(args, "signaling_endpoint", "") or "",
-            lobby_constant=getattr(args, "signaling_lobby", None),
-        )
+        from entity_handlers.signaling.reflection import ReflectionEndpointError
+
+        try:
+            builder.with_signaling_node_handler(
+                endpoint=getattr(args, "signaling_endpoint", "") or "",
+                lobby_constant=getattr(args, "signaling_lobby", None),
+                reflection_endpoints=reflection_endpoints or None,
+            )
+        except ReflectionEndpointError as exc:
+            # Fail at startup, never publish it: a malformed URI does not
+            # degrade at the consumer — it throws at RTCPeerConnection
+            # construction and takes the establisher with it (§4.5.1).
+            print(f"Error: --reflection-endpoint: {exc}")
+            return 1
         print("Signaling: serving the §4/§5 rendezvous node "
               "(system/signaling offer/collect/advertise)")
+        if reflection_endpoints:
+            print("Signaling: advertising §9.3 reflection at "
+                  + ", ".join(reflection_endpoints))
 
     # V7 §6.9a (F27) peer-authority-bootstrap. The owner cap defaults to
     # this peer's own identity; --operator names a distinct owner.
@@ -1540,6 +1578,22 @@ def build_parser() -> argparse.ArgumentParser:
              "published in advertise. Omit to use `lobby:default` — it is a "
              "derivation input (§3.1 hashes it verbatim), so overriding it "
              "moves every peer's lobby bucket.",
+    )
+    start_parser.add_argument(
+        "--reflection-endpoint",
+        metavar="URI[,URI...]",
+        dest="reflection_endpoint",
+        default=None,
+        help="EXTENSION-SIGNALING §4.5.1 (v1.1): comma-separated RFC 7064 STUN "
+             "URI(s) (stun:host[:port] / stuns:host[:port], non-hierarchical — "
+             "no //) for this node's OWN §9.3 reflection listener(s), published "
+             "in advertise's top-level reflection_endpoints. Set ONLY if this "
+             "deployment actually serves §9.3 reflection (co-located reflector "
+             "per GUIDE-REFERENCE-DEPLOYMENT). Requires --signaling-node. Empty "
+             "(default) advertises no reflection. Each URI is validated at "
+             "startup and emitted verbatim — a browser hands them to "
+             "RTCIceServer.urls as-is. Same flag name and spelling as Go's "
+             "entity-peer --reflection-endpoint.",
     )
     start_parser.add_argument(
         "--seed-policy",

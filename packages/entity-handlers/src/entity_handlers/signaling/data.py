@@ -163,10 +163,19 @@ class Advertisement:
         endpoint: The advertised endpoint string. Weight is computed over these
             bytes **exactly as published** (§3.1.1), so it is never normalized.
         limits: The node's bounds, carrying the `lobby` override if any.
+        reflection_endpoints: The node's OWN §9.3 STUN listener(s) (§4.5.1,
+            added v1.1), each an RFC 7064 `stun:`/`stuns:` URI. Empty when the
+            node serves no reflection — which is what an **absent** field
+            decodes to, the already-legal pre-v1.1 state.
     """
 
     endpoint: str
     limits: Limits
+    #: §4.5.1. A tuple so the decoded advertisement stays hashable/frozen, and
+    #: **in published order with published bytes** — a consumer dedups across
+    #: this and any `EXTENSION-REGISTRY` §3b set by *endpoint bytes exactly as
+    #: published* (§3b.3), which only works if nobody normalizes first.
+    reflection_endpoints: tuple[str, ...] = ()
 
     @property
     def lobby(self) -> str | None:
@@ -195,7 +204,31 @@ def advertisement_from_result(result: Any) -> Advertisement:
             ttl_seconds=_field_int(limits, "ttl_seconds"),
             lobby_constant=_lobby_override(limits),
         ),
+        reflection_endpoints=_reflection_endpoints(data),
     )
+
+
+def _reflection_endpoints(data: dict[str, Any]) -> tuple[str, ...]:
+    """Read the top-level `reflection_endpoints` (§4.5.1, added v1.1).
+
+    **Absent is the common case and not an error** — it is the already-legal
+    "this node serves no reflection" state every pre-v1.1 node is in, which is
+    what makes the field additive with no flag day ([ADR-0002], MUST-ignore).
+
+    Entries are taken **verbatim**: no `stun:` re-prefixing, no port
+    canonicalization, no dedup, no reordering. §3b.3's dedup is by published
+    bytes, and a consumer hands the string to an ICE agent as-is.
+
+    A non-string entry is **skipped rather than raised on**, following
+    `_lobby_override`: MUST-ignore says skip the field you cannot use, not the
+    message. Rejecting the whole advertisement would strand a peer's rendezvous
+    over a field it does not even need to meet anybody — the reflection hint is
+    an optimization, the endpoint and limits are the meet.
+    """
+    raw = data.get("reflection_endpoints")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(item for item in raw if isinstance(item, str))
 
 
 def _lobby_override(limits: dict[str, Any]) -> str | None:

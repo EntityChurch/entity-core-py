@@ -65,6 +65,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -83,6 +84,7 @@ from entity_handlers.signaling.data import (
     TYPE_COLLECT_RESULT,
     TYPE_OFFER_RESULT,
 )
+from entity_handlers.signaling.reflection import normalize_reflection_endpoints
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +194,7 @@ class SignalingNode:
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         max_keys: int = DEFAULT_MAX_KEYS,
         lobby_constant: str | None = None,
+        reflection_endpoints: Iterable[str] | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.max_blob_bytes = max_blob_bytes
@@ -202,6 +205,18 @@ class SignalingNode:
         #: never a null (§4.5).
         self.lobby_constant = (
             None if lobby_constant in (None, LOBBY_DEFAULT) else lobby_constant
+        )
+        #: §4.5.1 — this node's OWN §9.3 STUN listener(s), **never another
+        #: node's**: a directory of third-party reflectors is
+        #: `EXTENSION-REGISTRY` §3b's job, and that entity is signed by the
+        #: deployment identity precisely because it vouches for infrastructure
+        #: it does not run. Empty is the no-reflection state and is emitted as
+        #: an ABSENT field. Validated **here**, at configuration time — Go
+        #: validates in its CLI instead (`--reflection-endpoint`), which is the
+        #: same operator-visible contract (a bad URI fails at startup) with one
+        #: fewer place to forget it.
+        self.reflection_endpoints = normalize_reflection_endpoints(
+            reflection_endpoints,
         )
         self._buckets: dict[bytes, _Bucket] = {}
 
@@ -316,6 +331,7 @@ class SignalingNodeExtension(Extension):
         max_bucket_blobs: int = DEFAULT_MAX_BUCKET_BLOBS,
         max_keys: int = DEFAULT_MAX_KEYS,
         lobby_constant: str | None = None,
+        reflection_endpoints: Iterable[str] | None = None,
     ) -> None:
         self.node = SignalingNode(
             endpoint=endpoint,
@@ -324,6 +340,7 @@ class SignalingNodeExtension(Extension):
             max_bucket_blobs=max_bucket_blobs,
             max_keys=max_keys,
             lobby_constant=lobby_constant,
+            reflection_endpoints=reflection_endpoints,
         )
         self._limiter = RateLimiter()
         self._peer: Any | None = None
@@ -419,10 +436,21 @@ class SignalingNodeExtension(Extension):
         # move every peer's pool selection.
         if not self.node.endpoint and self._peer is not None:
             self.node.endpoint = _listen_endpoint(self._peer) or ""
-        return ok_response(
-            TYPE_ADVERTISE_RESULT,
-            {"endpoint": self.node.endpoint, "limits": self.node.limits()},
-        )
+        data: dict[str, Any] = {
+            "endpoint": self.node.endpoint,
+            "limits": self.node.limits(),
+        }
+        # §4.5.1 — TOP-LEVEL, sibling to `endpoint` and `limits`, NOT nested
+        # inside `limits`. Present only when this node actually serves §9.3
+        # reflection: absent and empty mean the same thing, so the key is
+        # omitted entirely rather than emitted as `[]` or null (the
+        # `lobby_constant` precedent above). Absent decodes to the already-legal
+        # no-reflection state, which is what makes v1.1 additive with no flag
+        # day. Emitted **verbatim** — a consumer hands these to an ICE agent
+        # unchanged, so the node runs no transform (§4.5.1).
+        if self.node.reflection_endpoints:
+            data["reflection_endpoints"] = list(self.node.reflection_endpoints)
+        return ok_response(TYPE_ADVERTISE_RESULT, data)
 
 
 def _refusal_text(code: str | None) -> str:

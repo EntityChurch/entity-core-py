@@ -223,6 +223,53 @@ JOIN_INCOMPLETE_FIELD = "incomplete"
 # a 1-minute floor so a busy peer doesn't pay a full sweep per advance.
 JOIN_SWEEP_THROTTLE_MS = 60_000
 
+# ---------------------------------------------------------------------------
+# v1.23 §3.4 A.1 — chain-error marker retention and self-collection
+# ---------------------------------------------------------------------------
+#
+# v1.23 elevated the marker bind SHOULD → MUST and, in the same move, elevated
+# collection to MUST: *"A MUST-write paired with a MAY-collect is a leak by
+# construction."* A permanently-failing chain mints ~1,440 markers/day, so
+# binding without a reaper is unbounded growth by construction — which is the
+# state this peer was in until this landed.
+#
+# **The collector is the binder.** That is not a choice; it falls out of
+# §3.10.7's invariant that markers are bound in the observing peer's own tree
+# under its own authority. Nobody else can collect them, so nobody else should
+# be asked to. There is no operator step and no external reaper.
+
+#: The v1.23 canonical operator knob: a config ENTITY at this path whose
+#: ``retention_ms`` field carries the window. Named by the spec, not by us —
+#: Go had to retire an invented `system/runtime/chain-errors/retention-ms` for
+#: this one, and Python never had a key at all to retire.
+MARKER_RETENTION_CONFIG_PATH = "system/config/chain-errors"
+MARKER_RETENTION_FIELD = "retention_ms"
+
+#: §3.4 A.1's suggested default, now with a home: 24 hours.
+DEFAULT_MARKER_RETENTION_MS = 24 * 60 * 60 * 1000
+
+#: An explicit ``retention_ms: 0`` disables collection.
+#:
+#: Not a contradiction of the MUST. The obligation closes an ASYMMETRY — a
+#: MUST-write that nothing was obliged to collect — so it lands on *having a
+#: reaper with a bounded default*, which is what an impl gets wrong by
+#: omission, rather than on any particular marker dying. An operator who wants
+#: the full history is legitimate (the tree IS the event log) and sets this;
+#: what they cannot do is get unbounded growth by accident. Same reading and
+#: same sentinel value as Go's `RetainMarkersForever`, and Go has flagged the
+#: same question to arch: if the elevation meant "no opt-out", this knob is
+#: non-conformant in both impls and the ruling should say so.
+RETAIN_MARKERS_FOREVER = 0
+
+#: Both marker kinds live under this root — `lost` (sender-side, this module)
+#: and `rejected` (receiver-side, the dispatcher). Collection is indifferent to
+#: which: it reads the timestamp every marker body carries.
+CHAIN_ERROR_MARKER_ROOT = "system/runtime/chain-errors/"
+
+#: Throttle floor for the collection sweep, mirroring JOIN_SWEEP_THROTTLE_MS
+#: above and Go's `collectThrottle`. Keeps the amortized cost off the bind path.
+MARKER_COLLECT_THROTTLE_MS = 60_000
+
 # V7 §6.12 per-request transport codes (status pinned in spec).
 TRANSPORT_CODE_RECV_TIMEOUT = "recv_timeout"          # 503
 TRANSPORT_CODE_CONNECTION_BROKEN = "connection_broken"  # 503
@@ -2285,6 +2332,183 @@ def _dispatch_chain_bundle(
     )
 
 
+class _MarkerCollectState:
+    """Per-peer throttle bookkeeping for the v1.23 collection sweep.
+
+    Keyed off ``emit_pathway`` identity in a WeakKeyDictionary, exactly as
+    :class:`_JoinSweepState` is — one EmitPathway per peer, alive for the
+    peer's lifetime, and reclaimed automatically when a test fixture or a
+    torn-down peer drops it. No Extension hook and no peer-lifecycle wiring,
+    which is what keeps this free of a start/stop/leak-on-drop lifecycle.
+    """
+
+    __slots__ = ("last_collect_ms",)
+
+    def __init__(self) -> None:
+        self.last_collect_ms: int = 0
+
+
+_marker_collect_states: weakref.WeakKeyDictionary[Any, _MarkerCollectState] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _marker_collect_state_for(emit_pathway: Any) -> _MarkerCollectState:
+    state = _marker_collect_states.get(emit_pathway)
+    if state is None:
+        state = _MarkerCollectState()
+        _marker_collect_states[emit_pathway] = state
+    return state
+
+
+def marker_retention_from_config(emit_pathway: Any) -> int | None:
+    """Read the v1.23 operator knob — ``retention_ms`` on the config entity at
+    :data:`MARKER_RETENTION_CONFIG_PATH` — out of this peer's own tree.
+
+    Returns the configured window in milliseconds, or ``None`` when the
+    operator has set nothing here (unresolved path, missing entity, absent or
+    non-integer field). Best-effort and read-only, like everything else on this
+    tree: the config is **advisory over a working default**, never a
+    precondition, so no failure mode here is an error — it just means "fall
+    back to :data:`DEFAULT_MARKER_RETENTION_MS`".
+
+    Unknown fields on the entity are ignored (V7 forward-compat MUST-ignore);
+    only ``retention_ms`` is defined today. An explicit ``0`` is returned as
+    ``0`` and is meaningful — :data:`RETAIN_MARKERS_FOREVER`, the operator
+    turning collection off — which is why "absent" is ``None`` and not ``0``.
+    """
+    if emit_pathway is None:
+        return None
+    try:
+        entity_tree = emit_pathway.entity_tree
+        content_hash = entity_tree.get(MARKER_RETENTION_CONFIG_PATH)
+        if content_hash is None:
+            return None
+        config = emit_pathway.content_store.get(content_hash)
+        if config is None:
+            return None
+        value = config.data.get(MARKER_RETENTION_FIELD)
+    except Exception:  # a config read must never affect a chain
+        return None
+    # bool is an int subclass and `retention_ms: true` is not a window.
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def collect_expired_markers(
+    emit_pathway: Any, retention_ms: int, now_ms: int,
+) -> int:
+    """Remove every §3.10 chain-error marker older than ``retention_ms``,
+    returning how many were collected.
+
+    **Self-collection** (v1.23 §3.4 A.1): a peer reaping its own markers out of
+    its own tree under its own authority. Both kinds are in scope — the sweep
+    walks :data:`CHAIN_ERROR_MARKER_ROOT` and reads the timestamp each marker
+    body carries, so `lost` and `rejected` age out identically.
+
+    Only the **tree binding** is dropped; the body stays content-addressed and
+    auditable, which is the same call `_gc_decided_pending` makes for registry
+    pending heads and preserves the ruling's "independently of the pointer".
+
+    Best-effort and strictly non-reactive, like every other operation on this
+    tree. An entity that does not resolve, does not decode, or is not a marker
+    is **skipped rather than deleted** — deleting something we did not identify
+    is how a reaper becomes a data-loss bug. Collection MUST NOT be able to
+    affect a chain: it removes observations, never behaviour.
+
+    ``retention_ms == RETAIN_MARKERS_FOREVER`` collects nothing.
+    """
+    if retention_ms == RETAIN_MARKERS_FOREVER or emit_pathway is None:
+        return 0
+    if now_ms <= retention_ms:
+        # Clock before epoch+window (a test clock, or a peer with no wall
+        # time yet) — nothing can be expired yet, and an underflowed cutoff
+        # would sweep the whole tree.
+        return 0
+    cutoff = now_ms - retention_ms
+
+    collected = 0
+    try:
+        entity_tree = emit_pathway.entity_tree
+        paths = list(entity_tree.list_prefix(CHAIN_ERROR_MARKER_ROOT))
+    except Exception:
+        return 0
+    for path in paths:
+        try:
+            content_hash = entity_tree.get(path)
+            if content_hash is None:
+                continue
+            entity = emit_pathway.content_store.get(content_hash)
+            if entity is None or entity.type != LOST_ERROR_MARKER_TYPE:
+                # An intermediate binding, or something else's entity.
+                continue
+            timestamp = entity.data.get("timestamp")
+            if isinstance(timestamp, bool) or not isinstance(timestamp, int):
+                continue
+            # The timestamp is captured at failure-ORIGINATION (§3.10.6), not
+            # at bind time — which is exactly what makes it a sound age: a
+            # redelivered marker does not look younger than the failure it
+            # records. A marker with no timestamp is never aged out; absent
+            # evidence is not evidence of age.
+            if timestamp == 0 or timestamp > cutoff:
+                continue
+            if entity_tree.remove(path) is not None:
+                collected += 1
+        except Exception:  # one bad marker must not stop the sweep
+            continue
+    return collected
+
+
+def maybe_collect_markers(emit_pathway: Any, now_ms: int | None = None) -> int:
+    """Run a throttled collection sweep from a marker-bind path.
+
+    **Bind-time rather than a background task**, deliberately, and the same
+    call `_maybe_sweep_joins` and `_gc_decided_pending` already make in this
+    repo: nothing here owns a timer or a task, so there is no lifecycle to
+    start, stop, or leak on drop. Binding is precisely when this tree grows, so
+    it is precisely when a bounded sweep is worth paying for — and a peer that
+    has stopped failing has nothing left to collect. The throttle
+    (:data:`MARKER_COLLECT_THROTTLE_MS`) keeps the amortized cost off the
+    dispatch path.
+
+    The consequence, stated plainly: the last batch of markers outlives the
+    window until something binds again. That is conformant — §3.4 A.1 makes the
+    window an **eligibility** threshold ("GC-eligible after"), not a deadline —
+    and on an idle peer it is bounded by one window's worth of markers.
+
+    Precedence: the operator's tree config wins when present (including an
+    explicit ``0``), else :data:`DEFAULT_MARKER_RETENTION_MS`. Go carries an
+    additional deploy-time builder default between those two; Python does not,
+    because v1.23 made the tree config *the* knob and a second one would be a
+    place for the two impls to disagree about which wins.
+
+    Returns the number collected (0 when throttled or disabled). Never raises.
+    """
+    if emit_pathway is None:
+        return 0
+    moment = int(time.time() * 1000) if now_ms is None else now_ms
+    state = _marker_collect_state_for(emit_pathway)
+    if (
+        state.last_collect_ms
+        and (moment - state.last_collect_ms) < MARKER_COLLECT_THROTTLE_MS
+    ):
+        return 0
+    state.last_collect_ms = moment
+
+    configured = marker_retention_from_config(emit_pathway)
+    retention = DEFAULT_MARKER_RETENTION_MS if configured is None else configured
+    if retention == RETAIN_MARKERS_FOREVER:
+        return 0
+    collected = collect_expired_markers(emit_pathway, retention, moment)
+    if collected:
+        logger.debug(
+            "collected %d expired chain-error marker(s) (retention %dms)",
+            collected, retention,
+        )
+    return collected
+
+
 def _bind_chain_error_marker(
     ctx: HandlerContext,
     *,
@@ -2386,6 +2610,10 @@ def _bind_chain_error_marker(
                 marker_path, kind, sanitized_reason, result.status,
             )
             return None
+        # v1.23 §3.4 A.1 MUST-collect: the binder is the collector. Throttled,
+        # and after the bind so a sweep can never cost us the marker we came
+        # here to write.
+        maybe_collect_markers(ctx.emit_pathway)
         return marker_hash
     except Exception as exc:  # never let observability affect advancement
         logger.warning(
@@ -2485,6 +2713,11 @@ def bind_dispatcher_rejected_marker(
                 marker_path, sanitized_reason, result.status,
             )
             return None
+        # v1.23 §3.4 A.1 MUST-collect. The `rejected` kind grows the same tree
+        # from the dispatcher side, so it pays for the same sweep — otherwise a
+        # peer that only ever *receives* rejected chains would bind forever and
+        # never collect, which is the leak wearing a different hat.
+        maybe_collect_markers(emit_pathway)
         return marker_hash
     except Exception as exc:  # never let observability affect dispatch
         logger.warning(

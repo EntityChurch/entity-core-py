@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from entity_core.crypto.identity import Keypair
 from entity_core.peer import Peer, PeerBuilder
+from entity_core.utils.ecf import ecf_encode
 from entity_handlers.signaling.constants import (
     LOBBY_DEFAULT,
     PATTERN,
@@ -46,6 +49,7 @@ from entity_handlers.signaling.node import (
     RateLimiter,
     SignalingNode,
 )
+from entity_handlers.signaling.reflection import ReflectionEndpointError
 
 KEY_A = bytes([0x00]) + bytes(range(32))
 KEY_B = bytes([0x00]) + bytes(range(1, 33))
@@ -430,6 +434,121 @@ class TestWrappedSurface:
                 await node.stop()
 
         asyncio.run(run())
+
+
+class TestReflectionEndpoints:
+    """§4.5.1 (added v1.1) — a node publishing its OWN §9.3 STUN listener(s).
+
+    Before v1.1 a node that ran reflection had no way to say so, which is the
+    hole that left `entity-browser-rust` unable to provision ICE automatically.
+    The two assertions here are the ones Go's node carries, because the emit
+    contract is where the two impls have to agree: **verbatim bytes**, and
+    **absent, never `[]`**.
+    """
+
+    def test_the_configured_uris_reach_the_client_byte_for_byte(self):
+        """Emitted verbatim — no `stun:` re-prefixing, no port
+        canonicalization, no reordering. A consumer hands these to
+        `RTCIceServer.urls` unchanged, so any transform on the way out is a
+        place two consumers guess differently."""
+        configured = [
+            "stun:reflect.example.org:3478",
+            "stuns:[2001:db8::1]:5349",
+        ]
+
+        async def run():
+            node_kp, client_kp = Keypair.generate(), Keypair.generate()
+            node = _build_node(node_kp, reflection_endpoints=configured)
+            await node.start("127.0.0.1", 0)
+            client = _build_client(client_kp, node, node_kp, _bound_port(node))
+            try:
+                result = await _sig(client, node, "advertise", empty_params())
+                assert result.status == 200, result.error
+
+                # TOP-LEVEL, sibling to endpoint and limits — NOT nested
+                # inside limits, which is the shape a reader skimming §4.5
+                # would reach for.
+                data = result.result["data"]
+                assert data["reflection_endpoints"] == configured
+                assert "reflection_endpoints" not in data["limits"]
+
+                # And the client codec agrees with the node — the two halves
+                # of this repo, which is what makes the round-trip a contract
+                # rather than one side's opinion.
+                ad = advertisement_from_result(result.result)
+                assert list(ad.reflection_endpoints) == configured
+            finally:
+                await client.stop()
+                await node.stop()
+
+        asyncio.run(run())
+
+    def test_a_node_serving_no_reflection_omits_the_key_entirely(self):
+        """**Absent, never null and never `[]`** (§4.5.1, the `lobby_constant`
+        precedent). Absent decodes to the already-legal no-reflection state,
+        which is what makes v1.1 additive with no flag day; an empty array is a
+        different, non-conformant encoding of the same fact."""
+        async def run():
+            node_kp, client_kp = Keypair.generate(), Keypair.generate()
+            node = _build_node(node_kp)  # no reflection configured
+            await node.start("127.0.0.1", 0)
+            client = _build_client(client_kp, node, node_kp, _bound_port(node))
+            try:
+                result = await _sig(client, node, "advertise", empty_params())
+                assert result.status == 200, result.error
+                data = result.result["data"]
+                assert "reflection_endpoints" not in data
+
+                # Wire-level: the field name does not appear in the encoded
+                # bytes at all. Asserting on the dict alone would pass for a
+                # node that emitted an explicit null.
+                assert b"reflection_endpoints" not in ecf_encode(result.result)
+
+                # Absent decodes to empty, not to an error.
+                ad = advertisement_from_result(result.result)
+                assert ad.reflection_endpoints == ()
+            finally:
+                await client.stop()
+                await node.stop()
+
+        asyncio.run(run())
+
+    def test_an_empty_configuration_is_the_same_as_none(self):
+        """§4.5.1: "absent and empty are the same thing, and both are valid."
+        So an operator passing an empty list gets the absent field, not `[]`."""
+        async def run():
+            node_kp, client_kp = Keypair.generate(), Keypair.generate()
+            node = _build_node(node_kp, reflection_endpoints=[])
+            await node.start("127.0.0.1", 0)
+            client = _build_client(client_kp, node, node_kp, _bound_port(node))
+            try:
+                result = await _sig(client, node, "advertise", empty_params())
+                assert "reflection_endpoints" not in result.result["data"]
+            finally:
+                await client.stop()
+                await node.stop()
+
+        asyncio.run(run())
+
+    def test_a_malformed_uri_fails_at_build_not_at_advertise(self):
+        """The operator is the only one who can fix it, and they are gone by
+        the time a browser's `RTCPeerConnection` throws on it."""
+        with pytest.raises(ReflectionEndpointError):
+            _build_node(Keypair.generate(), reflection_endpoints=["stun://x:1"])
+
+    def test_the_type_declares_the_field_optional(self):
+        """A REQUIRED `reflection_endpoints` would make every pre-v1.1 node's
+        advertisement invalid against our own type — the flag day §4.5.1 exists
+        to avoid."""
+        from entity_core.types.definitions import (
+            type_system_signaling_advertise_result,
+        )
+
+        fields = type_system_signaling_advertise_result().data["fields"]
+        assert fields["reflection_endpoints"] == {
+            "array_of": {"type_ref": "primitive/string"},
+            "optional": True,
+        }
 
 
 class TestTwoPeersMeet:

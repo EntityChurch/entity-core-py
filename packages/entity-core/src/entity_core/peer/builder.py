@@ -49,6 +49,7 @@ Handler Protocols:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -1623,6 +1624,7 @@ class PeerBuilder:
         max_blob_bytes: int | None = None,
         max_bucket_blobs: int | None = None,
         lobby_constant: str | None = None,
+        reflection_endpoints: Iterable[str] | None = None,
     ) -> PeerBuilder:
         """Register the `system/signaling` rendezvous node (EXTENSION-SIGNALING
         §4/§5) — `offer` / `collect` / `advertise`.
@@ -1649,6 +1651,16 @@ class PeerBuilder:
         The buckets are in-memory: a bucket is ephemeral and TTL-reaped, and
         the peers that deposited into it have long since retried or given up by
         the time a restart matters.
+
+        `reflection_endpoints` (§4.5.1, added v1.1) publishes this node's **own**
+        §9.3 STUN listener(s) in `advertise`, each an RFC 7064 `stun:`/`stuns:`
+        URI — set it **only if this deployment actually serves reflection** (the
+        reference deployment co-locates the reflector on the signaling VM).
+        Never another node's: a directory of third-party reflectors is
+        `EXTENSION-REGISTRY` §3b's job. Each URI is validated here and emitted
+        verbatim, so a malformed one raises at build time rather than reaching a
+        browser's `RTCIceServer.urls`, where it throws instead of degrading.
+        Omitted (the default) advertises no reflection.
 
         Requires the entity-handlers package to be installed.
 
@@ -1677,6 +1689,7 @@ class PeerBuilder:
                 if max_bucket_blobs is None else max_bucket_blobs
             ),
             lobby_constant=lobby_constant,
+            reflection_endpoints=reflection_endpoints,
         )
         self._state.handlers.append(
             _HandlerConfig(

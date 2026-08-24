@@ -5539,7 +5539,23 @@ def type_system_signaling_limits() -> Entity:
 
 
 def type_system_signaling_advertise_result() -> Entity:
-    """`system/signaling/advertise-result` — §4.5 output of `advertise`."""
+    """`system/signaling/advertise-result` — §4.5 output of `advertise`.
+
+    `reflection_endpoints` (§4.5.1, added v1.1) is a **third top-level field,
+    sibling to `endpoint` and `limits` — not nested inside `limits`**. It
+    carries this node's OWN §9.3 STUN listener(s), each an RFC 7064
+    `stun:`/`stuns:` URI in the non-hierarchical form (no `//`), and is
+    **absent — never null, never `[]`** when the node serves no reflection:
+    absent decodes to the already-legal no-reflection state, which is what
+    makes v1.1 additive with no flag day.
+
+    Marked `optional` here on the strength of §4.5.1's normative text ("absent
+    and empty are the same thing, and both are valid") rather than the §4.5
+    field block, which annotates OPTIONAL in a comment but omits the
+    `optional: true` marker its own `lobby_constant` carries two lines down.
+    Logged for upstream in `docs/status/`; the semantics are not in doubt, only
+    the notation.
+    """
     return Entity(
         type="system/type",
         data={
@@ -5547,6 +5563,10 @@ def type_system_signaling_advertise_result() -> Entity:
             "fields": {
                 "endpoint": {"type_ref": "primitive/string"},
                 "limits": {"type_ref": "system/signaling/limits"},
+                "reflection_endpoints": {
+                    "array_of": {"type_ref": "primitive/string"},
+                    "optional": True,
+                },
             },
         },
     )
