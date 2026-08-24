@@ -841,7 +841,15 @@ REGISTRY_HANDLER_MANIFEST = build_handler_manifest(
         "renew-request": {
             "input_type": "system/registry/renew-request",
         },
+        # §6a.9.3 operator decisions. No `input_type` on either: the ruling's
+        # table gives their inputs as bare `{pending_hash}` / `{pending_hash,
+        # reason?}` and names no entity type for them, and inventing one here
+        # would be an implementation defining wire shape. Routed upstream
+        # (core-go `spec-issues/2026-08-13-d` gap 2).
         "approve-request": {
+            "output_type": "system/registry/register-result",
+        },
+        "deny-request": {
             "output_type": "system/registry/register-result",
         },
         # §6a.9.2 — `set` echoes the stored policy as written; `get` is 404 when

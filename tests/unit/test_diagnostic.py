@@ -193,7 +193,7 @@ class TestDispatchTap:
     @pytest.mark.asyncio
     async def test_two_outcomes_at_one_status_are_distinct_buckets(self):
         """The negative half: harvesting the field but keying the histogram
-        only on ``code`` would collapse ``registered`` and ``pending_review``
+        only on ``code`` would collapse ``bound`` and ``pending_review``
         into one ``status=200`` bucket — the same blindness, moved."""
         tap = DispatchTap()
 
@@ -207,12 +207,12 @@ class TestDispatchTap:
             }
 
         wrapped = tap.wrap(registry_like)
-        await wrapped("system/registry", "register-request", {"outcome": "registered"}, None)
-        await wrapped("system/registry", "register-request", {"outcome": "registered"}, None)
+        await wrapped("system/registry", "register-request", {"outcome": "bound"}, None)
+        await wrapped("system/registry", "register-request", {"outcome": "bound"}, None)
         await wrapped("system/registry", "register-request", {"outcome": "pending_review"}, None)
 
         buckets = {outcome: count for (_, _, _, _, outcome, count) in tap.histogram()}
-        assert buckets == {"registered": 2, "pending_review": 1}
+        assert buckets == {"bound": 2, "pending_review": 1}
 
 
 class TestContentTap:

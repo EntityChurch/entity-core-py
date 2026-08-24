@@ -45,6 +45,7 @@ import logging
 import unicodedata
 from typing import Any
 
+from entity_core.capability.checking import check_handler_scope
 from entity_core.crypto.identity import decode_peer_id, peer_id_from_identity_entity
 from entity_core.crypto.signing import public_key_from_bytes, verify_signature
 from entity_core.handlers.context import HandlerContext
@@ -86,11 +87,27 @@ REGISTER_REQUEST_TYPE = "system/registry/register-request"
 REVOKE_REQUEST_TYPE = "system/registry/revoke-request"
 RENEW_REQUEST_TYPE = "system/registry/renew-request"
 ISSUER_POLICY_TYPE = "system/registry/issuer-policy"
-REGISTER_PENDING_TYPE = "system/registry/register-pending"
+# §6a.9.3 `[RULED 2026-08-13]`. This was our PROVISIONAL `register-pending` until
+# the section landed; the note here tabulated four cohort postures and ended
+# "this type renames with it." It renamed. Clean break, no alias — there is no
+# old peer to stay compatible with, and a dual-name path is the drift the rename
+# was for. The ruling ratified our body/pointer split and our `approve-request`
+# and added the parts no one had built: the by-request pointer, the decision
+# states, deny, supersession, retention.
+PENDING_BINDING_TYPE = "system/registry/pending-binding"
 NONCE_RECORD_TYPE = "system/registry/nonce-record"
 
 ISSUER_POLICY_PATH = "system/registry/issuer-policy"
-REGISTER_PENDING_PREFIX = "system/registry/register-pending/"
+# §6a.9.3 storage, §6.3's body/pointer split exactly (the ruling is explicit that
+# re-deriving the pattern here is how the two would drift):
+#   body    — `pending/{pending_hash}`, immutable, content-addressed
+#   pointer — `pending/by-request/{target_peer_id}/{name}`, the current head
+# `target_peer_id` precedes `name` and the order is NORMATIVE: a peer-id is one
+# Base58 segment but a name is not guaranteed single-segment, so the
+# variable-depth value goes last or `by-request/{peer}/` stops being enumerable
+# at a fixed depth.
+PENDING_PREFIX = "system/registry/pending/"
+PENDING_BY_REQUEST_PREFIX = "system/registry/pending/by-request/"
 NONCE_PREFIX = "system/registry/nonce/"
 # Revocation by-target index (P7 NORMATIVE): name → free once revoked.
 REVOCATION_PREFIX = "system/registry/binding/revocation/"
@@ -116,6 +133,60 @@ ISSUER_MODES = {"open", "allowlist", "manual", "domain-control"}
 # layer-2 answer (proof accepted, policy says no).
 LAYER1_PROOF_ERROR_CODE = "signature_invalid"
 
+# §6a.9's `register-result` `.status` — the two 2xx outcomes, `[MUST]`
+# `[RULED 2026-08-12]`: `bound` on the 200 (binding issued, `binding_hash`
+# present) and `pending_review` on the 202 (manual-mode queue, `pending_hash`
+# present). Constants for the same reason as the layer-1 code above — `bound`
+# has two emit sites (`register-request` approve and `approve-request`), and two
+# literals is two places to drift.
+#
+# We answered `registered` on both until 2026-08-13. Nothing in the cohort caught
+# it for a cycle: core-go emitted `registered` too, rust had already applied the
+# ruling, and the cross-impl check for this path asserted the 200 and read the
+# binding back without ever opening the result body. Our own wire test *did*
+# assert `.status` — and pinned the wrong constant, so the assertion held the
+# divergence in place rather than finding it. Measured by core-go's
+# `registry_issuer.register_result_status_bound` at py `ad0ef98` (one FAIL).
+#
+# A value all three implementations quietly agreed on is not a value anyone
+# checked; it is the branch where agreement stood in for the spec.
+REGISTER_STATUS_BOUND = "bound"
+REGISTER_STATUS_PENDING_REVIEW = "pending_review"
+# §6a.9.3's decision table returns `register-result {status: "denied"}` from
+# `deny-request`. NOTE the corpus conflict, routed rather than papered over:
+# §6a.9's result-type block two screens up enumerates `"bound" | "pending_review"`
+# and nothing else, so the section's own third outcome is undeclared in the type
+# it returns — structurally the SAME defect §6a.9 recorded about itself in the
+# 08-12 ruling ("an operation whose declared return type does not enumerate every
+# branch of its own pseudocode is an interop bug already in flight"). We implement
+# §6a.9.3's table: it is the later, more specific ruling and it is the one that
+# defines deny at all. core-go filed this as gap 1 of spec-issues/2026-08-13-d.
+REGISTER_STATUS_DENIED = "denied"
+
+# §6a.9.3 pending-binding lifecycle. `pending_review` is live queue state;
+# `approved` / `denied` are terminal and are what make deny not-a-delete.
+PENDING_STATUS_APPROVED = "approved"
+PENDING_STATUS_DENIED = "denied"
+PENDING_DECIDED_STATUSES = frozenset({PENDING_STATUS_APPROVED, PENDING_STATUS_DENIED})
+
+# §6a.9.3 — a second decision on a decided head. Approve and deny are not
+# idempotent-by-replay: re-approving would mint a second binding for one request,
+# and approving an already-denied one would overturn the operator by retry.
+ALREADY_DECIDED_ERROR_CODE = "already_decided"
+
+# §6a.9.3 retention `[SHOULD]`: a DECIDED head is GC-eligible once this much time
+# has passed since it was queued; a `pending_review` head is NEVER eligible — it
+# is live queue state, and expiring it silently drops a request no operator has
+# seen (the deliver-or-signal violation that deny-is-not-a-delete already
+# forbids). Only the tree entries are reclaimed; the body stays content-addressed
+# and auditable, which is what the ruling means by "independently of the pointer."
+#
+# The window's CONFIGURATION SITE is not pinned by the ruling — it says "a
+# configured retention window" and stops. A module default is the smallest thing
+# that satisfies the SHOULD without inventing an issuer-policy field the other
+# seats would not read.
+PENDING_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+
 # §6a.9.1 replay acceptance window: a request's issued_at MUST be within this
 # many ms of now; nonce records older than the window may be GC'd. Generous by
 # default — the load-bearing replay guard is the per-(requester, nonce) seen-set.
@@ -139,6 +210,10 @@ TA_SELF_CERTIFYING = "self_certifying"
 TA_LOCAL_NAME = "local_name"
 TA_OUT_OF_BAND = "out_of_band"
 
+# §6a.9.1's internal sign-and-publish cap. §6a.9.3 reuses it verbatim as the
+# gate on both operator decisions rather than minting a decision cap.
+CAP_REGISTRY_ISSUE_BINDING = "system/capability/registry-issue-binding"
+
 # §5 capability surface — named for discovery; the local peer holds them
 # via the §6.9a owner-cap full-self-access floor (§5.2).
 REGISTRY_CAPS = (
@@ -156,7 +231,7 @@ REGISTRY_CAPS = (
     # policy. Named here for discovery; the local registry peer holds them via
     # the §6.9a owner-cap full-self-access floor.
     "system/capability/registry-request-binding",
-    "system/capability/registry-issue-binding",
+    CAP_REGISTRY_ISSUE_BINDING,
     "system/capability/registry-manage-issuer-policy",
 )
 
@@ -173,6 +248,7 @@ _OP_REGISTER = "register-request"
 _OP_REVOKE = "revoke-request"
 _OP_RENEW = "renew-request"
 _OP_APPROVE = "approve-request"
+_OP_DENY = "deny-request"
 _OP_SET_POLICY = "set-issuer-policy"
 _OP_GET_POLICY = "get-issuer-policy"
 
@@ -990,6 +1066,92 @@ def _name_is_taken(ctx: HandlerContext, nfc_name: str) -> bool:
     return revoked is None
 
 
+# -- §6a.9.3 pending-binding storage ---------------------------------------
+
+
+def _pending_body_path(ph: bytes) -> str:
+    return PENDING_PREFIX + ph.hex()
+
+
+def _pending_pointer_path(target_peer_id: str, nfc_name: str) -> str:
+    return f"{PENDING_BY_REQUEST_PREFIX}{target_peer_id}/{nfc_name}"
+
+
+def _write_pending_head(ctx: HandlerContext, pending: Entity) -> bytes:
+    """Publish a pending-binding as the head for its (target_peer_id, name):
+    immutable body + repointed by-request pointer. Returns its hash.
+
+    This is the whole of §6a.9.3's supersession rule — a second queued request
+    for the same pair writes a new body and repoints, so exactly one head
+    exists per pair. Replace-whole, never merge; same rule and same reason as
+    §6a.9.2's policy write. Superseded bodies stay at their own paths on
+    purpose: they are content-addressed audit, and `_load_pending_head` is what
+    stops them being decidable."""
+    ph = pending.compute_hash()
+    emit_ctx = EmitContext.from_handler_grant(ctx, "register")
+    ctx.emit_pathway.emit(_pending_body_path(ph), pending, emit_ctx)
+    ctx.emit_pathway.emit(
+        _pending_pointer_path(pending.data["target_peer_id"], pending.data["name"]),
+        pending, emit_ctx,
+    )
+    return ph
+
+
+def _load_pending_head(
+    ctx: HandlerContext, ph: bytes,
+) -> tuple[Entity | None, bool]:
+    """Resolve a `pending_hash` to ``(entity, is_head)``.
+
+    ``is_head`` is the half §6a.9.3 does not spell out and the one a decision
+    MUST check. Supersession repoints the pointer but deliberately leaves the
+    old body fetchable forever, so a stale `pending_review` body stays
+    resolvable indefinitely. Deciding one would issue a binding on terms the
+    operator's queue no longer shows AND leave the pointer naming a different
+    head than the one decided — an inconsistency no later read can untangle.
+    "One pending head per pair" is a rule about what is DECIDABLE, not only
+    about what is listed.
+
+    Requires the body to be published at its OWN path, not merely present in
+    the content store: anything content-addressed is `get`-able, and a
+    pending-binding that was never emitted here was never queued here."""
+    stored = _normalize_hash(ctx.emit_pathway.entity_tree.get(_pending_body_path(ph)))
+    if stored != ph:
+        return None, False
+    ent = ctx.emit_pathway.content_store.get(ph)
+    if ent is None or ent.type != PENDING_BINDING_TYPE:
+        return None, False
+    head = _normalize_hash(ctx.emit_pathway.entity_tree.get(
+        _pending_pointer_path(ent.data.get("target_peer_id"), ent.data.get("name"))
+    ))
+    return ent, head == ph
+
+
+def _gc_decided_pending(ctx: HandlerContext) -> None:
+    """§6a.9.3 retention `[SHOULD]` — reclaim decided heads past the window.
+
+    Drops the tree entries only; the body remains content-addressed and
+    auditable, which is the ruling's "independently of the pointer". A
+    `pending_review` head is never eligible at any age. Swept opportunistically
+    when a request queues rather than on a timer — a MUST-write paired with an
+    unbounded queue is a leak by construction, and this keeps the queue an
+    operator's inbox rather than a log without adding a background task."""
+    cutoff = _now_ms() - PENDING_RETENTION_MS
+    for path in list(ctx.emit_pathway.entity_tree.list_prefix(PENDING_BY_REQUEST_PREFIX)):
+        h = _normalize_hash(ctx.emit_pathway.entity_tree.get(path))
+        if h is None:
+            continue
+        ent = ctx.emit_pathway.content_store.get(h)
+        if ent is None or ent.type != PENDING_BINDING_TYPE:
+            continue
+        if ent.data.get("status") not in PENDING_DECIDED_STATUSES:
+            continue
+        queued_at = ent.data.get("queued_at")
+        if not isinstance(queued_at, int) or queued_at > cutoff:
+            continue
+        ctx.emit_pathway.entity_tree.remove(path)
+        ctx.emit_pathway.entity_tree.remove(_pending_body_path(h))
+
+
 def _nonce_path(requester: str, nonce: bytes) -> str:
     return f"{NONCE_PREFIX}{requester}/{nonce.hex()}"
 
@@ -1145,26 +1307,28 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
     if mode == "manual":
         # Queue for operator review; record the nonce (the request is processed).
         _record_nonce(ctx, target_peer_id, nonce, issued_at)
-        pending = Entity(type=REGISTER_PENDING_TYPE, data={
+        _gc_decided_pending(ctx)
+        # Supersedes any existing head for this (target_peer_id, name) — every
+        # retry carries a fresh nonce and is a distinct request by construction,
+        # so without this one intent fills the operator's queue with duplicates.
+        pending = Entity(type=PENDING_BINDING_TYPE, data={
             "name": nfc_name,
             "target_peer_id": target_peer_id,
             "transports": data.get("transports") or [],
             "requested_ttl": ttl,
             "queued_at": _now_ms(),
-            "status": "pending_review",
+            "status": REGISTER_STATUS_PENDING_REVIEW,
         })
-        ph = pending.compute_hash()
-        ctx.emit_pathway.emit(
-            REGISTER_PENDING_PREFIX + ph.hex(), pending,
-            EmitContext.from_handler_grant(ctx, "register"),
-        )
+        ph = _write_pending_head(ctx, pending)
         # 202, not 200: the request was accepted for review, not acted on. A
         # 200 says "done" for an operation whose entire point is that nothing
-        # was signed. The spec pins the body (`status: "pending_review"`) but
-        # not the code; this converges on core-go.
+        # was signed. The in-source note here read "the spec pins the body but
+        # not the code; this converges on core-go" until 2026-08-13 — the
+        # ruling's status table now pins the 202 outright, so this is
+        # conformance, not convergence.
         return _ok(
             "system/registry/register-result",
-            {"status": "pending_review", "pending_hash": ph},
+            {"status": REGISTER_STATUS_PENDING_REVIEW, "pending_hash": ph},
             status=202,
         )
 
@@ -1179,7 +1343,10 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
 
     _record_nonce(ctx, target_peer_id, nonce, issued_at)
     bh = _issue_binding(ctx, nfc_name, target_peer_id, data.get("transports") or [], ttl)
-    return _ok("system/registry/register-result", {"status": "registered", "binding_hash": bh})
+    return _ok(
+        "system/registry/register-result",
+        {"status": REGISTER_STATUS_BOUND, "binding_hash": bh},
+    )
 
 
 def _lookup_binding(ctx: HandlerContext, data: dict[str, Any]) -> tuple[bytes | None, Entity | None]:
@@ -1256,28 +1423,125 @@ async def _handle_renew_request(ctx: HandlerContext, params: dict[str, Any]) -> 
     return _ok("system/registry/renew-result", {"binding_hash": new_bh})
 
 
-async def _handle_approve_request(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
-    """§6a.9 ``:approve-request`` — operator approves a ``manual``-mode queued
-    request, issuing the binding. Operator-only."""
-    if not _is_operator(ctx):
-        return _error(403, "not_entitled", "approve-request is operator-only")
+def _load_for_decision(
+    ctx: HandlerContext, op: str, params: dict[str, Any],
+) -> tuple[Entity | None, bytes | None, dict[str, Any] | None]:
+    """Shared front half of `approve-request` / `deny-request` (§6a.9.3).
+
+    Returns ``(pending, pending_hash, error)`` — exactly one of the first pair
+    or the last is meaningful.
+
+    Gate: ``system/capability/registry-issue-binding``, the cap §6a.9.1 already
+    defines for the internal sign-and-publish act. No new capability —
+    approving a queued request IS issuing a binding, and minting a second cap
+    for one act would let an operator hold either half alone.
+
+    This replaced a self-origin floor (``_is_operator``) that predated the
+    ruling and was wrong in a way only a cross-impl run could show: it made the
+    ruled capability **undelegable**. Gating on origin means the registry
+    operator must BE the registry process, so a capability whose entire purpose
+    is handing operator authority to someone else could never be exercised by
+    that someone else. core-go's oracle drives approve/deny as a remote client
+    holding the cap and got `403 not_entitled` from us on all four decision
+    vectors. Origin is not authority; the grant is."""
+    cap = ctx.caller_capability if isinstance(ctx.caller_capability, dict) else {}
+    cap_data = cap.get("data") if isinstance(cap.get("data"), dict) else cap
+    if not check_handler_scope(cap_data, REGISTRY_HANDLER_PATTERN, op, ctx.local_peer_id):
+        return None, None, _error(
+            403, "not_entitled",
+            f"{op} requires {CAP_REGISTRY_ISSUE_BINDING} (§6a.9.3)",
+        )
     data = _params_data(params)
     ph = _normalize_hash(data.get("pending_hash"))
     if ph is None:
-        return _error(400, "invalid_params", "approve-request requires a pending_hash")
-    pending = ctx.emit_pathway.content_store.get(ph)
-    if pending is None or pending.type != REGISTER_PENDING_TYPE:
-        return _error(404, "not_found", "no such pending request")
+        return None, None, _error(400, "invalid_params", f"{op} requires a pending_hash")
+
+    pending, is_head = _load_pending_head(ctx, ph)
+    if pending is None:
+        return None, None, _error(
+            404, "not_found", f"no pending-binding is published at {_pending_body_path(ph)}",
+        )
+    if not is_head:
+        # §6a.9.3 pins `404 not_found` for "names no stored pending-binding" and
+        # pins NOTHING for "names a superseded one" — a case its own supersession
+        # rule creates. Reusing the pinned code with a message that names
+        # supersession beats inventing a cohort-divergent one; core-go reached
+        # the same answer independently and routed it as gap 3 of
+        # spec-issues/2026-08-13-d.
+        return None, None, _error(
+            404, "not_found",
+            f"pending-binding {ph.hex()} is no longer the head for "
+            f"({pending.data.get('target_peer_id')}, {pending.data.get('name')!r}) — a later "
+            "register-request superseded it (§6a.9.3, one head per pair), or its retention "
+            "window elapsed; the body remains for audit but is not decidable",
+        )
+    if pending.data.get("status") in PENDING_DECIDED_STATUSES:
+        # Checked BEFORE name_taken so a replayed approve of an already-approved
+        # request reports what actually happened rather than blaming the name it
+        # bound itself.
+        return None, None, _error(
+            409, ALREADY_DECIDED_ERROR_CODE,
+            f"pending request is already {pending.data.get('status')!r} — approve and deny "
+            "are not idempotent-by-replay (§6a.9.3)",
+        )
+    return pending, ph, None
+
+
+def _decided_body(pending: Entity, status: str, **extra: Any) -> Entity:
+    """The next body in a pending-binding's life: same request fields, new
+    terminal status. A decision writes a NEW immutable body and repoints — it
+    does not mutate, and (§6a.9.3 `[MUST]`) it does not delete."""
+    data = dict(pending.data)
+    data["status"] = status
+    data.update(extra)
+    return Entity(type=PENDING_BINDING_TYPE, data=data)
+
+
+async def _handle_approve_request(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
+    """§6a.9.3 ``:approve-request`` — the operator issues a queued request's
+    binding, leaving an ``approved`` head that carries the binding_hash."""
+    pending, ph, err = _load_for_decision(ctx, _OP_APPROVE, params)
+    if err is not None:
+        return err
     nfc_name = pending.data.get("name")
     if _name_is_taken(ctx, nfc_name):
+        # The queue is not a reservation (§6a.9.3 [MUST]) — issuing anyway would
+        # silently overwrite whoever took the name between queue and approval.
         return _error(409, "name_taken", f"name {nfc_name!r} was taken since it was queued")
     bh = _issue_binding(
         ctx, nfc_name, pending.data.get("target_peer_id"),
         pending.data.get("transports") or [], pending.data.get("requested_ttl"),
     )
-    # Dequeue the now-issued request (the body remains content-addressed/auditable).
-    ctx.emit_pathway.entity_tree.remove(REGISTER_PENDING_PREFIX + ph.hex())
-    return _ok("system/registry/register-result", {"status": "registered", "binding_hash": bh})
+    # Approve does NOT remove the head. Our pre-§6a.9.3 path dequeued it here;
+    # the ruling calls that out as the one place our shape was not ratified. A
+    # requester polling a vanished pointer cannot tell *decided* from *never
+    # received*, which is a silent drop the substrate floor forbids.
+    _write_pending_head(ctx, _decided_body(
+        pending, PENDING_STATUS_APPROVED, binding_hash=bh,
+    ))
+    return _ok(
+        "system/registry/register-result",
+        {"status": REGISTER_STATUS_BOUND, "binding_hash": bh},
+    )
+
+
+async def _handle_deny_request(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
+    """§6a.9.3 ``:deny-request`` — the operator refuses a queued request.
+    Nothing is signed and nothing is published; a ``denied`` head is left
+    reachable through the by-request pointer, because deny is not a delete."""
+    pending, ph, err = _load_for_decision(ctx, _OP_DENY, params)
+    if err is not None:
+        return err
+    reason = _params_data(params).get("reason")
+    extra: dict[str, Any] = {}
+    if isinstance(reason, str):
+        # Operator-supplied, never parsed (§6a.9.3).
+        extra["reason"] = reason
+    _write_pending_head(ctx, _decided_body(pending, PENDING_STATUS_DENIED, **extra))
+    return _ok(
+        "system/registry/register-result",
+        {"status": REGISTER_STATUS_DENIED},
+    )
 
 
 async def _handle_set_issuer_policy(ctx: HandlerContext, params: dict[str, Any]) -> dict[str, Any]:
@@ -1360,6 +1624,8 @@ async def registry_handler(
         return await _handle_renew_request(ctx, params)
     if operation == _OP_APPROVE:
         return await _handle_approve_request(ctx, params)
+    if operation == _OP_DENY:
+        return await _handle_deny_request(ctx, params)
     if operation == _OP_SET_POLICY:
         return await _handle_set_issuer_policy(ctx, params)
     if operation == _OP_GET_POLICY:

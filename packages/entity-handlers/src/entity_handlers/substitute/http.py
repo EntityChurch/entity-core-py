@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 HTTP_HANDLER_PATTERN = "system/substitute/http"
 HTTP_TRY_OP = "try"
+# The `substitute_type` value this handler serves; the handler URI is
+# `system/substitute/{substitute_type}` (cross-impl rulings §3.2).
+HTTP_SUBSTITUTE_TYPE = "http"
 
 # Default timeout: short enough that transients don't stall the chain.
 DEFAULT_HTTP_TIMEOUT_SECONDS = 10.0
@@ -165,6 +168,27 @@ async def http_substitute_handler(
         )
 
     entry_data = entry.get("data") if "data" in entry else entry
+    # Handler-side re-validation of `substitute_type`. §6 pins the ORCHESTRATOR's
+    # type→handler routing (chain.py dispatches to `system/substitute/{type}`) and
+    # says nothing about the handler re-checking on arrival, so this is the safe
+    # direction on an unpinned question, not a conformance requirement — routed to
+    # arch to pin (core-go's E2, scored WARN against us deliberately rather than
+    # FAIL, which was the right call on their own reading).
+    #
+    # Adopted anyway because of what this component is: the entry is
+    # attacker-supplied input to the one handler whose job is making an outbound
+    # request. Without the check, an entry declaring some other convention still
+    # got its URL built and fetched — we answered 502 network_error, having
+    # already made the call. Refusing costs nothing on the routed path, where the
+    # type always matches by construction.
+    declared_type = entry_data.get("substitute_type") if isinstance(entry_data, dict) else None
+    if declared_type is not None and declared_type != HTTP_SUBSTITUTE_TYPE:
+        return error_response(
+            400,
+            "invalid_entry",
+            f"entry declares substitute_type {declared_type!r}; "
+            f"{HTTP_HANDLER_PATTERN} serves {HTTP_SUBSTITUTE_TYPE!r} sources only",
+        )
     endpoint = entry_data.get("endpoint") if isinstance(entry_data, dict) else None
     if not isinstance(endpoint, dict):
         return error_response(

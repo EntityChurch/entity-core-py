@@ -709,7 +709,9 @@ async def test_reg_register_open_issues_and_resolves(peer):
 
     r = await _call(peer, "register-request", data)
     assert r["status"] == 200
-    assert r["result"]["data"]["status"] == "registered"
+    assert r["result"]["type"] == "system/registry/register-result"
+    assert r["result"]["data"]["status"] == "bound"
+    assert r["result"]["data"].get("binding_hash")
 
     resolved = (await _call(peer, "resolve", {"name": "billslab.com"}))["result"]["data"]
     assert resolved["status"] == "resolved"
@@ -839,24 +841,314 @@ async def test_reg_register_manual_queue_then_approve(peer):
     approved = await _call(peer, "approve-request", {"pending_hash": pending_hash},
                            remote=peer.keypair.peer_id)
     assert approved["status"] == 200
-    assert approved["result"]["data"]["status"] == "registered"
+    # `approve-request` shares `register-result` with the 200 branch above, so
+    # it shares the ruled value — an operator-issued binding is `bound` too.
+    assert approved["result"]["type"] == "system/registry/register-result"
+    assert approved["result"]["data"]["status"] == "bound"
     resolved = (await _call(peer, "resolve", {"name": "queued.com"}))["result"]["data"]
     assert resolved["status"] == "resolved"
     assert resolved["peer_id"] == reg_kp.peer_id
 
 
 @pytest.mark.asyncio
-async def test_reg_register_approve_is_operator_only(peer):
-    """A non-operator caller cannot approve a queued request."""
+@pytest.mark.parametrize("op", ["approve-request", "deny-request"])
+async def test_reg_decision_requires_the_issue_binding_cap(peer, op):
+    """§6a.9.3 — both decisions are gated by
+    `system/capability/registry-issue-binding`, and a caller without it is
+    refused whatever its origin.
+
+    This test used to assert a self-origin floor ("approve-request is
+    operator-only"), which was our pre-ruling invention and made the ruled
+    capability undelegable: gating on origin means only the registry process
+    itself can ever decide, so a cap whose purpose is handing operator
+    authority to someone else could never be exercised by them. The gate is
+    the grant, so the narrow-grant caller is what has to be refused."""
     _emit_issuer_policy(peer, "manual")
     reg_kp = Keypair.generate()
-    data = _register_data(reg_kp.peer_id, "queued.com")
-    _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
-    pending_hash = (await _call(peer, "register-request", data))["result"]["data"]["pending_hash"]
+    ph = await _queue_call(peer, reg_kp, "queued.com")
 
-    r = await _call(peer, "approve-request", {"pending_hash": pending_hash})  # remote="test"
+    # A caller granted everything EXCEPT the decision ops.
+    narrow = {"grants": [{
+        "handlers": {"include": ["*"]},
+        "resources": {"include": ["*"]},
+        "operations": {"include": ["*"], "exclude": ["approve-request", "deny-request"]},
+    }]}
+    h = peer.handlers.find_handler("system/registry")
+    ctx = _ctx(peer, remote="somebody-else")
+    ctx.caller_capability = narrow
+    r = await h("system/registry", op, {"data": {"pending_hash": ph}}, ctx)
     assert r["status"] == 403
     assert r["result"]["data"]["code"] == "not_entitled"
+
+    # And the head is untouched — a refused decision decides nothing.
+    assert _pending_body(peer, _by_request(peer, reg_kp.peer_id, "queued.com")
+                         ).data["status"] == "pending_review"
+
+
+@pytest.mark.asyncio
+async def test_reg_decision_by_a_remote_holding_the_cap_is_allowed(peer):
+    """The positive half, and the reason the floor had to go: a REMOTE
+    operator holding the cap can decide. core-go's oracle drives exactly this
+    shape, and a self-origin check answers 403 to a conformant client."""
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    ph = await _queue_call(peer, reg_kp, "queued.com")
+
+    r = await _call(peer, "approve-request", {"pending_hash": ph}, remote="a-remote-operator")
+    assert r["status"] == 200, r
+    assert r["result"]["data"]["status"] == "bound"
+
+
+# ---------------------------------------------------------------------------
+# §6a.9.3 — the manual-approval path (RULED 2026-08-13)
+# ---------------------------------------------------------------------------
+
+
+def _queue(peer, target_kp, name, *, nonce=b"\x11" * 16, requested_ttl=None):
+    """Build + sign a manual-mode request."""
+    data = _register_data(target_kp.peer_id, name, nonce=nonce,
+                          requested_ttl=requested_ttl)
+    _sign_into_store(peer, target_kp, "system/registry/register-request", data)
+    return data
+
+
+async def _queue_call(peer, target_kp, name, *, nonce=b"\x11" * 16, requested_ttl=None):
+    """Queue a manual-mode request; returns its pending_hash.
+
+    Supersession cases vary `requested_ttl` rather than only the nonce, and the
+    reason is a real property of §6a.9.3's schema: a pending-binding carries
+    `{name, target_peer_id, transports, requested_ttl, queued_at, status}` and
+    NOTHING request-unique — the request's `nonce` is not among its fields. Two
+    retries for one pair with identical terms inside the same millisecond
+    therefore hash identically, so `pending_hash` identifies (pair, terms,
+    millisecond) rather than a request. Benign in production — supersession
+    keeps one head either way and a byte-identical head is the same intent on
+    the same terms — but a test that varies only the nonce is asserting a
+    distinctness the schema does not provide, and fails whenever both calls land
+    in one millisecond."""
+    r = await _call(peer, "register-request",
+                    _queue(peer, target_kp, name, nonce=nonce, requested_ttl=requested_ttl))
+    assert r["status"] == 202, r
+    return r["result"]["data"]["pending_hash"]
+
+
+def _pending_body(peer, ph):
+    return peer.emit_pathway.content_store.get(ph)
+
+
+def _by_request(peer, target_peer_id, name):
+    return peer.emit_pathway.entity_tree.get(
+        f"system/registry/pending/by-request/{target_peer_id}/{name}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_handle_resolves_to_a_pending_binding(peer):
+    """REG-PENDING-HANDLE-1 — the resolvability half, which is the reason
+    §6a.9.3 exists: before the schema landed, a `pending_hash` that named
+    nothing fetchable was indistinguishable from a conformant one."""
+    _emit_issuer_policy(peer, "manual")
+    reg_kp = Keypair.generate()
+    data = _queue(peer, reg_kp, "queued.com")
+    request_hash = Entity(type="system/registry/register-request", data=data).compute_hash()
+
+    r = await _call(peer, "register-request", data)
+    ph = r["result"]["data"]["pending_hash"]
+
+    # Distinct from the request's own hash — a handle the client can already
+    # compute is not a handle.
+    assert ph != request_hash
+
+    body = _pending_body(peer, ph)
+    assert body is not None, "pending_hash resolves to nothing"
+    assert body.type == "system/registry/pending-binding"
+    assert body.data["status"] == "pending_review"
+    assert body.data["target_peer_id"] == reg_kp.peer_id
+    assert body.data["name"] == "queued.com"
+
+    # Published at its own body path, and the by-request pointer names it.
+    assert peer.emit_pathway.entity_tree.get(f"system/registry/pending/{ph.hex()}") == ph
+    assert _by_request(peer, reg_kp.peer_id, "queued.com") == ph
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_supersedes_leaving_one_head(peer):
+    """§6a.9.3 [MUST] — one pending head per (target_peer_id, name). Every
+    retry carries a fresh nonce and is a distinct request by construction, so
+    without supersession one intent fills the operator's queue."""
+    _emit_issuer_policy(peer, "manual")
+    reg_kp = Keypair.generate()
+    first = await _queue_call(peer, reg_kp, "queued.com",
+                              nonce=b"\x11" * 16, requested_ttl=60_000)
+    second = await _queue_call(peer, reg_kp, "queued.com",
+                               nonce=b"\x22" * 16, requested_ttl=90_000)
+
+    assert first != second
+    # The pointer names the NEW body, and there is exactly one head for the pair.
+    assert _by_request(peer, reg_kp.peer_id, "queued.com") == second
+    heads = peer.emit_pathway.entity_tree.list_prefix(
+        "system/registry/pending/by-request/"
+    )
+    assert len(heads) == 1, heads
+    # The superseded body survives for audit — it is content-addressed history.
+    assert _pending_body(peer, first) is not None
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_superseded_head_is_not_decidable(peer):
+    """The case §6a.9.3's own supersession rule creates and does not pin.
+
+    Approving a superseded hash would mint a binding on terms the operator's
+    queue no longer shows, and leave the pointer naming a different head than
+    the one decided. Refused with the code §6a.9.3 DOES pin for an
+    unresolvable handle rather than an invented one."""
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    stale = await _queue_call(peer, reg_kp, "queued.com",
+                              nonce=b"\x11" * 16, requested_ttl=60_000)
+    await _queue_call(peer, reg_kp, "queued.com",
+                      nonce=b"\x22" * 16, requested_ttl=90_000)
+
+    r = await _call(peer, "approve-request", {"pending_hash": stale},
+                    remote=peer.keypair.peer_id)
+    assert r["status"] == 404
+    assert r["result"]["data"]["code"] == "not_found"
+    # The negative half: nothing was issued off the stale head.
+    assert (await _call(peer, "resolve", {"name": "queued.com"}))[
+        "result"]["data"]["status"] != "resolved"
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_approve_leaves_an_approved_head(peer):
+    """REG-PENDING-DECIDE-1, approve half. Our pre-§6a.9.3 path removed the
+    entry on issue; the ruling names that the one place our shape was not
+    ratified. A requester polling a vanished pointer cannot distinguish
+    *decided* from *never received*."""
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    ph = await _queue_call(peer, reg_kp, "queued.com")
+
+    approved = await _call(peer, "approve-request", {"pending_hash": ph},
+                           remote=peer.keypair.peer_id)
+    assert approved["status"] == 200
+    bh = approved["result"]["data"]["binding_hash"]
+
+    head = _by_request(peer, reg_kp.peer_id, "queued.com")
+    assert head is not None, "approve removed the head — deny/approve are not deletes"
+    body = _pending_body(peer, head)
+    assert body.data["status"] == "approved"
+    # REQUIRED on "approved": the head carries the binding it produced.
+    assert body.data["binding_hash"] == bh
+    assert (await _call(peer, "resolve", {"name": "queued.com"}))[
+        "result"]["data"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_deny_leaves_a_denied_head_and_publishes_nothing(peer):
+    """REG-PENDING-DECIDE-1, deny half — and the negative half is the
+    load-bearing one: a deny that silently issued would pass an
+    outcome-only check."""
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    ph = await _queue_call(peer, reg_kp, "queued.com")
+
+    denied = await _call(peer, "deny-request",
+                         {"pending_hash": ph, "reason": "not your name"},
+                         remote=peer.keypair.peer_id)
+    assert denied["status"] == 200
+    assert denied["result"]["type"] == "system/registry/register-result"
+    assert denied["result"]["data"]["status"] == "denied"
+
+    head = _by_request(peer, reg_kp.peer_id, "queued.com")
+    assert head is not None, "deny is not a delete (§6a.9.3 [MUST])"
+    body = _pending_body(peer, head)
+    assert body.data["status"] == "denied"
+    assert body.data["reason"] == "not your name"
+    assert "binding_hash" not in body.data
+    # Nothing signed, nothing published.
+    assert (await _call(peer, "resolve", {"name": "queued.com"}))[
+        "result"]["data"]["status"] != "resolved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first,second", [
+    ("approve-request", "approve-request"),
+    ("approve-request", "deny-request"),
+    ("deny-request", "approve-request"),
+    ("deny-request", "deny-request"),
+])
+async def test_reg_pending_second_decision_is_409(peer, first, second):
+    """§6a.9.3 — approve and deny are not idempotent-by-replay. The dangerous
+    failure is a 200: re-approving mints a second binding for one request, and
+    approving an already-denied one overturns the operator by retry."""
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+    reg_kp = Keypair.generate()
+    ph = await _queue_call(peer, reg_kp, "queued.com")
+
+    assert (await _call(peer, first, {"pending_hash": ph},
+                        remote=peer.keypair.peer_id))["status"] == 200
+
+    # A decision writes a NEW body and repoints, so the decided head is not the
+    # hash the 202 handed out. The pointer is the poll surface (§6a.9.3 gives no
+    # list-pending op precisely because a tree read answers it), and the second
+    # decision is submitted against the current head — which is what core-go's
+    # oracle does too. Submitting the pre-decision hash instead is the
+    # superseded-head case above and correctly answers 404.
+    decided_head = _by_request(peer, reg_kp.peer_id, "queued.com")
+    assert decided_head is not None and decided_head != ph
+
+    r = await _call(peer, second, {"pending_hash": decided_head},
+                    remote=peer.keypair.peer_id)
+    assert r["status"] == 409, r
+    assert r["result"]["data"]["code"] == "already_decided"
+    # The dangerous failure is a 200; assert nothing was published by the refusal.
+    if first == "deny-request":
+        assert (await _call(peer, "resolve", {"name": "queued.com"}))[
+            "result"]["data"]["status"] != "resolved"
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_decision_on_unknown_hash_is_404(peer):
+    _emit_issuer_policy(peer, "manual")
+    r = await _call(peer, "approve-request", {"pending_hash": b"\x00" * 33},
+                    remote=peer.keypair.peer_id)
+    assert r["status"] == 404
+    assert r["result"]["data"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_reg_pending_retention_spares_live_queue_state(peer, monkeypatch):
+    """§6a.9.3 retention [SHOULD] — a DECIDED head past the window is
+    GC-eligible; a `pending_review` head is never eligible at any age.
+    Expiring live queue state would silently drop a request no operator has
+    seen, which is the same deliver-or-signal violation deny-is-not-a-delete
+    forbids."""
+    import entity_handlers.registry as _reg
+    _emit_issuer_policy(peer, "manual")
+    _peerissued_config(peer, peer.keypair)
+
+    old_kp, live_kp = Keypair.generate(), Keypair.generate()
+    decided = await _queue_call(peer, old_kp, "decided.com")
+    await _call(peer, "deny-request", {"pending_hash": decided},
+                remote=peer.keypair.peer_id)
+    aged = await _queue_call(peer, live_kp, "still-waiting.com")
+
+    # Both heads are now older than the window.
+    monkeypatch.setattr(_reg, "PENDING_RETENTION_MS", -1)
+    # Any queue triggers the opportunistic sweep.
+    await _queue_call(peer, Keypair.generate(), "trigger.com")
+
+    assert _by_request(peer, old_kp.peer_id, "decided.com") is None, \
+        "a decided head past retention should be reclaimed"
+    assert _by_request(peer, live_kp.peer_id, "still-waiting.com") == aged, \
+        "a pending_review head is never GC-eligible, at any age"
+    # The reclaimed body stays content-addressed and auditable.
+    assert _pending_body(peer, decided) is not None
 
 
 @pytest.mark.asyncio

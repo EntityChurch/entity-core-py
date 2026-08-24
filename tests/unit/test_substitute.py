@@ -509,6 +509,54 @@ class TestHttpSubstituteHandler:
         assert result["status"] == 400
         assert result["result"]["data"]["code"] == "invalid_entry"
 
+    def test_foreign_substitute_type_refused_without_fetching(self):
+        """An entry declaring another convention is refused before the GET.
+
+        §6 pins the ORCHESTRATOR's type→handler routing and is silent on the
+        handler re-checking on arrival, so this is the safe direction on an
+        unpinned question rather than a conformance requirement (core-go scored
+        it WARN against us, correctly, and routed it to arch to pin). Adopted
+        because of what this component is: the entry is attacker-supplied input
+        to the one handler whose job is making an outbound request. We used to
+        build the URL and fetch, answering 502 having already made the call.
+
+        The negative half is the point — assert the fetcher was never touched.
+        """
+        ctx = _make_ctx()
+        bad = _make_entry()
+        bad["data"]["substitute_type"] = "peer-to-peer"
+        fetcher = _FakeFetcher(body=b"")
+        result = _run(
+            http_substitute_handler(
+                HTTP_HANDLER_PATTERN,
+                "try",
+                {"data": {"entry": bad, "hash": _digest(b"x")}},
+                ctx.handler,
+                fetcher=fetcher,
+            )
+        )
+        assert result["status"] == 400
+        assert result["result"]["data"]["code"] == "invalid_entry"
+        assert fetcher.url_seen is None, "refused entry still triggered an outbound fetch"
+
+    def test_matching_substitute_type_still_fetches(self):
+        """The control: the routed path always carries `http` by construction,
+        so the check must not cost the happy path anything."""
+        ctx = _make_ctx()
+        target = {"type": "custom/thing", "data": {"x": 1}}
+        body = cbor2.dumps(target, canonical=True)
+        want = compute_ecf_hash(target)
+        result = _run(
+            http_substitute_handler(
+                HTTP_HANDLER_PATTERN,
+                "try",
+                {"data": {"entry": _make_entry(), "hash": want}},
+                ctx.handler,
+                fetcher=_FakeFetcher(body=body),
+            )
+        )
+        assert result["status"] == 200
+
 
 # -----------------------------------------------------------------------------
 # Chain orchestrator — list/filter/sort + abort/advance + ingest.

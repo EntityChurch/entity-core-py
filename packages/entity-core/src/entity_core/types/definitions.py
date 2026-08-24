@@ -6413,12 +6413,25 @@ def type_system_registry_issuer_policy() -> Entity:
     )
 
 
-def type_system_registry_register_pending() -> Entity:
-    """`system/registry/register-pending` — a queued request in `manual` mode (§6a.9)."""
+def type_system_registry_pending_binding() -> Entity:
+    """`system/registry/pending-binding` — a queued request in `manual` mode.
+
+    §6a.9.3 `[RULED 2026-08-13]`. `status` walks `pending_review` → `approved`
+    | `denied` and the terminal states are what make deny not-a-delete;
+    `binding_hash` is REQUIRED on `approved` and absent otherwise, `reason` is
+    OPTIONAL on `denied` and never parsed. Body at
+    `system/registry/pending/{pending_hash}`, head pointer at
+    `system/registry/pending/by-request/{target_peer_id}/{name}`.
+
+    The hash is registry-local by design and MUST NOT be gated on cross-impl
+    reproducibility — `queued_at` is a local wall-clock reading, so two
+    registries cannot agree on it and never need to: this is pre-decision,
+    single-registry state that no aggregator republishes.
+    """
     return Entity(
         type="system/type",
         data={
-            "name": "system/registry/register-pending",
+            "name": "system/registry/pending-binding",
             "fields": {
                 "name": {"type_ref": "primitive/string"},
                 "target_peer_id": {"type_ref": "system/peer-id"},
@@ -6428,6 +6441,8 @@ def type_system_registry_register_pending() -> Entity:
                 "requested_ttl": {"type_ref": "primitive/uint", "optional": True},
                 "queued_at": {"type_ref": "primitive/uint"},
                 "status": {"type_ref": "primitive/string"},
+                "binding_hash": {"type_ref": "system/hash", "optional": True},
+                "reason": {"type_ref": "primitive/string", "optional": True},
             },
         },
     )
@@ -6454,9 +6469,19 @@ def type_system_registry_nonce_record() -> Entity:
 def type_system_registry_register_result() -> Entity:
     """`system/registry/register-result` — `:register-request` / `:approve-request` output.
 
-    `status` is `registered` (binding issued, `binding_hash` present),
-    `pending_review` (manual-mode queue, `pending_hash` present), or a typed
-    rejection delivered as `system/protocol/error` instead.
+    `status` is `bound` (binding issued, `binding_hash` present) or
+    `pending_review` (manual-mode queue, `pending_hash` present), both `[MUST]`
+    `[RULED 2026-08-12]`, or `denied` from `:deny-request` (§6a.9.3
+    `[RULED 2026-08-13]`). A *rejection* is still delivered as
+    `system/protocol/error`; `denied` is an operator decision on an accepted
+    request, which is a different thing from a refused one.
+
+    The 08-12 result-type block enumerates only the first two — §6a.9.3
+    introduced its third outcome without extending the type it returns, which
+    is structurally the defect §6a.9 recorded about itself when `pending_hash`
+    appeared in pseudocode and nowhere in the schema. Routed upstream (core-go
+    `spec-issues/2026-08-13-d` gap 1); implemented per §6a.9.3's table, the
+    later and more specific ruling.
     """
     return Entity(
         type="system/type",
@@ -7421,7 +7446,7 @@ ALL_TYPE_DEFINITIONS = [
     # EXTENSION-REGISTRY §6a.9 — peer-issued live registration
     type_system_registry_register_request,
     type_system_registry_issuer_policy,
-    type_system_registry_register_pending,
+    type_system_registry_pending_binding,
     type_system_registry_nonce_record,
     type_system_registry_register_result,
     type_system_registry_revoke_request,

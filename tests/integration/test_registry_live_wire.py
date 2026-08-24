@@ -78,8 +78,15 @@ async def test_live_register_over_wire_then_resolve(registry_peer: Peer):
             included=included,
         )
         assert resp.status == 200, resp.result
+        # All three halves §6a.9's ruling pins, not just the status line: the
+        # result carries its OWN type (not a borrowed shape), `.status` is
+        # `bound`, and `binding_hash` is present. This assertion read
+        # `== "registered"` until 2026-08-13 — it was the only check in the
+        # cohort looking at this field, and it pinned the divergence in place.
+        assert resp.result["type"] == "system/registry/register-result"
         body = resp.result["data"] if "data" in resp.result else resp.result
-        assert body["status"] == "registered"
+        assert body["status"] == "bound"
+        assert body.get("binding_hash")
 
         # The issued name now resolves against the registry (warm-cache precede).
         rresp = await conn.execute(
