@@ -50,7 +50,7 @@ from entity_core.storage.entity_tree import EntityTree
 from entity_handlers.compute import (
     _COMPUTE_TYPE_DEFS,
     _CONTAINED_ARGS,
-    _EVAL_LIMIT_CODES,
+    _SHORT_CIRCUIT_LIMIT_CODES,
     BUILTIN_CONCAT,
     BUILTIN_FILTER,
     BUILTIN_FOLD,
@@ -68,7 +68,7 @@ from entity_handlers.compute import (
     error_data,
     evaluate,
     is_error,
-    is_eval_limit,
+    is_short_circuit_limit,
 )
 
 PEER_ID = "test-peer-id"
@@ -147,6 +147,33 @@ def _body_value_form_error(ctx: EvalContext, code: str = SEEDED) -> bytes:
         type="compute/error", data={"code": code, "message": "prose"},
     ))
     return _put(ctx, Entity(type="compute/lookup/hash", data={"hash": stored}))
+
+
+def _cmp(ctx: EvalContext, op: str, left: bytes, right: bytes) -> bytes:
+    return _put(ctx, Entity(type="compute/compare", data={
+        "op": op, "left": left, "right": right,
+    }))
+
+
+def _if(ctx: EvalContext, cond: bytes, then_: bytes, else_: bytes) -> bytes:
+    return _put(ctx, Entity(type="compute/if", data={
+        "condition": cond, "then": then_, "else": else_,
+    }))
+
+
+def _nested_adds(ctx: EvalContext, levels: int) -> bytes:
+    """`1 + (1 + (1 + …))` — an expression whose *depth* is `levels`.
+
+    Each operand resolution is one `evaluate()` call, so this is the one shape
+    that exhausts `depth` without exhausting `operations`, which is what makes
+    a `depth_exceeded` reachable on a chosen element and nowhere else.
+    """
+    body = _lit(ctx, 0)
+    for _ in range(levels):
+        body = _put(ctx, Entity(type="compute/arithmetic", data={
+            "op": "add", "left": _lit(ctx, 1), "right": body,
+        }))
+    return body
 
 
 def _err_body(ctx: EvalContext, form: str, code: str = SEEDED) -> tuple[bytes, str]:
@@ -445,11 +472,25 @@ class TestFoldContainsTheAccumulator:
 
 
 # ============================================================================
-# The evaluation-limit carve-out — go's lead call, py concurs on the outcome
-# and diverges on the discriminator
+# The evaluation-limit carve-out — RULED 2026-08-21 (§8), and the ruling moved
+# a row at THIS seat that two sibling reports said was already right
 # ============================================================================
+#
+# Arch's §8 and go's `2026-08-22-compute-v327-*` both state that
+# `entity-core-py` **contains** `depth_exceeded`. **It did not.** `f09ae70`
+# short-circuited all three limit codes, from py's own SA-PY-25 which says so in
+# its second paragraph — the ruling read that filing as agreeing with rust and
+# recorded the result as "nothing owed", and go relayed it. So the ruling's
+# derivation (§5.1's *restored on return*) landed against a seat that believed
+# it already complied.
+#
+# The rows below are the CV-9 series (§6.1) written locally, and the depth ones
+# are the ones that were RED before this commit. `test_the_premise_of_8_3_holds_
+# at_this_peer` is the one that would have caught the mis-attribution without a
+# sibling: it asserts the *property the ruling reasons from*, in our tree.
 
-class TestEvalLimitCodesPropagate:
+
+class TestShortCircuitLimitCodes:
     def test_a_real_budget_exhaustion_inside_a_map_aborts_the_map(self):
         """The reason for the carve-out, measured rather than argued.
 
@@ -471,22 +512,22 @@ class TestEvalLimitCodesPropagate:
         assert _code(result) == ERR_BUDGET_EXHAUSTED
         assert not isinstance(result, list)
 
-    def test_a_value_form_limit_code_propagates_too_and_that_is_the_divergence(
+    def test_cv9c_a_value_form_budget_exhausted_short_circuits_exactly_as_a_minted_one(
         self,
     ):
-        """**Named divergence from `entity-core-go` `9ad0110`.**
+        """**CV-9c** (§6.1) — the provenance pair for §8.4, and the arm go's
+        pre-`0e1f604` minted-only carve-out failed.
 
-        go checks `isEvalLimitCode` only on its MINTED arm (`err != nil` in
-        `builtinMap`), so a closure returning a stored
-        `compute/error{code: "budget_exhausted"}` is CONTAINED there and
-        propagated here. That is the §2.4 provenance asymmetry the same ruling
-        closed, narrowed to three codes — and the narrowing is what makes it
-        easy to miss.
+        The value form is not hypothetical: §7.3 **mandates** writing a
+        `compute/error` to the `result_path` when a reactive re-evaluation
+        exhausts its budget, so a downstream `compute/lookup/tree` reads a
+        value-form `budget_exhausted` produced by a conformant peer doing what
+        the spec requires. §2.4 then makes it *the same materialized entity* as
+        a minted one, so the disposition must be keyed on the code.
 
-        py cannot express that split: it carries one representation, and the
-        discriminator is the code, read through `error_data`. This row is the
-        claim go is asked to concur with or refute; the arm above is the one
-        both seats already agree on.
+        py has one representation and cannot express the split even by
+        accident — asserted anyway, because "cannot express it" is a claim about
+        `is_short_circuit_limit`'s current shape, not a property of the language.
         """
         ctx = _ctx()
         result = _builtin(ctx, BUILTIN_MAP, {
@@ -496,34 +537,176 @@ class TestEvalLimitCodesPropagate:
             ),
         })
         assert is_error(result) and _code(result) == ERR_BUDGET_EXHAUSTED
+        assert not isinstance(result, list), (
+            "contained — the minted-only-carve-out shape, one code family over"
+        )
 
-    def test_the_carve_out_is_exactly_the_three_limit_codes(self):
-        """A carve-out that grows silently stops being a carve-out.
+    def test_the_short_circuit_set_is_exactly_the_two_unrestored_counters(self):
+        """A carve-out that grows silently stops being a carve-out — and this
+        one **shrank**, which is the direction nobody re-checks.
 
-        `division_by_zero` is the control: it is the code go's CV-8a uses
-        precisely because it is uncontested under every reading, so a seat that
-        "helpfully" widened the limit set would fail here rather than at the
-        wire.
+        `depth_exceeded`'s absence is a ruling (§8.3), not an omission: `depth`
+        is *restored on unwind*, so it is element-local and contains. A seat
+        that "helpfully" re-adds it, or that widens the set to
+        `division_by_zero` (the control, chosen because CV-8a uses it precisely
+        for being uncontested under every reading), fails here rather than at
+        the wire.
         """
-        assert _EVAL_LIMIT_CODES == {
-            ERR_BUDGET_EXHAUSTED, ERR_DEPTH_EXCEEDED, ERR_CASCADE_LIMIT,
-        }
-        assert not is_eval_limit(
+        assert _SHORT_CIRCUIT_LIMIT_CODES == {ERR_BUDGET_EXHAUSTED, ERR_CASCADE_LIMIT}
+        assert ERR_DEPTH_EXCEEDED not in _SHORT_CIRCUIT_LIMIT_CODES, (
+            "§8.3: depth is restored on unwind, so depth_exceeded is "
+            "element-local and CONTAINS like any other error"
+        )
+        assert not is_short_circuit_limit(
             {"type": "compute/error", "data": {"code": ERR_DIVISION_BY_ZERO}}
         )
-        assert not is_eval_limit({"type": "primitive/any", "data": ERR_BUDGET_EXHAUSTED}), (
-            "the predicate is kind-AND-code, so a plain string is not a limit"
-        )
+        assert not is_short_circuit_limit(
+            {"type": "primitive/any", "data": ERR_BUDGET_EXHAUSTED}
+        ), "the predicate is kind-AND-code, so a plain string is not a limit"
 
     def test_the_predicate_reads_the_code_and_not_the_representation(self):
-        """The whole objection to go's shape, as an assertion.
-
-        Both representations of the same code MUST answer identically — that is
-        §2.4, and a discriminator that reads the representation re-opens it.
+        """§8.4, adopted verbatim from rust: *keyed on the CODE, never the
+        variant.* Both representations of one code MUST answer identically.
         """
         as_dict = {"type": "compute/error", "data": {"code": ERR_BUDGET_EXHAUSTED}}
         as_entity = Entity(type="compute/error", data={"code": ERR_BUDGET_EXHAUSTED})
-        assert is_eval_limit(as_dict) is is_eval_limit(as_entity) is True
+        assert (
+            is_short_circuit_limit(as_dict) is is_short_circuit_limit(as_entity) is True
+        )
+        as_dict_d = {"type": "compute/error", "data": {"code": ERR_DEPTH_EXCEEDED}}
+        as_entity_d = Entity(type="compute/error", data={"code": ERR_DEPTH_EXCEEDED})
+        assert (
+            is_short_circuit_limit(as_dict_d)
+            is is_short_circuit_limit(as_entity_d)
+            is False
+        )
+
+
+# ============================================================================
+# CV-9a — `depth_exceeded` CONTAINS (§8.3). RED at this seat before this commit.
+# ============================================================================
+
+class TestDepthExceededContains:
+    """The row arch ruled and two reports said we already satisfied.
+
+    `_short_circuit_map_body` builds `if x == 2 then <deep> else x`, so exactly
+    one element of three exceeds `depth`. Under the pre-ruling set the whole
+    `map` answered one `depth_exceeded`; under §8.3 it answers `[1, E, 3]`.
+    """
+
+    @staticmethod
+    def _one_deep_element(ctx: EvalContext) -> bytes:
+        return _lambda(ctx, ["x"], _if(
+            ctx,
+            _cmp(ctx, "eq", _scope_ref(ctx, "x"), _lit(ctx, 2)),
+            _nested_adds(ctx, 40),
+            _scope_ref(ctx, "x"),
+        ))
+
+    def test_cv9a_one_deep_element_yields_a_e_c_and_not_a_single_error(self):
+        """The discriminator, and it fails under the pre-ruling reading."""
+        ctx = _ctx()
+        result = _builtin(
+            ctx, BUILTIN_MAP,
+            {
+                "collection": _lit(ctx, [1, 2, 3]),
+                "fn": self._one_deep_element(ctx),
+            },
+            budget=Budget(operations=100_000, depth=12),
+        )
+
+        assert not is_error(result), (
+            "map short-circuited depth_exceeded — the pre-§8.3 reading, which "
+            f"is what this seat shipped through f09ae70: {result!r}"
+        )
+        assert isinstance(result, list) and len(result) == 3
+        assert result[0] == 1 and result[2] == 3, (
+            "the neighbours are untouched — element-local, §1.5's NaN model"
+        )
+        assert _code(result[1]) == ERR_DEPTH_EXCEEDED
+
+    def test_the_premise_of_8_3_holds_at_this_peer_depth_is_restored_on_unwind(
+        self,
+    ):
+        """**The row that would have caught the mis-attribution unaided.**
+
+        §8.3 does not reason about `depth_exceeded`; it reasons about `depth`
+        being *restored on unwind* and derives containment from that. If this
+        peer leaked depth, element 3 would begin at a shallower budget than
+        element 1 and containment would NOT be element-local here — the ruling
+        would be right and our implementation of it still wrong.
+
+        So the property is asserted directly on the budget object, driven by a
+        **bare** `evaluate` rather than through `map`. That is deliberate and it
+        is a correction the mutation made to this row's first draft: written
+        through `map`, it failed under the *carve-out* mutation as well, which
+        means it was measuring containment a second time and not the premise at
+        all. Driven bare it is orthogonal — it stays GREEN when the set is
+        wrong and RED when the evaluator leaks, which is the only way it can
+        tell the two failures apart.
+        """
+        ctx = _ctx()
+        budget = Budget(operations=100_000, depth=12)
+        before = budget.depth
+        result = evaluate(
+            ctx.content_store.get(_nested_adds(ctx, 40)), Scope(), budget, ctx,
+        )
+        assert _code(result) == ERR_DEPTH_EXCEEDED, (
+            "the fixture no longer reaches the depth ceiling, so this row "
+            "proves nothing — re-tune `_nested_adds` against the budget"
+        )
+        assert budget.depth == before, (
+            f"depth leaked on the failing path: {budget.depth} != {before}. "
+            "§8.3's derivation does not hold at this peer, so containment is "
+            "not element-local here regardless of what the set says"
+        )
+
+    def test_a_value_form_depth_exceeded_is_contained_too(self):
+        """The mirror of CV-9c on the row that moved, and no vector reaches it.
+
+        CV-9c pins that a *stored* `budget_exhausted` short-circuits like a
+        minted one. The same provenance symmetry binds the other way: a stored
+        `depth_exceeded` must be **contained** like a minted one. A seat that
+        moved `depth_exceeded` out of the set in the minted arm alone passes
+        CV-9a and fails here.
+        """
+        ctx = _ctx()
+        result = _builtin(ctx, BUILTIN_MAP, {
+            "collection": _lit(ctx, [1, 2]),
+            "fn": _lambda(
+                ctx, ["x"], _body_value_form_error(ctx, ERR_DEPTH_EXCEEDED),
+            ),
+        })
+        assert isinstance(result, list) and len(result) == 2
+        assert [_code(el) for el in result] == [ERR_DEPTH_EXCEEDED] * 2
+
+    def test_fold_recovers_from_a_depth_exceeded_accumulator(self):
+        """§8.3 crossed with C-8's fold row — the widest blast radius of the
+        two, because it changes a produced **value** and not merely a cost.
+
+        A closure that ignores its accumulator recovers from an ordinary error
+        (CV-8d). Under the pre-ruling set a `depth_exceeded` accumulator could
+        not be recovered from; under §8.3 it is an ordinary error and can.
+        """
+        ctx = _ctx()
+        result = _builtin(ctx, BUILTIN_FOLD, {
+            "collection": _lit(ctx, [1, 2]),
+            "initial": _body_value_form_error(ctx, ERR_DEPTH_EXCEEDED),
+            # ignores `acc` entirely — returns the element
+            "fn": _lambda(ctx, ["acc", "x"], _scope_ref(ctx, "x")),
+        })
+        assert result == 2, f"fold did not recover: {result!r}"
+
+    def test_a_budget_exhausted_accumulator_still_does_not_recover(self):
+        """The control that keeps the row above attributable to §8.3 rather
+        than to the fold arm having lost its carve-out altogether."""
+        ctx = _ctx()
+        result = _builtin(ctx, BUILTIN_FOLD, {
+            "collection": _lit(ctx, [1, 2]),
+            "initial": _body_value_form_error(ctx, ERR_BUDGET_EXHAUSTED),
+            "fn": _lambda(ctx, ["acc", "x"], _scope_ref(ctx, "x")),
+        })
+        assert is_error(result) and _code(result) == ERR_BUDGET_EXHAUSTED
 
 
 # ============================================================================

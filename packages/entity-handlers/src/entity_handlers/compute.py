@@ -29,6 +29,7 @@ import concurrent.futures
 import hashlib
 import logging
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -182,27 +183,47 @@ ERR_CAST_OUT_OF_RANGE = "cast_out_of_range"    # compute/numeric-cast (§9.1, N.
 ERR_COUNT_OUT_OF_RANGE = "count_out_of_range"  # range's n (§9.1, v3.25)
 ERR_SCOPE_UNREACHABLE = "scope_unreachable"    # kind:entity binding unresolvable (§9.1, v3.19b N8)
 
-#: The **evaluation-limit** codes (§5.1 budget, §5.4 cascade). These are the one
-#: thing that does not flow into a contained position `[C-8 lead call, go
-#: 2026-08-21; py concurs]`.
+#: The codes that **short-circuit even in a contained position** — the one
+#: thing a CONTAINED position does not contain `[C-8; RULED 2026-08-21, arch
+#: PROPOSAL-COMPUTE-CLOSURE-RESULT-POSITIONS §8 / ROUTING-2026-08-21-h §2]`.
 #:
-#: A limit code is not a value the closure produced — it is the evaluator
-#: refusing to run the closure at all — so placing it into the output would
-#: assert an element the program never computed. Concretely: `Evaluate`
-#: decrements once per call, so containing `budget_exhausted` and continuing
-#: turns one stop-point into `[be, be, …]` at a **shifted** budget, and two
-#: conformant peers fork on the array's bytes.
+#: **The discriminator is not "limit-ness" and it is not the cohort vote — it is
+#: one sentence of §5.1:** *"Every call to `evaluate()` decrements `operations`
+#: by 1. Recursive calls decrement `depth` by 1 **(restored on return)**."* A
+#: counter that is **not restored on unwind** makes element *i*'s outcome a
+#: function of elements 1…*i*−1, and *that* is what a contained result forks
+#: across peers:
 #:
-#: **We apply it to the code, never to the provenance.** go's implementation
-#: checks `isEvalLimitCode` only on its *minted* arm, so a value-form
-#: `compute/error{code: "budget_exhausted"}` is contained there and propagated
-#: here — the §2.4 provenance asymmetry the same ruling closed, re-opened three
-#: codes wide. py has one representation and cannot express that split even by
-#: accident; the check is :func:`is_eval_limit`, and it is kind-and-code based
-#: exactly as :func:`is_error` is kind based. Routed to go and arch.
-_EVAL_LIMIT_CODES: frozenset[str] = frozenset({
+#: - `budget_exhausted` (§8.1) — `operations` is decremented once per
+#:   `evaluate()` and restored nowhere, and §10.4 makes memoization
+#:   implementation-defined, so two conformant peers on identical IR/inputs/
+#:   budget can exhaust at a **different element**. Contained, that is
+#:   `[v₁…v_{k−1}, E, E, …]` with a different *k* per peer — different boundary
+#:   bytes for one program. Independently: a well-formed array with a readable
+#:   boundary hash, reported for an evaluation the peer **aborted**.
+#: - `cascade_limit` (§8.2) — §7.3's counter is shared across the entire causal
+#:   chain (cross-peer, by `chain_id`) and reaching it **freezes the subgraph**.
+#:
+#: **`depth_exceeded` is deliberately NOT here (§8.3).** `depth` is *restored on
+#: unwind*, so it is **element-local by the spec's own parenthetical**: element
+#: *i* begins at the same depth every time, so whether it exceeds is a property
+#: of that element's own sub-expression. `map(f, xs)` where `f` recurses too
+#: deeply on element 2 is `[a, E, c]` — the element-wise §1.5 NaN model, and
+#: every peer evaluates it identically. **It contains like any other error and
+#: needs no carve-out at all.**
+#:
+#: **We apply it to the code, never to the provenance** (§8.4, `SA-PY-25`, and
+#: rust's wording adopted verbatim by the ruling: *keyed on the CODE, never the
+#: variant*). The value form is not hypothetical — §7.3 **mandates** writing a
+#: `compute/error` to the `result_path` on reactive budget exhaustion, so a
+#: downstream `compute/lookup/tree` reads a value-form `budget_exhausted`
+#: produced by a conformant peer. go's pre-`0e1f604` carve-out fired on the
+#: minted arm alone and so contained the value form while short-circuiting the
+#: minted one; py has one representation and cannot express that split even by
+#: accident. The check is :func:`is_short_circuit_limit`, kind-and-code based
+#: exactly as :func:`is_error` is kind based.
+_SHORT_CIRCUIT_LIMIT_CODES: frozenset[str] = frozenset({
     ERR_BUDGET_EXHAUSTED,
-    ERR_DEPTH_EXCEEDED,
     ERR_CASCADE_LIMIT,
 })
 
@@ -476,25 +497,30 @@ def is_error(v: Any) -> bool:
     return _entity_type(v) == "compute/error"
 
 
-def is_eval_limit(v: Any) -> bool:
-    """Is ``v`` an **evaluation-limit** error — the one thing a CONTAINED
-    position does not contain? `[C-8, 2026-08-21]`
+def is_short_circuit_limit(v: Any) -> bool:
+    """Is ``v`` an error that short-circuits **even in a contained position**?
+    `[C-8; RULED 2026-08-21, §8]`
 
-    See :data:`_EVAL_LIMIT_CODES` for why. The discriminator is the **code**,
+    See :data:`_SHORT_CIRCUIT_LIMIT_CODES` for the derivation — it is §5.1's
+    *restored on return* parenthetical, not "limit-ness", which is why
+    `depth_exceeded` is **not** in the set. The discriminator is the **code**,
     read through :func:`error_data` so it answers identically for a minted dict
-    and a stored-literal `Entity` — deliberately, because a discriminator that
-    reads the *representation* is the §2.4 asymmetry the C-8 ruling exists to
-    close, and re-introducing it three codes wide is still re-introducing it.
+    and a stored-literal `Entity`: a discriminator that reads the
+    *representation* is the §2.4 asymmetry the C-8 ruling exists to close, and
+    re-introducing it inside the carve-out C-8 created is still re-introducing
+    it (§8.4).
 
-    **The residual, stated rather than hidden:** a caller can store a
-    `compute/error{code: "budget_exhausted"}` literal and have a closure return
-    it, and this predicate will propagate it out of a `map` that would
-    otherwise contain it. That costs the caller their own `map` and escalates
-    nothing, but it does mean "the evaluator gave up" is spellable as a value.
-    The durable fix is a limit signal that is not a `compute/error` at all —
-    arch's to decide, filed as SA-PY-25.
+    **The residual, ruled explicitly rather than left to be discovered:** a
+    caller can store a `compute/error{code: "budget_exhausted"}` literal and
+    have a closure return it, and this predicate short-circuits a `map` that
+    would otherwise contain it. `SA-PY-25` asked whether that was a hole; §8.4
+    answers that it is not — §2.4 makes the stored and minted errors *the same
+    materialized entity* (content-addressed over `code` alone), so treating them
+    differently would require the evaluator to know something the boundary
+    cannot express, and an author could already halt an expression by placing an
+    error in a consumed position.
     """
-    return is_error(v) and error_data(v).get("code") in _EVAL_LIMIT_CODES
+    return is_error(v) and error_data(v).get("code") in _SHORT_CIRCUIT_LIMIT_CODES
 
 
 def error_data(v: Any) -> dict[str, Any]:
@@ -1520,7 +1546,12 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
             # therefore already covered this position before the position
             # existed. That is what "the fourth container is silently
             # uncovered" was written to avoid, and it held.
-            if is_eval_limit(r):
+            #
+            # The carve-out is `budget_exhausted` / `cascade_limit` ONLY
+            # `[RULED §8.3]` — `depth_exceeded` is element-local (`depth` is
+            # restored on unwind) and contains here like any other error, which
+            # is the `[a, E, c]` row CV-9a measures.
+            if is_short_circuit_limit(r):
                 return r
             out.append(r)
         return out
@@ -1560,8 +1591,9 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
             return make_error(ERR_TYPE_MISMATCH, "fold collection must be an array")
         # `initial` is a CONTAINED arg (`_CONTAINED_ARGS`), so an error arrives
         # here as a value rather than short-circuiting at the arg loop — except
-        # a limit code, which is not a value at all.
-        if is_eval_limit(acc):
+        # a short-circuit limit code, which reports an evaluation the peer
+        # aborted rather than a value it produced.
+        if is_short_circuit_limit(acc):
             return acc
         for el in collection:
             acc = _invoke_closure(fn, [acc, el], budget, ctx)
@@ -1577,7 +1609,7 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
             # precisely so a fold can branch on one). Short-circuiting here
             # would make recovery unexpressible and would be exception
             # semantics wearing a value model's clothes.
-            if is_eval_limit(acc):
+            if is_short_circuit_limit(acc):
                 return acc
         return acc
 
@@ -1622,8 +1654,9 @@ def _eval_builtin(path: str, args: dict[str, Any], budget: Budget, ctx: EvalCont
 #   filter    predicate result read for truthiness (§4.5)    short-circuit
 #   fold      accumulator    bound into the next invocation  CONTAIN
 #
-# with the evaluation-LIMIT codes carved out of both CONTAIN rows — see
-# `_EVAL_LIMIT_CODES`.
+# with `budget_exhausted` / `cascade_limit` — and NOT `depth_exceeded` —
+# carved out of the two closure-primitive CONTAIN rows `[RULED §8]`; see
+# `_SHORT_CIRCUIT_LIMIT_CODES`.
 #
 # The *arg-level* half of that table lives in `_CONTAINED_ARGS` and is applied
 # by `_eval_apply_handler`'s canonical-order arg loop, which is why these
@@ -2983,30 +3016,12 @@ def _audit_walk(
                 "resource": static_resource,
             })
 
-    # Recursively walk hash references in entity data
-    for val in entity.data.values():
-        if is_hash_ref(val):
-            referenced = ctx.resolve(val)
-            if referenced is not None:
-                _audit_walk(referenced, result, visited, ctx, root_path)
-        elif isinstance(val, list):
-            for item in val:
-                if is_hash_ref(item):
-                    referenced = ctx.resolve(item)
-                    if referenced is not None:
-                        _audit_walk(referenced, result, visited, ctx, root_path)
-                elif isinstance(item, dict) and "value" in item:
-                    val_ref = item["value"]
-                    if is_hash_ref(val_ref):
-                        referenced = ctx.resolve(val_ref)
-                        if referenced is not None:
-                            _audit_walk(referenced, result, visited, ctx, root_path)
-        elif isinstance(val, dict) and not isinstance(val, bytes):
-            for sub_val in val.values():
-                if is_hash_ref(sub_val):
-                    referenced = ctx.resolve(sub_val)
-                    if referenced is not None:
-                        _audit_walk(referenced, result, visited, ctx, root_path)
+    # Recursively walk hash references in entity data — the SAME traversal
+    # `_walk_deps` uses (`_referenced_entities`), because this walker decides
+    # which `compute/apply` gets its install-time capability/resource check and
+    # a reference it fails to enter is a check that never runs.
+    for referenced in _referenced_entities(entity, ctx):
+        _audit_walk(referenced, result, visited, ctx, root_path)
 
     # Walk closure body and captured environment
     if t == "compute/closure":
@@ -3051,30 +3066,73 @@ def _walk_deps(
         deps.append(path)
         return
 
-    # Walk hash references
-    for val in entity.data.values():
-        if is_hash_ref(val):
-            referenced = ctx.resolve(val)
+    for referenced in _referenced_entities(entity, ctx):
+        _walk_deps(referenced, deps, visited, ctx, root_path)
+
+
+def _hash_refs_in(value: Any) -> Iterator[bytes]:
+    """Every `system/hash` reference inside ``value``, **at any depth**.
+
+    §7.1's `walk` `[MUST, D8 / RULED 2026-08-21 §10.3]`. The normative property
+    is the prose one — *"all `compute/lookup/tree` paths reachable in the
+    expression graph are registered"* — and it is measured against **that
+    sentence, never against §7.1's pseudocode**, which recurses on scalar
+    `system/hash` field values alone and therefore enters no container. On the
+    grammar that exists, entering no container means registering no dependency
+    inside any function argument (`compute/apply.args` is `{map_of:
+    system/hash}`) or any `let` binding (`compute/let.bindings` is an array of
+    `{name, value: system/hash}`) — most of every non-trivial expression,
+    including §3.5's own *"Sequencing side effects"* worked example.
+
+    **This function is recursive by rule, and the previous one was correct by
+    enumeration** — a scalar; a list of hashes; a list of dicts keyed on the
+    literal field name ``"value"``; a dict, one level. Those cases happen to
+    cover today's grammar exactly. One args type nesting a reference a level
+    deeper, or a binding field not called ``value``, and it silently registered
+    **nothing** — and the failure is a reactive expression that evaluates
+    correctly once and is never woken again, which **no boundary-hash vector
+    can see** (§6.2: dependency registration produces no boundary, which is how
+    three walkers of three different strengths passed everything).
+
+    Over-registration is permitted and under-registration is not: §7.1 calls the
+    walk *conservative* and lists paths behind untaken `compute/if` branches as
+    registered on purpose. So this descends into a container without asking what
+    the container means.
+    """
+    if is_hash_ref(value):
+        yield value
+        return
+    if isinstance(value, (bytes, bytearray, str)):
+        # A byte string that is not a reference is a leaf, not a container of
+        # its own bytes — and `str` is iterable, which is the trap.
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _hash_refs_in(item)
+        return
+    if isinstance(value, dict):
+        for sub_value in value.values():
+            yield from _hash_refs_in(sub_value)
+
+
+def _referenced_entities(entity: Entity, ctx: EvalContext) -> Iterator[Entity]:
+    """Every resolvable entity referenced from ``entity.data``, at any depth.
+
+    The **one** traversal shared by both §7.1 walkers — `_walk_deps` (reactive
+    dependency registration) and `_audit_walk` (install-time static audit).
+    They were two hand-rolled copies of the same enumeration, so the D8 defect
+    had two sites and only one of them was measured: at `_audit_walk` a
+    reference nested past the enumerated shapes silently skips a
+    `compute/apply`, i.e. an install-time capability/resource check that never
+    runs. Keep it one function — a traversal that decides what gets registered
+    and what gets authorized is not a place for two implementations of one
+    concept.
+    """
+    for value in entity.data.values():
+        for ref in _hash_refs_in(value):
+            referenced = ctx.resolve(ref)
             if referenced is not None:
-                _walk_deps(referenced, deps, visited, ctx, root_path)
-        elif isinstance(val, list):
-            for item in val:
-                if is_hash_ref(item):
-                    referenced = ctx.resolve(item)
-                    if referenced is not None:
-                        _walk_deps(referenced, deps, visited, ctx, root_path)
-                elif isinstance(item, dict) and "value" in item:
-                    val_ref = item["value"]
-                    if is_hash_ref(val_ref):
-                        referenced = ctx.resolve(val_ref)
-                        if referenced is not None:
-                            _walk_deps(referenced, deps, visited, ctx, root_path)
-        elif isinstance(val, dict) and not isinstance(val, bytes):
-            for sub_val in val.values():
-                if is_hash_ref(sub_val):
-                    referenced = ctx.resolve(sub_val)
-                    if referenced is not None:
-                        _walk_deps(referenced, deps, visited, ctx, root_path)
+                yield referenced
 
 
 # ---------------------------------------------------------------------------
