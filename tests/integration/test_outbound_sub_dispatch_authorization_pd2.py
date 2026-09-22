@@ -10,17 +10,30 @@ written to **fail when one landed**, with the retirement condition in each
 assertion message. 0.8.2.17 landed it; the condition fired as written; the
 rows are inverted here rather than deleted, so the history stays legible.
 
-.. rubric:: The rule
+.. rubric:: The rule, as corrected at 0.8.2.19
 
 `check_permission` MUST run **before a locally-originated sub-dispatch leaves
 the peer**, four dimensions, `target_peer = extract_peer(uri, local_peer_id)`.
-*Which* authority it runs against depends on what the sub-dispatch spends:
+**There is ONE gate and ONE exemption:**
 
-- **Ambient** — nothing presented, riding the executing handler's grant.
-  Dimension 4 binds that grant.
-- **Presented** — a capability minted **by the target** naming **this peer**
-  as grantee. Its own four dimensions authorize; the handler's `peers` scope
-  is not consulted.
+> The executing handler's grant is the gate on all four dimensions (§6.8). A
+> valid credential minted by the **target** peer relaxes **Dimension 4 — and
+> only Dimension 4** — to the peers that credential covers, and must
+> additionally authorize the request on its own four dimensions.
+> **The target answers *where*; the handler's grant answers *what*.**
+
+.. rubric:: This file described a two-arm model until 0.8.2.19, and that
+   reading was F67
+
+The 0.8.2.17 wording said the presented capability's *"own four dimensions
+authorize the sub-dispatch"* while exempting only the handler's `peers` scope
+by name. **All three ground-up peers resolved that as a bypass of the whole
+grant** — and the credential arrives as a caller-supplied parameter, so a
+caller holding a copy of any `target -> us` capability could steer any handler
+here past its own grant. `entity-core-keystone` found it auditing the ruling it
+had itself authored; `entity-core-go` routed it. See `TestTheConfusedDeputy`
+below, which is the class that can see it — **nothing above that class can**,
+and every row above it passed on both sides of the fix.
 
 .. rubric:: One arm is not a check
 
@@ -513,6 +526,410 @@ class TestThePresentedArm:
             "a capability that is not presented authority turned into a "
             "refusal instead of falling back to the ambient arm "
             f"(status={result.status}, error={result.error!r})"
+        )
+
+
+def _grant_scoped(*, handlers=None, operations=None, resources=None) -> dict:
+    """A handler grant with `peers` OMITTED — so Dimension 4 refuses a foreign
+    target on its own, and the credential is the only thing that can relax it.
+
+    Every row in `TestTheConfusedDeputy` uses this shape deliberately: with
+    `peers` omitted, a 502 is positive evidence that the relaxation ran, and a
+    403 is attributable to whichever of Dimensions 1-3 the row narrowed.
+    """
+    return {
+        "grants": [
+            Grant.create(
+                handlers=handlers if handlers is not None else ["*"],
+                operations=operations if operations is not None else ["*"],
+                resources=resources if resources is not None else ["/*/*"],
+            ).to_dict(),
+        ],
+    }
+
+
+class TestTheConfusedDeputy:
+    """F67 / 0.8.2.19 — the discriminator whose absence shipped the bypass in
+    all three ground-up implementations.
+
+    .. rubric:: Why every other class in this file is blind to it
+
+    The two obvious vectors are *credential + covering grant -> allow* and
+    *no credential -> refuse*. **Both pass a peer whose credential path
+    bypasses the grant entirely**, which is exactly how this survived a cohort
+    conformance run, a 358-vector cross-bless and three green suites. The
+    discriminating input is the one no arm-scoped author writes: a **valid**
+    credential presented to a handler whose **own grant does not cover the
+    request**. It belongs to both arms at once, so neither arm's author owns
+    it — the same shape as the `EXTENSION-TREE` Appendix A row-ordering law.
+
+    .. rubric:: The warning `entity-core-go` sent with the fix, taken
+
+    *"A negative security test can PASS for the wrong reason — refused
+    upstream of the gate."* `403` is the expected outcome here, so a row that
+    refuses for an unrelated reason is indistinguishable from a row with
+    teeth. Every refusal row below is paired with a **502 control differing in
+    exactly one dimension**, so the pair localizes the refusal to that
+    dimension; and each was mutation-verified by restoring the bypass form
+    (`if relaxes: return None` ahead of the gate), which turns the refusal rows
+    RED and leaves every control green. Measured, not predicted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_valid_credential_does_not_carry_a_handler_past_its_own_grant(
+        self, peer, target_peer_id,
+    ):
+        """**The row F67 was.** A broad, valid, target-minted credential —
+        all handlers, all operations, all resources — presented to a handler
+        whose grant authorizes `put` and not `get`.
+
+        Under the bypass this is authorized on the credential's dimensions and
+        the handler's grant is never read: measured `502` before the fix. The
+        caller cannot use the credential itself (its leaf `grantee` is us),
+        which is precisely the confused deputy — and `operations` is the
+        dimension a caller most wants to widen.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        result = await _dispatch(
+            peer, target_peer_id,
+            _grant_scoped(operations=["put"]),
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 403, (
+            f"a target-minted credential carried a handler past its own "
+            f"`operations` scope (status={result.status}, "
+            f"error={result.error!r}) — F67 is live: the credential is "
+            "authorizing instead of relaxing Dimension 4 (§1.4, §6.8, "
+            "0.8.2.19)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_and_the_same_credential_relaxes_dimension_4_when_1_to_3_cover(
+        self, peer, target_peer_id,
+    ):
+        """The relaxation control, and the reason the row above is
+        attributable.
+
+        **Identical credential, identical peer, one dimension changed** — the
+        grant now covers `get`. `peers` is still omitted, so ambient alone
+        refuses (that is `TestTheAmbientArm`'s first row). The dispatch
+        therefore proceeds *only* if the credential relaxed Dimension 4 while
+        Dimensions 1-3 were read from the grant, which is the whole ruling in
+        one assertion.
+
+        Without this row the row above passes against a peer that refuses
+        every presented credential — the vacuous-green shape, and the reason
+        `dispatch_outbound_ambient_refused` was reported as non-discriminating.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        result = await _dispatch(
+            peer, target_peer_id,
+            _grant_scoped(operations=["get"]),
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 502, (
+            f"a valid target-minted credential did NOT relax Dimension 4 for "
+            f"a grant that covers the request on 1-3 (status={result.status}, "
+            f"error={result.error!r}) — the presented arm has become a "
+            "blanket refusal, which satisfies the negative row while "
+            "implementing nothing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dimension_1_stays_with_the_handler_too(
+        self, peer, target_peer_id,
+    ):
+        """Not just `operations`: §1.4 says Dimensions **1-3**.
+
+        The grant names a different handler; the credential names all of them.
+        A fix that relaxed `peers` *and* `handlers` — the two path-scope
+        dimensions, which is an easy slip since both canonicalize — passes the
+        `operations` row above and fails here.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        result = await _dispatch(
+            peer, target_peer_id,
+            _grant_scoped(handlers=["system/handler/other"]),
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 403, (
+            "a target-minted credential carried a handler past its own "
+            f"`handlers` scope (status={result.status}) — Dimension 1 is "
+            "being relaxed along with Dimension 4"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dimension_3_stays_with_the_handler_too(
+        self, peer, target_peer_id,
+    ):
+        """The resource dimension, which runs in the *second* of the gate's
+        two calls — so a fix that threaded `relax_peers` into
+        `check_handler_scope` and forgot `check_resource_scope` passes both
+        rows above and fails here.
+
+        That omission is not hypothetical: the two checks each run their own
+        per-grant-entry peers test, and relaxing one and not the other leaves
+        the resource dimension silently carrying the network bound.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        refused = await peer._dispatch_local_execute(
+            f"entity://{target_peer_id}/system/tree", "get",
+            {"data": {"path": "app/x"}},
+            _grant_scoped(resources=[f"/{target_peer_id}/app/allowed/*"]),
+            None, None,
+            resource_targets=[f"/{target_peer_id}/app/denied/x"],
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert refused.status == 403, (
+            "a target-minted credential carried a handler past its own "
+            f"`resources` scope (status={refused.status}) — Dimension 3 is "
+            "being relaxed along with Dimension 4"
+        )
+
+        allowed = await peer._dispatch_local_execute(
+            f"entity://{target_peer_id}/system/tree", "get",
+            {"data": {"path": "app/x"}},
+            _grant_scoped(resources=[f"/{target_peer_id}/app/allowed/*"]),
+            None, None,
+            resource_targets=[f"/{target_peer_id}/app/allowed/x"],
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert allowed.status == 502, (
+            "the in-scope resource control was refused "
+            f"(status={allowed.status}, error={allowed.error!r}) — the "
+            "refusal above is not attributable to Dimension 3"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_credential_is_not_a_grant_so_no_grant_means_no_dispatch(
+        self, peer, target_peer_id,
+    ):
+        """§1.4: *"A credential is **not** a grant — with no handler grant
+        there is nothing to supply Dimensions 1-3 and the sub-dispatch is
+        refused."*
+
+        This is the row keystone's F63(b) is about from the other side: their
+        bootstrap grant carries **zero** grant entries, so §5.2's
+        all-four-from-a-single-entry rule matches nothing and an ambient arm
+        implemented literally denies everything. Here the credential is
+        perfect and the grant is empty; the answer is still refuse, and a peer
+        that authorizes this has a credential path that does not consult the
+        grant at all.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        result = await _dispatch(
+            peer, target_peer_id, {"grants": []},
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 403, (
+            f"a valid credential authorized a dispatch with NO handler grant "
+            f"to relax (status={result.status}) — the credential is being "
+            "treated as a grant"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_relaxation_is_scoped_to_the_entry_not_the_capability(
+        self, peer, target_peer_id,
+    ):
+        """§5.2 requires all four dimensions from a **single** grant entry,
+        and the relaxation must not become a way around that.
+
+        Two entries: one covers `get` on nothing useful, the other covers the
+        resources but only `put`. No single entry covers the request, so the
+        dispatch must be refused even with Dimension 4 relaxed. A fix that
+        applied `relax_peers` by widening the *search* — collecting matching
+        dimensions across entries — passes every other row in this class and
+        authorizes here.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+        split = {
+            "grants": [
+                Grant.create(
+                    handlers=["system/handler/other"], operations=["get"],
+                    resources=["/*/*"],
+                ).to_dict(),
+                Grant.create(
+                    handlers=["*"], operations=["put"], resources=["/*/*"],
+                ).to_dict(),
+            ],
+        }
+
+        result = await _dispatch(
+            peer, target_peer_id, split,
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 403, (
+            f"dimensions were satisfied across two grant entries "
+            f"(status={result.status}) — §5.2's single-entry rule did not "
+            "survive the Dimension 4 relaxation"
+        )
+
+
+class TestTheMultiGranterRootIsFailClosed:
+    """§1.4 *Root granter under multi-signature* `[MUST]` (0.8.2.19) — E3/F66's
+    sub-item, and a **live over-acceptance** here rather than a no-op absorb.
+
+    The ruling: a K-of-N root *"satisfies the root-granter check only when the
+    target peer's identity is the multi-granter itself; a root whose signer set
+    merely includes the target does not."*
+
+    **Measured before the fix: we accepted the signer-set form.** Not by
+    oversight — `verify_capability_chain`'s M6 rule is *"the local peer is
+    among the root's signers"*, which is correct for its own job, and this gate
+    calls it with the frame set to `target_peer`. So M6 answered *"the target
+    is among the signers"* and a group credential relaxed Dimension 4 on one
+    constituent's say-so, which is the escalation the ruling names: *treating a
+    constituent as the granter would let any one signer's target confer the
+    group's grant.*
+
+    That is why the rule is enforced at **this gate** and not by tightening M6
+    — tightening M6 would refuse every legitimate local multi-sig root. The
+    two rules disagree on purpose, and the frame is what makes them disagree.
+
+    .. rubric:: The first fixture here did not discriminate, and that is a
+       finding about the code
+
+    Disarming the rule reddened **nothing** — measured, 24/24 green with the
+    check `and False`-ed out. Traced (A1) rather than patched: this gate calls
+    `verify_capability_chain` **without** a `find_signature_by_signer`, so the
+    walk refuses *every* multi-signature root at depth 0 with *"Multi-sig
+    capability requires by-signer signature finder"* — including one where the
+    target genuinely IS the multi-granter. The rule is therefore **correct and
+    currently unreachable**, refused one layer earlier by a mechanical gap.
+
+    Per the standing law the two paths refuse for **different reasons**, and
+    the broader one is the accident: the fail-closed property rests on an
+    *absence* — a finder nobody passed — which reads as an oversight and is
+    exactly what a later seat wires up as an improvement. On that day the
+    over-acceptance returns with nothing watching it. So the rule stays, and
+    the row below is written at the configuration that isolates it: the chain
+    walk is made to succeed, leaving this rule as the only thing between a
+    K-of-N root and Dimension 4. `test_the_rule_is_unreachable_today_and_this_
+    is_why` pins the mechanism so the reachability change is visible when it
+    lands, rather than being discovered by its consequence.
+    """
+
+    def test_the_rule_is_unreachable_today_and_this_is_why(
+        self, peer, target_peer_id,
+    ):
+        """Not a coverage row — a **reachability** row, and it is the one that
+        will fail first when this stops being true.
+
+        It asserts the mechanism named above: the outbound gate passes no
+        by-signer finder, so multi-signature roots are refused by the chain
+        walk before the §1.4 rule is consulted. When a seat wires a by-signer
+        finder in, this row goes red and points at the row below, which is the
+        one that then starts doing the work.
+        """
+        src = inspect.getsource(
+            type(peer)._presented_credential_relaxes_peers,
+        )
+        assert "verify_capability_chain(" in src
+        assert "find_signature_by_signer" not in src, (
+            "the outbound gate now passes a by-signer signature finder, so "
+            "multi-signature roots reach the §1.4 root-granter rule for the "
+            "first time. That rule is live now: confirm "
+            "test_a_k_of_n_root_whose_signers_include_the_target_relaxes_"
+            "nothing still discriminates WITHOUT its monkeypatch, and delete "
+            "the patch if so"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_k_of_n_root_whose_signers_include_the_target_relaxes_nothing(
+        self, peer, target_peer_id, monkeypatch,
+    ):
+        """The rule, driven at the one configuration that isolates it.
+
+        `verify_capability_chain` is forced to succeed, so the chain walk's
+        blanket multi-sig refusal (see the class docstring) is out of the way
+        and **this rule is the only thing left**. Without the patch the row
+        passes with the rule deleted; with it, deleting the rule turns this
+        row RED and nothing else — measured both ways.
+        """
+        from entity_core.capability.delegation import DelegationResult
+        from entity_core.crypto.identity import peer_id_from_identity_entity
+        from entity_core.protocol.entity import Entity
+
+        monkeypatch.setattr(
+            "entity_core.capability.delegation.verify_capability_chain",
+            lambda *a, **kw: DelegationResult(valid=True),
+        )
+
+        other_signer = create_identity_entity(Keypair.generate())
+        target_identity = create_identity_entity(FOREIGN_KEYPAIR)
+        assert peer_id_from_identity_entity(
+            {"data": target_identity.data},
+        ) == target_peer_id
+
+        root = Entity(
+            type="system/capability/token",
+            data={
+                "grants": [Grant.create(
+                    handlers=["*"], operations=["*"], resources=["/*/*"],
+                ).to_dict()],
+                "granter": {
+                    "signers": [
+                        target_identity.compute_hash(),
+                        other_signer.compute_hash(),
+                    ],
+                    "threshold": 2,
+                    "n": 2,
+                },
+                "grantee": create_identity_entity(peer.keypair).compute_hash(),
+                "created_at": int(time.time() * 1000),
+                "parent": None,
+            },
+        )
+        signature = create_signature_entity(
+            FOREIGN_KEYPAIR, root.compute_hash(), target_identity.compute_hash(),
+        )
+
+        result = await _dispatch(
+            peer, target_peer_id, _grant_scoped(operations=["get"]),
+            dispatch_capability_entity=root.to_dict(),
+            dispatch_capability_chain=[
+                target_identity.to_dict(), other_signer.to_dict(),
+                signature.to_dict(),
+            ],
+        )
+        assert result.status == 403, (
+            "a K-of-N-rooted credential whose signer set merely INCLUDES the "
+            f"target relaxed Dimension 4 (status={result.status}, "
+            f"error={result.error!r}) — one constituent's target is "
+            "conferring the group's grant (§1.4, 0.8.2.19)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_and_a_single_sig_target_root_still_relaxes(
+        self, peer, target_peer_id,
+    ):
+        """The teeth control. Without it the row above is satisfied by a peer
+        that refuses every credential, and the whole multi-granter rule reads
+        as implemented while being a blanket refusal — the exact shape §1.4
+        calls *looks implemented and denies everything*.
+        """
+        cap, chain = _target_minted_capability(peer, target_peer_id)
+
+        result = await _dispatch(
+            peer, target_peer_id, _grant_scoped(operations=["get"]),
+            dispatch_capability_entity=cap,
+            dispatch_capability_chain=chain,
+        )
+        assert result.status == 502, (
+            f"the ordinary single-signature target-minted root stopped "
+            f"relaxing (status={result.status}, error={result.error!r})"
         )
 
 

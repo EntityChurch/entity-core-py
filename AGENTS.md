@@ -268,6 +268,100 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **Cohort AGREEMENT is evidence about the reading implementers reach, not about the text —
+  and it is the most convincing green there is.** ***RATIFIED 2026-09-10*** *— the CE-1 law
+  (*"unruled" is a claim about the corpus, and three peers disagreeing is evidence about three
+  peers*) in **mirror image**, which is what ratifies it: there, measured **divergence** falsely
+  said the corpus had a gap; here, measured **convergence** falsely said the code was right.
+  Cost: a confused-deputy bypass live in all three ground-up peers, and in ours for the life of
+  PD-2.*
+  §1.4's 0.8.2.17 wording said a target-minted credential's *"own four dimensions authorize the
+  sub-dispatch"* while exempting only the handler's `peers` scope **by name**. **All three
+  ground-up implementations resolved that ambiguity as a bypass of the whole grant**, two of them
+  with design prose defending it — ours is in this file's own history. Because the credential
+  arrives as a caller-supplied parameter and capabilities travel in `included` maps, a caller
+  holding a copy of any `target -> P` capability could steer **any** handler on P past its own
+  grant. The caller cannot wield it itself, the leaf `grantee` being P: the confused deputy, with
+  the ceiling §1.4 names removed by name.
+  **What could not see it, and this is the whole entry.** A 1616-check cohort validator, a
+  358-vector cross-bless, and three green suites — all agreeing, all agreeing *because* they
+  agreed. `dispatch_outbound_reentry` (credential + covering grant → allow) and
+  `dispatch_outbound_ambient_refused` (no credential → refuse) read as the two arms and **are the
+  two vectors a bypassing peer passes**. It was found by `entity-core-keystone` auditing **its
+  own ruling** — their standing rule being *the exculpation most likely to be wrong is the one we
+  wrote, because nothing routes it back for review.*
+  **The three checks, in the order they are cheap:**
+  1. **When a rule COMPOSES two authorities, the discriminating vector is the one where they
+     DISAGREE** — a valid credential presented to a handler whose grant does not cover the
+     request. Neither arm's author writes it, because it belongs to both at once: the
+     `EXTENSION-TREE` Appendix A row-ordering law with **authorities** as the subject rather than
+     error rows. *"Both agree → allow"* and *"neither → refuse"* are the two vectors that cannot
+     discriminate a compose from a bypass, and they are the two everyone writes.
+  2. **Structure the fix so the wrong shape needs a new statement, not a flipped operator.** The
+     credential path must produce a **bit**, never a verdict: `_presented_credential_relaxes_peers`
+     returns `bool` and the gate reads it as `relax_peers`. Reintroducing F67 now requires *adding
+     an early return*. A predicate named for what it authorizes is an invitation to return early
+     from it — the rename was load-bearing, not cosmetic.
+  3. **A negative security test can PASS for the wrong reason.** `403` is the expected outcome, so
+     a row refused upstream of the gate is indistinguishable from one with teeth. Pair every
+     refusal row with a **502 control differing in exactly one dimension**, and verify the row
+     REACHES the gate by running the restore-the-bypass mutation. Measured here: the mutation
+     reddens 5 rows and leaves **all 16 pre-existing rows green** — which is the entry restated as
+     a number.
+  **And the corollary that cost the second half of the session: removing a short-circuit
+  ACTIVATES every latent defect it was hiding downstream.** ***Second instance*** of *"adding a
+  check that should always have run is a behaviour change; budget for the second finding"*, with
+  the arrow reversed. The continuation advance passed the B-rooted credential as **both** the gate
+  and the presented credential — inert while the presented arm returned early, because the
+  credential was then only ever read in the target's frame. Composing the gate made it fatal:
+  §1.4 evaluates the handler's grant in the **local** frame, and a B-rooted credential's resource
+  patterns are authored in B's namespace, so as a local grant they can never match a target naming
+  B. `convergence.rexec_delivered` FAIL against a **4382-green** tree. **A duplicated argument that
+  is provably harmless is harmless *because of* something — find out what, before you remove it.**
+  **Two smaller things earned here, both about how the diagnosis was reached:**
+  - **Adjacency in a concurrent log is not causation.** The `relax_peers=True` line and the `403`
+    line sat 17 lines apart and named **different** dispatches — 16-way concurrent reentry. Pairing
+    them yields a confident wrong diagnosis. Bisect (restore the bypass → PASS → the regression is
+    yours and it is in this diff), then trace the value with an instrumented run; do not read a
+    concurrent log as a sequence.
+  - **A refusal that names the wrong dimension is the only artifact a cross-impl debugger has.**
+    Ours said *"Dimension 4"* unconditionally while `check_handler_scope` covers 1, 2 **and** 4 —
+    so it was wrong in exactly the case where a credential relaxed 4, i.e. the one case where 4
+    cannot be the reason.
+  Enforcement points: `tests/integration/test_outbound_sub_dispatch_authorization_pd2.py`
+  (`TestTheConfusedDeputy` — the discriminator, its one-dimension-apart control, Dimensions 1 and
+  3 separately, the no-grant row, and the cross-entry row that fails a fix which relaxes by
+  widening the *search* instead of skipping one dimension inside `§5.2`'s single-entry loop) and
+  `test_continuation_handler.py::TestTheCrossPeerAdvanceGatesOnTheHandlerGrant`, whose rows are
+  **source** rows and say so — every continuation cross-peer test here drives a stub dispatcher,
+  so no local run can see that seam. Four mutations on the gate, four correct predictions.
+
+- **A rule can be CORRECT and UNREACHABLE, fail-closed by an absence — and the absence is what a
+  later seat wires up as an improvement.** *Candidate, 2026-09-10, landing §1.4's multi-granter
+  root rule (E3/F66).* 0.8.2.19: a K-of-N root satisfies the root-granter check *"only when the
+  target peer's identity is the multi-granter itself; a root whose signer set merely includes the
+  target does not."* We accepted the signer-set form — not by oversight:
+  `verify_capability_chain`'s M6 asks *"is the local peer among the root's signers"*, correct for
+  its own job, and this gate calls it with the frame set to `target_peer`, so M6 answered *"is the
+  **target** among the signers"* and a group credential relaxed Dimension 4 on one constituent's
+  say-so. Fixed at the **gate**, not in M6 — tightening M6 refuses every legitimate *local*
+  multi-sig root. **Two rules disagreeing on purpose, and the frame is what makes them disagree.**
+  **Then the mutation reddened nothing.** Traced rather than patched (the standing law): the gate
+  passes no `find_signature_by_signer`, so the chain walk refuses **every** multi-sig root one
+  layer earlier — including one where the target genuinely IS the multi-granter. So the rule was
+  right and inert.
+  **What this adds to the mutation-reddens-nothing law, which had two remedies and now has a
+  third.** It is neither *redundancy* (delete the arm) nor *your fixture is not discriminating*
+  (both paths live) — the second path is **strictly broader** and refuses by **accident**, and the
+  accident is an absent argument that reads as an oversight. Deleting the rule leaves a
+  fail-closed property resting on nothing; keeping it silently is a rule nobody can test. **The
+  remedy is a third artifact: a REACHABILITY row** that asserts the mechanism keeping the rule
+  inert, so the day someone wires the finder in, the row goes red and points at the rule that has
+  just become live — instead of the over-acceptance returning with nothing watching it. Enforcement
+  point: `TestTheMultiGranterRootIsFailClosed::test_the_rule_is_unreachable_today_and_this_is_why`,
+  beside a row driven at the configuration that isolates the rule (chain verification forced to
+  succeed), which is the fixture the first draft got wrong.
+
 - **Strict entity fidelity (IMPLEMENTATION-SPEC §1.8) — the single biggest interop
   pitfall.** On receipt, validate the hash (compute from `{type, data}`, compare) and then
   **trust it: MUST NOT recompute**. **Store the original bytes** and **forward them as-is —

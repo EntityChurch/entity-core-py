@@ -745,6 +745,9 @@ class Peer:
         # the acceptor's grant. Wired as a hook so the pool keeps no
         # back-reference to the peer.
         peer._remote_pool.on_dialed = peer._attach_dialed_connection
+        # §6.5 (0.8.2.19) — see `Peer.ingest_received_envelope`. Same hook
+        # shape as `on_dialed` and for the same reason.
+        peer._remote_pool.envelope_ingest = peer.ingest_received_envelope
         # §6.5 (b) discriminator, acceptor side: peer-ids whose establishment
         # this peer classified as "met at a §3 rendezvous key". Local, never
         # wire-read — see `mark_rendezvous_establishment`.
@@ -2117,6 +2120,45 @@ class Peer:
         """Serve until cancelled."""
         if self._server:
             await self._server.serve_forever()
+
+    def ingest_received_envelope(self, envelope: Envelope) -> None:
+        """§6.5 envelope-`included` ingestion over **any** received envelope
+        (0.8.2.19, generalizing 0.8.2.18's D7 — keystone F64 / go E4).
+
+        *"Ingestion binds ANY received envelope carrying an `included` map —
+        it is a property of the envelope, not of a surface `[MUST]`."*
+
+        The two steps are the ones the inbound EXECUTE path has always run:
+        store the entities (§1.5 provenance), then bind signature entities at
+        the §3.5 invariant pointer paths. This method exists so the *response*
+        path runs the same algorithm with the same idempotency and the same
+        `signature_path_conflict` semantics, rather than a second copy.
+
+        .. rubric:: What was unbound here, and why it is invisible until it
+           is not
+
+        A signature that arrives unbound is unreachable to chain-bundle
+        collection, which resolves signatures solely through the §3.5
+        invariant pointer — so **every chain rooted at that grant is
+        unverifiable locally**, while remaining perfectly verifiable at the
+        issuer, where its own signature is bound. Nothing surfaces that until
+        a peer must verify a target-minted credential *locally* on an
+        **attenuated** chain — i.e. a presented-authority sub-dispatch (§1.4)
+        — where it presents as a missing root signature and reads as a
+        capability defect rather than an ingestion one.
+
+        Measured here before the fix: `Connection` lifted the connect
+        capability, its signature and the granter identity into **in-memory
+        fields** and stored none of them; the `EXECUTE_RESPONSE` path hoisted
+        `included` onto the response object for callers to read and likewise
+        stored nothing. §6.2 requires the `request`/`delegate` result envelope
+        to carry exactly those three entities, and that is *"the runtime entry
+        point for in-band capability management"* — so the carrier a
+        presented-authority sub-dispatch depends on most was the one still
+        unbound.
+        """
+        self._store_included_entities(envelope)
+        self._bind_envelope_signatures(envelope)
 
     def _store_included_entities(self, envelope: Envelope) -> None:
         """Store all included entities in the content store.
@@ -3571,39 +3613,80 @@ class Peer:
         dispatch_capability_chain: list[dict[str, Any]] | None,
         included: dict[bytes, dict[str, Any]] | None = None,
     ) -> "_DispatchDenied | None":
-        """§1.4 PD-2 (0.8.2.17) — authorize a locally-originated sub-dispatch
+        """§1.4 PD-2 (0.8.2.19) — authorize a locally-originated sub-dispatch
         **before it leaves the peer**. Returns a denial, or None to proceed.
 
-        Two arms, and *which authority the check runs against depends on what
-        the sub-dispatch spends*:
+        .. rubric:: One gate, one exemption
 
-        - **Ambient** — nothing presented; the sub-dispatch rides the executing
-          handler's grant, and **Dimension 4 binds that grant**. A handler
-          whose grant carries no `peers` scope defaults to
-          ``{include: [local_peer_id]}`` and therefore cannot reach a foreign
-          peer. This is the confused-deputy ceiling: the bootstrap grant is a
-          ceiling a *caller* must not be able to steer past.
-        - **Presented** — a capability minted **by the target peer** naming
-          **this peer** as grantee. Its own four dimensions authorize, and the
-          dispatching handler's `peers` scope is not consulted, because the
-          party that decides what may happen at a peer is that peer and it has
-          already decided.
+        §1.4, as corrected at 0.8.2.19: *"The executing handler's grant is the
+        gate, on all four dimensions (§6.8). A valid credential minted by the
+        TARGET peer relaxes Dimension 4 — and only Dimension 4 — to the peers
+        that credential covers, and must additionally authorize the request on
+        its own four dimensions."* **The target answers where; the handler's
+        grant still answers what.**
 
-        A presented capability failing **any** of the four verifications is
-        **not presented authority** and falls back to the ambient arm — it is
-        not an error in its own right, because a caller who supplies a bad
-        credential is in exactly the position of one who supplied none.
+        So there is exactly one authorizer below — ``check_handler_scope`` /
+        ``check_resource_scope`` against ``caller_capability``, the executing
+        handler's grant — and the presented credential contributes a **bit**,
+        not a verdict. A credential is **not** a grant: with no handler grant
+        there is nothing to supply Dimensions 1-3 and the dispatch is refused
+        however good the credential is.
 
-        .. rubric:: This is disjoint from §6.2's confused-deputy rule
+        .. rubric:: F67 — what this function did until 0.8.2.19, and why it
+           was a confused deputy
 
-        §6.2 forbids falling back to the *propagated caller capability* — the
-        inbound request's authority, re-spent by the deputy at a target the
-        caller chose. Presented authority is the opposite shape: minted for
-        this purpose, by the party being accessed. Note the argument this
-        function receives is ``caller_capability``, which on this path is the
-        **executing handler's grant** (``ctx.handler_grant``), not the
-        propagated caller's — the two are named confusingly and are opposite
-        sides of the authorization (see this function's caller).
+        The 0.8.2.17 wording said the presented capability's *"own four
+        dimensions authorize the sub-dispatch"* while exempting only the
+        handler's ``peers`` scope by name. **All three ground-up peers
+        resolved that ambiguity as a bypass of the whole grant** — here, an
+        early ``return None`` the moment ``_presented_authority`` answered.
+        Because the credential arrives as a **caller-supplied parameter**
+        (the §7a scaffold reads it out of ``params``, and capabilities travel
+        on the wire in ``included`` maps), a caller holding a copy of any
+        ``target -> this peer`` capability could steer **any** handler on this
+        peer past its own grant, bounded only by that credential's dimensions.
+        The caller cannot wield the credential itself — the leaf ``grantee``
+        is us — which is exactly the confused-deputy shape, with the ceiling
+        §1.4 names removed by name. Found by `entity-core-keystone` auditing
+        the ruling it had itself authored; routed by `entity-core-go`.
+
+        **The structure is the fix, not the condition.** The credential path
+        must have **no route to "authorized"** of its own: reintroducing the
+        bypass has to require *adding a new early return*, not flipping an
+        operator. That is why the predicate below returns ``bool`` and is
+        named for what it does to one dimension.
+
+        A presented credential failing **any** verification relaxes nothing
+        and the handler grant gates unrelaxed — it is not an error in its own
+        right, because a caller who supplies a bad credential is in exactly
+        the position of one who supplied none.
+
+        .. rubric:: This is disjoint from §6.2's confused-deputy rule — and
+           that is only half of §6.8
+
+        §6.2 forbids falling back to the *propagated caller capability*, and a
+        target-minted credential is a different object with a different
+        granter, so that specific prohibition does not reach it. **The half it
+        is not is the operative one:** §6.8 states positively and
+        unconditionally that the decision is made on the executing handler's
+        grant. Note the argument this function receives is
+        ``caller_capability``, which on this path is the **executing handler's
+        grant** (``ctx.handler_grant``), not the propagated caller's — the two
+        are named confusingly and are opposite sides of the authorization
+        (see this function's caller).
+
+        .. rubric:: Frames, per arm (§1.4 ``[MUST]``, 0.8.2.19)
+
+        **The handler's grant canonicalizes in the LOCAL frame** — the grant
+        being evaluated is local, and the target is carried by Dimension 4
+        alone. The presented credential canonicalizes in the **target's**
+        frame (see the predicate). Generalizing the credential's frame to the
+        grant would resolve Dimension 1 against the target while the grant's
+        own pattern resolves against us, so the gate would refuse even a
+        handler legitimately scoped ``peers: {include: [target]}`` — the
+        *looks-implemented-and-denies-everything* failure, reached from the
+        opposite direction. Hence ``self.peer_id`` below and ``target_peer``
+        there, and neither is a default.
 
         .. rubric:: Which handler pattern the check runs against — our call,
            filed as SA-PY-42
@@ -3632,8 +3715,14 @@ class Peer:
         target_peer = extract_peer(uri, self.peer_id)
         handler_path = extract_handler_path(uri)
 
+        # The ONE exemption, computed as a bit. This block cannot authorize:
+        # its only output is `relax_peers`, and every `return` below is a
+        # denial or the tail of the single gate. Reintroducing F67 requires
+        # adding an early return here, which is the property the structural
+        # row in the PD-2 test file asserts.
+        relax_peers = False
         if dispatch_capability_entity is not None:
-            presented = self._presented_authority(
+            relax_peers = self._presented_credential_relaxes_peers(
                 dispatch_capability_entity,
                 dispatch_capability_chain,
                 target_peer=target_peer,
@@ -3642,15 +3731,9 @@ class Peer:
                 resource_targets=resource_targets,
                 included=included,
             )
-            if presented is not None:
-                logger.debug(
-                    "[dispatch:outbound] presented authority accepted: "
-                    "granter=%s op=%s", target_peer[:16], operation,
-                )
-                return None
             logger.debug(
-                "[dispatch:outbound] presented capability is not presented "
-                "authority; falling back to the ambient arm",
+                "[dispatch:outbound] presented credential: relax_peers=%s "
+                "target=%s op=%s", relax_peers, target_peer[:16], operation,
             )
 
         # NOTE (SA-PY-45, withdrawn): a hold on Dimension 4 sat here for one
@@ -3663,21 +3746,38 @@ class Peer:
         # stops matching anything is cover for nothing while reading as a live
         # exception, so it is deleted rather than left in place.
 
-        # Ambient arm. Same two calls, in the same order, as the local arm
-        # below — handler/operation/peers, then the resource dimension when a
-        # resource is named. One predicate, and a sub-dispatch that names no
-        # resource has no resource (§5.2, 0.8.2), so the second check is gated
-        # on the field exactly as it is there.
+        # THE GATE — the executing handler's grant, all four dimensions, with
+        # Dimension 4 relaxed iff a target-minted credential verified above.
+        # Same two calls, in the same order, as the local arm below —
+        # handler/operation/peers, then the resource dimension when a resource
+        # is named. One predicate, and a sub-dispatch that names no resource
+        # has no resource (§5.2, 0.8.2), so the second check is gated on the
+        # field exactly as it is there.
         if not check_handler_scope(
             caller_capability, handler_path, operation, self.peer_id,
             target_peer=target_peer,
+            relax_peers=relax_peers,
         ):
+            # Which dimension to name. `check_handler_scope` covers 1
+            # (handlers), 2 (operations) and 4 (peers), so naming Dimension 4
+            # unconditionally is wrong exactly when a credential relaxed it —
+            # the one case where 4 CANNOT be the reason. A refusal that names
+            # the wrong dimension sends the next reader to the wrong grant
+            # field, and this message is the only artifact a cross-impl
+            # debugger has.
+            dimension = (
+                "§5.2 Dimensions 1-2 (handlers/operations) — a target-minted "
+                "credential relaxed Dimension 4, and the handler's grant "
+                "still refuses: the target answers WHERE, the handler's "
+                "grant answers WHAT (§6.8)"
+                if relax_peers
+                else "§5.2 Dimension 4 (peers), or 1-2"
+            )
             return _DispatchDenied(
                 403,
                 f"Outbound sub-dispatch refused: the executing handler's "
                 f"grant does not authorize {operation} on {handler_path} in "
-                f"peer {target_peer}'s namespace (§1.4 PD-2, §5.2 "
-                f"Dimension 4)",
+                f"peer {target_peer}'s namespace (§1.4 PD-2, {dimension})",
             )
         if resource_targets and not check_resource_scope(
             caller_capability, handler_path, operation, resource_targets,
@@ -3686,6 +3786,7 @@ class Peer:
                 caller_capability, self.peer_id, self._resolve_identity_entity,
             ),
             target_peer=target_peer,
+            relax_peers=relax_peers,
         ):
             return _DispatchDenied(
                 403,
@@ -3695,7 +3796,7 @@ class Peer:
             )
         return None
 
-    def _presented_authority(
+    def _presented_credential_relaxes_peers(
         self,
         capability: dict[str, Any],
         chain: list[dict[str, Any]] | None,
@@ -3705,41 +3806,60 @@ class Peer:
         handler_path: str,
         resource_targets: list[str] | None,
         included: dict[bytes, dict[str, Any]] | None = None,
-    ) -> dict[str, Any] | None:
-        """The presented-authority arm of §1.4 PD-2. Returns the capability's
-        `data` when it IS presented authority, else None (→ ambient arm).
+    ) -> bool:
+        """§1.4 PD-2 (0.8.2.19) — does this presented credential relax the
+        executing handler's grant on **Dimension 4, and only Dimension 4**?
 
-        §1.4: *"The presented-authority arm MUST verify all of the following,
-        or it is forgeable."* Every check already existed; this composes them.
+        **This is a predicate, not an authorizer, and the name says so.** It
+        returns a bit that feeds ``relax_peers`` at the single gate in
+        :meth:`_authorize_outbound_sub_dispatch`; it has no route to
+        "authorized". It was ``_presented_authority`` and returned the
+        credential's ``data`` for the caller to accept — that shape is F67,
+        the cohort-wide confused deputy, and the rename is load-bearing: the
+        old name invited exactly the early return that was the defect.
 
-        1. ``granter`` resolves to the **target peer's** identity.
-        2. ``grantee`` resolves to the **local peer's** identity.
+        §1.4: *"The presented credential MUST be verified as follows, or it is
+        forgeable."* Every check already existed; this composes them.
+
+        1. The chain's **ROOT** ``granter`` resolves to the **target peer's**
+           identity.
+        2. The **leaf's** ``grantee`` resolves to the **local peer's**
+           identity.
         3. It is **valid** — chain-verified, unexpired, unrevoked.
         4. Its own four dimensions authorize the request.
 
-        .. rubric:: Rooted at the target, not merely granted by it
+        A credential failing any of these relaxes nothing, and the handler's
+        grant gates unrelaxed.
 
-        Check 1 is read here as *the leaf's own `granter`*, which is what §1.4
-        says, and the chain is then verified **in the target's frame** —
-        ``verify_capability_chain`` enforces *root granter == the frame peer*,
-        and for a credential the target minted the target IS the root
-        authority. A consequence worth stating because it is a narrowing: a
-        capability the target *delegated* from some third party's root does
-        not qualify as presented authority here and falls to the ambient arm.
-        That is fail-closed, and it is the only reading under which check 1 and
-        §5.5's root rule are simultaneously satisfiable. Filed as SA-PY-42.
+        .. rubric:: Root, not leaf — and the asymmetry with `grantee` is
+           deliberate (0.8.2.18)
+
+        Check 1 is read at the chain's **root**. *"Minted by the target"* is a
+        property of the chain's origin: a credential the target granted and
+        the holder then **re-attenuated** — the ordinary cross-peer
+        continuation shape, ``EXTENSION-CONTINUATION`` §4.2 case 3 — has a
+        leaf whose ``granter`` is the holder and is still a credential the
+        target minted. Reading it at the leaf accepts only the unattenuated
+        grant and refuses every narrowing of it. We shipped the leaf reading
+        for one commit (SA-PY-45); the ruling took the root reading, which is
+        what the chain verification below already enforces in the target's
+        frame.
         """
         from entity_core.capability.checking import (
             check_handler_scope,
             check_resource_scope,
         )
-        from entity_core.capability.delegation import verify_capability_chain
+        from entity_core.capability.delegation import (
+            collect_authority_chain,
+            verify_capability_chain,
+        )
+        from entity_core.capability.token import is_multi_granter
         from entity_core.crypto.identity import peer_id_from_identity_entity
         from entity_core.utils.ecf import hash_equals, normalize_hash
 
         cap_data = capability.get("data")
         if not isinstance(cap_data, dict):
-            return None
+            return False
 
         # The granter/grantee identities and the chain's parents ride with the
         # dispatch rather than the store — this credential may never have been
@@ -3799,9 +3919,9 @@ class Peer:
         # granter check adds nothing to that and subtracts a shipped,
         # conformant flow.
 
-        # (2) grantee is this peer.
+        # (2) grantee is this peer — read at the LEAF, per the asymmetry above.
         if peer_of(cap_data.get("grantee")) != self.peer_id:
-            return None
+            return False
 
         # (3) valid: chain-verified in the TARGET's frame (the target is the
         # root authority for a credential it minted), unexpired — which
@@ -3825,7 +3945,46 @@ class Peer:
                 "[dispatch:outbound] presented capability chain invalid: %s",
                 chain_result.error,
             )
-            return None
+            return False
+
+        # (3a) **Root granter under multi-signature `[MUST]` (0.8.2.19).** The
+        # root-granter rule is undefined when the root `granter` is a §3.6
+        # `system/capability/multi-granter`, and M3 makes multi-signature
+        # root-only — so a K-of-N-rooted credential is exactly where it lands.
+        # Such a credential satisfies the root check **only when the target
+        # peer's identity IS the multi-granter itself; a root whose signer set
+        # merely includes the target does not.**
+        #
+        # This has to be checked HERE and not inside `verify_capability_chain`,
+        # and the distinction is the finding. That walker's M6 rule is *"the
+        # local peer is among the root's signers"*, which is correct for its
+        # own job — verifying a chain in a frame. We call it with the frame set
+        # to `target_peer`, so on this path M6 answers *"the target is among
+        # the signers"* and a K-of-N root whose signer set merely contains the
+        # target passed as presented authority. That is the over-acceptance
+        # 0.8.2.19 names: a K-of-N root is a **group's** authority, and
+        # treating a constituent as the granter lets any one signer's target
+        # confer the group's grant. Tightening M6 instead would break every
+        # legitimate local multi-sig root, which is why the rule is scoped to
+        # this gate.
+        #
+        # A `multi-granter` is a struct (`signers`, `threshold`, `n`), not an
+        # identity entity, so `peer_of` cannot resolve it to a peer id and the
+        # acceptance arm is unreachable in practice. It is written as a
+        # comparison rather than a bare refusal so the rule in the code is the
+        # rule in the spec — a bare `return False` would read as "multi-sig
+        # roots are never presented authority", which is a different sentence
+        # and would silently outlive a future identity shape that can be one.
+        collected = collect_authority_chain(capability, lookup)
+        root = collected.chain[-1] if collected.chain else capability
+        root_granter = root.get("data", {}).get("granter")
+        if is_multi_granter(root_granter) and peer_of(root_granter) != target_peer:
+            logger.debug(
+                "[dispatch:outbound] presented credential has a multi-granter "
+                "root that is not the target itself; it relaxes nothing "
+                "(§1.4, 0.8.2.19)",
+            )
+            return False
 
         # Revocation, on the same terms the wire path uses (F2: a peer that
         # writes the marker on `revoke` and does not read it here fails open).
@@ -3844,7 +4003,7 @@ class Peer:
             ),
         ):
             logger.debug("[dispatch:outbound] presented capability is revoked")
-            return None
+            return False
 
         # (4) its own four dimensions authorize the request — evaluated in the
         # **target's** frame, i.e. `local_peer_id = target_peer`.
@@ -3869,15 +4028,19 @@ class Peer:
             cap_data, handler_path, operation, target_peer,
             target_peer=target_peer,
         ):
-            return None
+            return False
         if resource_targets and not check_resource_scope(
             cap_data, handler_path, operation, resource_targets,
             None, target_peer,
             granter_peer_id=target_peer,
             target_peer=target_peer,
         ):
-            return None
-        return cap_data
+            return False
+
+        # Verified. The ONLY thing this buys is Dimension 4 at the gate — the
+        # credential's `data` is deliberately NOT returned, because a caller
+        # holding it is one line from authorizing on it, which is F67.
+        return True
 
     def _resolve_identity_entity(self, h: bytes) -> dict[str, Any] | None:
         """Resolve an identity (system/peer) entity by hash for §PR-8 granter

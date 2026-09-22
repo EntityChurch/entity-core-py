@@ -44,10 +44,30 @@ operation                               requirement stated in        covered
 `system/quorum:create/update/publish`   QUORUM §6 path-as-resource   here
 `system/attestation:create`             ATTESTATION §6               here
 `system/attestation:supersede/revoke`   ATTESTATION §6               here (*)
+`system/continuation:install`           CONTINUATION P-CONTINUATION-1 here (+)
+`system/compute:eval`                   COMPUTE §3.2                 here (+)
+`system/compute:install`                COMPUTE §3.3                 here (+)
+`system/compute:uninstall`              COMPUTE §3.4                 here (+)
 ======================================  ===========================  =========
 
 (*) reached by delegation to `create`, which is where the check lives — see
 `TestTheOrderIsNotStated` below, which is a finding rather than a pass.
+
+(+) **added at 0.8.2.18, and the gap in the first census is the finding.**
+This file was written to say *"the census is by the row's INPUT, not by the
+token"* — and its own set stopped at **core and the two extensions the author
+had open**. All four rows above derive their path from `resource.targets[0]`
+in exactly the way `system/handler:register` does, all four collapsed the two
+inputs into `len(targets) != 1 -> ambiguous_resource`, and all four were
+invisible to a census that enumerated the specs it happened to be reading.
+
+So the input-census beats a token grep and is still bounded by its **corpus
+sweep**. The unit was right; the *scope* was the reading list. The check the
+next census owes: enumerate from the handler registration list — the one
+inventory a defect cannot edit — and ask of every operation *does this derive
+a path from `resource.targets[0]`?*, rather than from the sections already
+open. That is the same remedy the §3.3 slot census reached from the other
+side, and it is the second time this repo has needed it.
 
 .. rubric:: What is deliberately NOT in the set
 
@@ -81,6 +101,11 @@ REQUIRES_RESOURCE = [
     ("system/handler", "unregister", {}, "core §6.2"),
     ("system/content", "get", {"hash": b"\x00" + b"\x11" * 32}, "CONTENT §6.2"),
     ("system/content", "ingest", {"entities": []}, "CONTENT §6.3"),
+    # --- added 0.8.2.18, and the four rows the first census could not see ---
+    ("system/continuation", "install", {}, "CONTINUATION P-CONTINUATION-1"),
+    ("system/compute", "eval", {}, "COMPUTE §3.2"),
+    ("system/compute", "install", {}, "COMPUTE §3.3"),
+    ("system/compute", "uninstall", {}, "COMPUTE §3.4"),
 ]
 
 

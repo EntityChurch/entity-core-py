@@ -439,6 +439,19 @@ async def _handle_install(
     """
     # Step 1: install path comes from resource (P-CONTINUATION-1).
     targets = ctx.resource_targets or []
+    # §3.3's 400 row (0.8.2.18): an operation that requires a resource answers
+    # ABSENT with `path_required` and MORE THAN ONE with `ambiguous_resource`.
+    # The two are different inputs with different remedies — *supply a
+    # resource* is a different instruction from *name only one* — and the row
+    # exists because the code selects the remedy. Collapsing them into
+    # `len(targets) != 1` is *"non-conformant on the absent case"*, which is
+    # what this site did.
+    if not targets:
+        return _error_response(
+            400,
+            "path_required",
+            "install requires a resource target (the suspended continuation path)",
+        )
     if len(targets) != 1:
         return _error_response(
             400,
@@ -1168,6 +1181,7 @@ async def _advance_forward(
     # unchanged (capability_data drives the local scope check; the chain
     # resolves from the install-persisted store).
     cross_peer_kwargs: dict[str, Any] = {}
+    gate_capability = dispatch_cap_entity.data
     if _remote_peer_of(ctx, eff_target) is not None:
         cross_peer_kwargs = {
             "dispatch_capability_entity": dispatch_cap_entity.to_dict(),
@@ -1175,6 +1189,34 @@ async def _advance_forward(
                 ctx, dispatch_cap_entity
             ),
         }
+        # §1.4 PD-2 (0.8.2.19): **a credential is not a grant.** On the
+        # cross-peer arm the `dispatch_capability` is the PRESENTED
+        # credential — it relaxes Dimension 4 and is verified on its own four
+        # dimensions in the TARGET's frame. The gate for Dimensions 1-3 is
+        # the executing handler's own grant, evaluated in the LOCAL frame.
+        #
+        # This site used to pass the credential as BOTH, and that is the
+        # confused-deputy conflation F67 is about, arriving from the other
+        # side: while the presented arm short-circuited, the duplicate was
+        # harmless because the credential was only ever read in the target's
+        # frame. Composing the gate made it fatal — measured, as
+        # `convergence.rexec_delivered` FAIL:
+        #
+        #     request target  system/validate/rexec-src-.../item
+        #                     -> canonicalizes in OUR frame  -> /{A}/...
+        #     grant pattern   /{B}/system/validate/rexec-src-.../item
+        #
+        # A B-rooted credential's resource patterns are authored in B's
+        # namespace, so evaluating it as a local grant can never match a
+        # target naming B — it is §1.4's *"looks implemented and denies
+        # everything"* reached through the resource dimension. Handing the
+        # handler's grant to the gate is what the ruling says and is also
+        # what makes the two frames consistent.
+        #
+        # Nothing is loosened: the credential's own narrow scope is still
+        # enforced, in the frame it was authored in, by the presented-arm
+        # verification.
+        gate_capability = ctx.handler_grant
 
     # Dispatch to target using stored capability. Transport-layer failures
     # discriminate per V7 §6.12 into recv_timeout / connection_broken /
@@ -1184,7 +1226,7 @@ async def _advance_forward(
     try:
         dispatch_result = await ctx.execute_with_capability(
             eff_target, eff_operation, params,
-            capability_data=dispatch_cap_entity.data,
+            capability_data=gate_capability,
             resource_targets=dispatch_resource_targets,
             **cross_peer_kwargs,
         )

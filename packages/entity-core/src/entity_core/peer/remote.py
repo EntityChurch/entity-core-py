@@ -175,6 +175,13 @@ class RemoteConnectionPool:
         self.on_dialed: (
             "Callable[[RemoteEndpoint], Awaitable[None]] | None"
         ) = None
+        # §6.5 envelope-`included` ingestion (0.8.2.19): the sink handed to
+        # every connection this pool dials, so the handshake's two responses
+        # and every EXECUTE_RESPONSE are bound into the owning peer's store.
+        # Wired as a hook for the same reason `on_dialed` is — the pool keeps
+        # no back-reference to the peer, and a pool built without one (the
+        # plain transport case) has nowhere to bind and leaves it unset.
+        self.envelope_ingest: "Callable[[Any], None] | None" = None
 
     async def get_connection(
         self,
@@ -231,10 +238,17 @@ class RemoteConnectionPool:
                             established_via_rendezvous_key=(
                                 established_via_rendezvous_key
                             ),
+                            # §6.5 (0.8.2.19): every envelope this connection
+                            # receives — the handshake's two responses and
+                            # every EXECUTE_RESPONSE after them — is ingested
+                            # into OUR store. The dialer is the side that has
+                            # one; a bare Connection has nowhere to bind.
+                            envelope_ingest=self.envelope_ingest,
                         )
                     elif transport_type == "http":
                         endpoint = await HttpConnection.connect(
-                            url, self._keypair, expected_peer_id=peer_id
+                            url, self._keypair, expected_peer_id=peer_id,
+                            envelope_ingest=self.envelope_ingest,
                         )
                     else:
                         failures.append(

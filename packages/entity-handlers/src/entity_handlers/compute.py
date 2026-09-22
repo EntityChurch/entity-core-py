@@ -178,6 +178,8 @@ ERR_CASCADE_LIMIT = "cascade_limit"
 ERR_PERMISSION_DENIED = "permission_denied"
 ERR_INSTALLATION_GRANT_INVALID = "installation_grant_invalid"
 ERR_AMBIGUOUS_RESOURCE = "ambiguous_resource"
+#: §3.3 400 row (0.8.2.18) — the ABSENT-resource half of the pair above.
+ERR_PATH_REQUIRED = "path_required"
 ERR_INDEX_OUT_OF_RANGE = "index_out_of_range"  # compute/index + assoc (§9.1, N.1; v3.25)
 ERR_CAST_OUT_OF_RANGE = "cast_out_of_range"    # compute/numeric-cast (§9.1, N.4)
 ERR_COUNT_OUT_OF_RANGE = "count_out_of_range"  # range's n (§9.1, v3.25)
@@ -3308,6 +3310,17 @@ async def _handle_eval(
     path is read from ctx.resource.targets[0] — single target, URI-only.
     """
     targets = handler_ctx.resource_targets or []
+    # §3.3's 400 row (0.8.2.18): ABSENT -> `path_required`, MORE THAN ONE ->
+    # `ambiguous_resource`. Different inputs, different remedies; collapsing
+    # them into `!= 1` is non-conformant on the absent case.
+    if not targets:
+        return {
+            "status": 400,
+            "result": {"type": "compute/error", "data": {
+                "code": ERR_PATH_REQUIRED,
+                "message": "eval requires a resource target (the expression path)",
+            }},
+        }
     if len(targets) != 1:
         return {
             "status": 400,
@@ -3424,6 +3437,17 @@ async def _handle_install(
     only handler-write/options fields (result_path, budget).
     """
     targets = handler_ctx.resource_targets or []
+    # §3.3's 400 row (0.8.2.18): ABSENT -> `path_required`, MORE THAN ONE ->
+    # `ambiguous_resource`. Different inputs, different remedies; collapsing
+    # them into `!= 1` is non-conformant on the absent case.
+    if not targets:
+        return {
+            "status": 400,
+            "result": {"type": "compute/error", "data": {
+                "code": ERR_PATH_REQUIRED,
+                "message": "install requires a resource target (the root expression path)",
+            }},
+        }
     if len(targets) != 1:
         return {
             "status": 400,
@@ -3756,6 +3780,17 @@ async def _handle_uninstall(
     wrapper is eliminated; params is empty primitive/any.
     """
     targets = handler_ctx.resource_targets or []
+    # §3.3's 400 row (0.8.2.18): ABSENT -> `path_required`, MORE THAN ONE ->
+    # `ambiguous_resource`. Different inputs, different remedies; collapsing
+    # them into `!= 1` is non-conformant on the absent case.
+    if not targets:
+        return {
+            "status": 400,
+            "result": {"type": "compute/error", "data": {
+                "code": ERR_PATH_REQUIRED,
+                "message": "uninstall requires a resource target (the subgraph path)",
+            }},
+        }
     if len(targets) != 1:
         return {
             "status": 400,

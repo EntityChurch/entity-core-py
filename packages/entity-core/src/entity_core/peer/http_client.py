@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import ssl
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -247,6 +248,7 @@ class HttpConnection:
         session_id: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         active_hash_format: int = ALG_ECFV1_SHA256,
+        envelope_ingest: "Callable[[Envelope], None] | None" = None,
     ) -> None:
         self.url = url
         self.keypair = keypair
@@ -255,6 +257,12 @@ class HttpConnection:
         self.capability_chain = capability_chain
         self._session_id = session_id
         self._ssl_context = ssl_context
+        # §6.5 (0.8.2.19) — see Connection.envelope_ingest. Set on the HTTP
+        # transport for the same reason and applied at the same place: the one
+        # point where a response envelope is decoded. This boundary is the one
+        # no cohort probe dials, which is precisely why it gets the shared
+        # rule rather than a second reading of it.
+        self._envelope_ingest = envelope_ingest
         # V7 v7.69 §4.5a — negotiated active content_hash_format for this
         # connection; every authenticated request authors under it.
         self.active_hash_format = active_hash_format
@@ -282,7 +290,21 @@ class HttpConnection:
                 f"HTTP {status} from {self.url}: "
                 f"{resp_body[:256].decode('utf-8', errors='replace')}"
             )
-        return _body_to_envelope(resp_body)
+        response_env = _body_to_envelope(resp_body)
+        # §6.5 (0.8.2.19): ingest EVERY received response envelope — the
+        # hello response, the connect/authenticate response, and every
+        # EXECUTE_RESPONSE — at the one point they are all decoded. Placing it
+        # here rather than at the three call sites is the point of the ruling:
+        # enumerating surfaces is what left `EXECUTE_RESPONSE` unbound after
+        # connect/authenticate had been enumerated.
+        if self._envelope_ingest is not None and response_env.included:
+            try:
+                self._envelope_ingest(response_env)
+            except Exception as e:  # noqa: BLE001 — inert ingestion (§1.5)
+                logger.warning(
+                    "envelope ingestion failed on an HTTP response: %s", e,
+                )
+        return response_env
 
     @classmethod
     async def connect(
@@ -292,6 +314,7 @@ class HttpConnection:
         expected_peer_id: str | None = None,
         *,
         ssl_context: ssl.SSLContext | None = None,
+        envelope_ingest: "Callable[[Envelope], None] | None" = None,
     ) -> "HttpConnection":
         """Open an HTTP-live connection: hello + authenticate handshake.
 
@@ -311,6 +334,10 @@ class HttpConnection:
             capability=None,
             capability_chain=None,
             ssl_context=ssl_context,
+            # The bootstrap instance is what POSTs the handshake, so the sink
+            # has to be on IT — the returned connection is constructed after
+            # both responses have already been received.
+            envelope_ingest=envelope_ingest,
         )
 
         # Step 1: hello

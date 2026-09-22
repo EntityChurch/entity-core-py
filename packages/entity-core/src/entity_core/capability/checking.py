@@ -377,6 +377,7 @@ def check_handler_scope(
     local_peer_id: str,
     now: int | None = None,
     target_peer: str | None = None,
+    relax_peers: bool = False,
 ) -> bool:
     """Check if capability grants operation on handler scope.
 
@@ -392,6 +393,20 @@ def check_handler_scope(
         operation: The operation to check.
         local_peer_id: The local peer's ID.
         now: Current timestamp in milliseconds.
+        relax_peers: §1.4 PD-2 (0.8.2.19) — **Dimension 4 only**. When a
+            credential minted by the target peer has been verified at the
+            outbound gate, it relaxes this grant's `peers` dimension to the
+            peers that credential covers, *and nothing else*. Set by
+            ``Peer._authorize_outbound_sub_dispatch`` and by no other caller.
+
+            **This skips one dimension of the per-grant-entry test, never the
+            entry itself.** §5.2 requires all four dimensions to match from a
+            *single* grant entry, so the relaxation is applied inside the loop
+            rather than by widening the search — a grant entry covering the
+            handler and a *different* entry covering the operation still does
+            not authorize. Mixing dimensions across entries is the escalation
+            §5.2's single-entry rule exists to close, and it is one `or` away
+            from here.
 
     Returns:
         True if the capability grants handler scope access.
@@ -418,8 +433,10 @@ def check_handler_scope(
         if not matches_id_scope(operations_scope, operation):
             continue
 
-        # §5.2 peers dimension — the same grant must cover the target peer.
-        if not grant_allows_peer(grant, peer, local_peer_id):
+        # §5.2 peers dimension — the same grant must cover the target peer,
+        # unless a verified target-minted credential has relaxed exactly this
+        # dimension (§1.4 PD-2, 0.8.2.19).
+        if not relax_peers and not grant_allows_peer(grant, peer, local_peer_id):
             continue
 
         # V6.0: handlers is now a CapabilityScope
@@ -440,6 +457,7 @@ def check_resource_scope(
     now: int | None = None,
     granter_peer_id: str | None = None,
     target_peer: str | None = None,
+    relax_peers: bool = False,
 ) -> bool:
     """Check if capability grants operation on resource scope at dispatch level.
 
@@ -458,6 +476,11 @@ def check_resource_scope(
             patterns (the granter's peer_id). Defaults to local_peer_id (the
             self-issued case, where granter == verifier). See
             granter_frame_peer_id.
+        relax_peers: §1.4 PD-2 (0.8.2.19) — Dimension 4 only, on the same
+            terms as :func:`check_handler_scope`. It is threaded here as well
+            as there because both checks run the per-grant-entry peers test,
+            and relaxing it in one while the other still refuses would leave
+            the resource dimension silently carrying the network bound.
 
     Returns:
         True if the capability grants access to all resource targets.
@@ -506,8 +529,10 @@ def check_resource_scope(
             if not matches_id_scope(operations_scope, operation):
                 continue
 
-            # §5.2 peers dimension — one grant must cover all four axes.
-            if not grant_allows_peer(
+            # §5.2 peers dimension — one grant must cover all four axes,
+            # unless a verified target-minted credential has relaxed exactly
+            # this dimension (§1.4 PD-2, 0.8.2.19).
+            if not relax_peers and not grant_allows_peer(
                 grant,
                 target_peer if target_peer is not None else local_peer_id,
                 local_peer_id,

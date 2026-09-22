@@ -106,6 +106,27 @@ logger = logging.getLogger(__name__)
 DEFAULT_REQUEST_TIMEOUT_SECONDS: float = 60.0
 
 
+def _ingest_handshake_envelope(
+    sink: "Callable[[Envelope], None] | None", envelope: Envelope,
+) -> None:
+    """§6.5 ingestion for the two envelopes :meth:`Connection.connect` receives
+    **before a Connection exists** (the hello response and the
+    connect/authenticate response).
+
+    Same semantics as :meth:`Connection._ingest`; it is a free function only
+    because the handshake is serial and instance-less at that point. Kept
+    beside the class rather than inlined twice so a third handshake receipt
+    cannot pick up a different rule — the two-hand-rolled-copies shape, which
+    is exactly how ingestion came to be defined per-surface in the first place.
+    """
+    if sink is None or not envelope.included:
+        return
+    try:
+        sink(envelope)
+    except Exception as e:  # noqa: BLE001 — inert ingestion, never fatal
+        logger.warning("envelope ingestion failed during handshake: %s", e)
+
+
 @dataclass
 class Connection:
     """Wrapper around an authenticated connection.
@@ -164,6 +185,35 @@ class Connection:
     #: granter identity, lifted from the authenticate response). The §6.5 (b)
     #: mint names the grantee by ITS content hash — never the §3.2 peer-id.
     remote_identity: dict[str, Any] | None = None
+    #: §6.5 envelope-`included` signature ingestion, generalized at 0.8.2.19
+    #: (E4 / keystone F64): *"Ingestion binds ANY received envelope carrying an
+    #: `included` map — it is a property of the envelope, not of a surface."*
+    #: Set by the owning ``Peer`` when it dials (and passed to :meth:`connect`
+    #: so the handshake's own two responses are covered); ``None`` on a bare
+    #: ``Connection``, which has no store to bind into.
+    envelope_ingest: "Callable[[Envelope], None] | None" = None
+
+    def _ingest(self, envelope: Envelope) -> None:
+        """Run §6.5 ingestion over a **received** envelope, if the owner
+        supplied a sink.
+
+        Called at every point this class takes an envelope off the wire. That
+        is deliberate and is the whole shape of the fix: the rule is stated as
+        an invariant over envelopes precisely because enumerating surfaces is
+        what left `EXECUTE_RESPONSE` unbound after connect/authenticate was
+        enumerated — *"two surfaces were enumerated one at a time, each after
+        a failure."*
+
+        Best-effort, on the same terms as ingestion itself (§1.5): a malformed
+        `included` map must not kill the reader loop and orphan every pending
+        caller. The frame it rode with is still validated downstream.
+        """
+        if self.envelope_ingest is None or not envelope.included:
+            return
+        try:
+            self.envelope_ingest(envelope)
+        except Exception as e:  # noqa: BLE001 — inert ingestion, never fatal
+            logger.warning("envelope ingestion failed on a received frame: %s", e)
 
     async def send(self, envelope: Envelope) -> None:
         """Send an envelope.
@@ -195,7 +245,9 @@ class Connection:
         Returns:
             The received envelope.
         """
-        return await recv_envelope(self.reader)
+        envelope = await recv_envelope(self.reader)
+        self._ingest(envelope)
+        return envelope
 
     async def execute(
         self,
@@ -454,6 +506,12 @@ class Connection:
         try:
             while True:
                 env = await recv_envelope(self.reader)
+                # §6.5 (0.8.2.19): ingest BEFORE the demux, because the rule
+                # is a property of the envelope and not of what we do with it
+                # next. An `EXECUTE_RESPONSE` nobody is waiting for still
+                # carried entities we received; an inbound EXECUTE is ingested
+                # again by the serving path, which is idempotent by design.
+                self._ingest(env)
                 msg_type = env.root.get("type", "")
                 if msg_type == Execute.TYPE:
                     # V7 §6.11(b) dialer-side reentry / EXTENSION-SIGNALING
@@ -580,6 +638,7 @@ class Connection:
         wait_for_capability: bool = True,
         *,
         established_via_rendezvous_key: bool = False,
+        envelope_ingest: "Callable[[Envelope], None] | None" = None,
     ) -> Connection:
         """Connect to a peer and complete EXECUTE-based connect handshake.
 
@@ -600,6 +659,13 @@ class Connection:
                 The caller that drove the establishment classifies; it is never
                 read from the wire. True makes this a *symmetric* establishment
                 and the handshake's tail mints the acceptor's reciprocal grant.
+            envelope_ingest: §6.5 ingestion sink (0.8.2.19) for every envelope
+                received here, **including the handshake's own two responses**.
+                It is a parameter rather than a post-construction assignment
+                because the connect/authenticate response is received *before*
+                a ``Connection`` exists — which is exactly why that surface
+                was the one D7 had to enumerate separately, and why leaving it
+                to the caller would rebuild the gap this closes.
 
         Returns:
             An authenticated Connection.
@@ -617,6 +683,7 @@ class Connection:
             # Step 2: Receive their hello response
             # Hello receives EXECUTE_RESPONSE with hello data as result
             their_hello_env = await recv_envelope(reader)
+            _ingest_handshake_envelope(envelope_ingest, their_hello_env)
             their_hello_root = their_hello_env.root
             if their_hello_root.get("type") != ExecuteResponse.TYPE:
                 raise ConnectError(
@@ -700,6 +767,12 @@ class Connection:
 
             # Step 4: Receive their authenticate response
             authenticate_response_env = await recv_envelope(reader)
+            # D7 (0.8.2.18) — THE surface the ruling was written for: the
+            # capability the acceptor mints here rides with its signature in
+            # `included`, and a signature only held in memory leaves every
+            # chain rooted at that grant unverifiable locally. Ingested before
+            # the status check, because the entities arrived either way.
+            _ingest_handshake_envelope(envelope_ingest, authenticate_response_env)
             authenticate_root = authenticate_response_env.root
 
             if authenticate_root.get("type") != ExecuteResponse.TYPE:
@@ -769,6 +842,7 @@ class Connection:
                 active_hash_format=active_format,
                 established_via_rendezvous_key=established_via_rendezvous_key,
                 remote_identity=remote_identity,
+                envelope_ingest=envelope_ingest,
             )
             # Class G / F-WB28: bring up the demuxer reader task NOW that
             # the inline handshake recv()s are done. From this point on,

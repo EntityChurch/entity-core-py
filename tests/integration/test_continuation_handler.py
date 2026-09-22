@@ -955,7 +955,39 @@ class TestContinuationInstall:
             ctx,
         )
         assert response["status"] == 400
-        assert response["result"]["data"]["code"] == "ambiguous_resource"
+        # 0.8.2.18, §3.3's 400 row: this row asserted `ambiguous_resource`
+        # until the two inputs were split. ABSENT is `path_required` — *supply
+        # a resource* is a different instruction from *name only one*, and the
+        # code is what selects the remedy. This test's own name says `missing`
+        # and it was pinning the code for the other input.
+        assert response["result"]["data"]["code"] == "path_required"
+
+    @pytest.mark.asyncio
+    async def test_install_with_two_resource_targets_is_ambiguous_not_missing(
+        self, setup_context,
+    ):
+        """The other half of the pair, which nothing drove — so the collapse
+        was invisible from this file: one row, one code, and the row that
+        existed was on the arm the spec moved.
+        """
+        emit_pathway, ctx, _ = setup_context
+        ctx.remote_identity_hash = b"\x00" * 33
+        ctx.resource_targets = ["app/one", "app/two"]
+        response = await continuation_handler(
+            "system/continuation",
+            "install",
+            {"type": "system/continuation", "data": {
+                "target": "system/tree",
+                "operation": "put",
+                "dispatch_capability": b"\x00" * 33,
+            }},
+            ctx,
+        )
+        assert response["status"] == 400
+        assert response["result"]["data"]["code"] == "ambiguous_resource", (
+            "both resource inputs now answer the same code — the pair has "
+            "re-collapsed and the absent case is non-conformant again"
+        )
 
     @pytest.mark.asyncio
     async def test_install_rejects_non_continuation_params_type(self, setup_context):
@@ -1601,4 +1633,83 @@ class TestContinuationInstall:
         assert rewritten, (
             "transform_ops+resource_extract not observable at the rewritten "
             f"path. Tree contents: {all_paths}"
+        )
+
+
+class TestTheCrossPeerAdvanceGatesOnTheHandlerGrant:
+    """§1.4 PD-2 (0.8.2.19) — *a credential is not a grant*, at the one site
+    that passed the same object as both.
+
+    .. rubric:: Why this is a SOURCE row and not a behavioural one
+
+    The seam is cross-peer, and every continuation cross-peer test in this
+    repo drives a **stub** dispatcher — so no local run can see a change to
+    it. That is the standing law (*a second dispatch path is a second
+    boundary, and the in-process one is the untested half*), and it is why
+    this defect was found by `convergence.rexec_delivered` against a live go
+    peer rather than by 4382 green tests.
+
+    .. rubric:: What was measured
+
+    The advance passed `capability_data=dispatch_cap_entity.data` — the
+    B-rooted credential — as the gate, *and* the same credential as the
+    presented one. While the presented arm short-circuited, the duplicate was
+    inert: the credential was only ever read in the target's frame. Composing
+    the gate (F67's fix) made it fatal, because §1.4 evaluates the handler's
+    grant in the **LOCAL** frame:
+
+        request target  `system/validate/rexec-src-.../item`
+                        -> canonicalizes in OUR frame  -> `/{A}/...`
+        grant pattern   `/{B}/system/validate/rexec-src-.../item`
+
+    A B-rooted credential's resource patterns are authored in B's namespace,
+    so read as a local grant they can never match a target naming B. §1.4's
+    *"looks implemented and denies everything"*, reached through Dimension 3.
+
+    Measured: `rexec_delivered` FAIL, bisected by restoring the bypass (PASS),
+    then PASS again with this fix — 1638 · 0 F @ core-go `6dc6506`.
+    """
+
+    def test_the_cross_peer_arm_hands_the_gate_the_handler_grant(self):
+        """The credential goes in as the CREDENTIAL and the handler's grant
+        goes in as the GATE. A seat that re-collapses them gets a green local
+        suite and a red cohort run, which is the trade this row exists to
+        stop.
+        """
+        import inspect
+
+        from entity_handlers import continuation as continuation_module
+
+        src = inspect.getsource(continuation_module)
+        assert "gate_capability = ctx.handler_grant" in src, (
+            "the cross-peer continuation advance no longer gates on the "
+            "executing handler's grant — if it passes the dispatch_capability "
+            "as `capability_data` again, §1.4's frame rule refuses every "
+            "cross-peer advance and `convergence.rexec_delivered` goes red"
+        )
+        assert "capability_data=gate_capability" in src, (
+            "the advance's dispatch no longer reads the gate variable"
+        )
+
+    def test_and_the_local_arm_still_spends_the_credential(self):
+        """The control, and the reason this is not a blanket change.
+
+        §4.2 case 3 scopes the credential to the **cross-peer** dispatch;
+        local/system targets are unchanged and still drive the local scope
+        check off the stored capability. A fix that hoisted
+        `ctx.handler_grant` out of the `if` would widen every local advance
+        from the continuation's narrow stored capability to the handler's
+        `*` self-grant — strictly more authority, on the arm nobody was
+        looking at.
+        """
+        import inspect
+
+        from entity_handlers import continuation as continuation_module
+
+        src = inspect.getsource(continuation_module)
+        default = src.index("gate_capability = dispatch_cap_entity.data")
+        override = src.index("gate_capability = ctx.handler_grant")
+        assert default < override, (
+            "the credential default no longer precedes the cross-peer "
+            "override; the local arm may have lost its narrow capability"
         )
