@@ -112,6 +112,23 @@ async def _handle_register(
     present + disagrees → reject 400 manifest_pattern_mismatch.
     """
     targets = getattr(ctx, "resource_targets", None) or []
+    if not targets:
+        # 0.8.2.17: `path_required` is the code when an operation **whose own
+        # specification requires a `resource`** is invoked without one, and
+        # §6.2 is that specification here — *"Both `register` and
+        # `unregister` derive the pattern from `EXECUTE.resource.targets[0]`
+        # … the handler MUST require exactly one resource target."*
+        #
+        # This site answered `ambiguous_resource` for the absent case until
+        # the §3.3 slot was censused **by the row's input** rather than by the
+        # token: grepping for `path_required` finds where we already emit it
+        # and can never find where we should. Zero targets and two targets are
+        # different inputs with different remedies — *supply a resource* is not
+        # *disambiguate the one you sent* — and §3.3 says selecting the remedy
+        # is what the code is for.
+        return _error(400, "path_required",
+                      "register requires a resource target "
+                      "(system/handler/{pattern}) — §6.2, §3.2 path-as-resource")
     if len(targets) != 1:
         return _error(400, "ambiguous_resource",
                       "register requires exactly one resource target (system/handler/{pattern})")
@@ -124,37 +141,53 @@ async def _handle_register(
         return _error(400, "malformed_resource",
                       "register resource missing pattern after system/handler/")
 
-    # Override prohibition (EXTENSION-COMPUTE §3.5): the compute builtins are
-    # registered at bootstrap and MUST NOT be overridden, so that two peers
-    # dispatching to e.g. system/compute/builtins/arithmetic cannot disagree on
-    # what "add" means. Reject any registration targeting that namespace.
+    # Override prohibition (EXTENSION-COMPUTE, override prohibition — v3.29):
+    # the compute builtins are registered at bootstrap and MUST NOT be
+    # overridden, so that two peers dispatching to e.g.
+    # system/compute/builtins/arithmetic cannot disagree on what "add" means.
+    #
+    # This rule **stands on its own** and is the reason the block below it is
+    # gone rather than narrowed. It used to describe itself as a subset of the
+    # core `system/*` reservation; v3.29 removed that framing when 0.8.2.13
+    # withdrew the reservation, and re-based it on what it actually is — a
+    # **cross-peer determinism** requirement, not a namespace policy. That is
+    # why this one is a MUST while local install policy is not, and why it
+    # binds every installation path.
+    #
+    # Returns BEFORE any emit: a refusal that published the manifest, handler
+    # entity or grant anyway satisfies a status-only check while defeating the
+    # prohibition entirely (GUIDE-CONFORMANCE §2.4a's negative half).
     if (
         derived_pattern == "system/compute/builtins"
         or derived_pattern.startswith("system/compute/builtins/")
     ):
         return _error(403, "builtin_override_prohibited",
                       "handlers under system/compute/builtins/* MUST NOT be "
-                      "overridden (EXTENSION-COMPUTE §3.5)")
+                      "overridden (EXTENSION-COMPUTE override prohibition, "
+                      "v3.29 — a cross-peer determinism requirement)")
 
-    # V7 §6.2 / §6.6 system-path reservation: "Implementations MUST NOT allow
-    # user-installed handlers to register at `system/*` paths." The whole
-    # namespace, not just the compute builtins above — without this a caller
-    # holding register authority can bind a handler in front of `system/tree`
-    # or `system/capability` and every subsequent dispatch to that prefix
-    # resolves to theirs (§6.6 longest-prefix wins).
+    # NOTE (0.8.2.13): a blanket `system/*` registration refusal used to sit
+    # here, citing V7 §6.2's *"Implementations MUST NOT allow user-installed
+    # handlers to register at `system/*` paths."* **That sentence is withdrawn
+    # and is no longer a conformance requirement.** Do not restore it.
     #
-    # Component-boundary comparison on purpose: `system` and `system/...` are
-    # reserved, `systemic/...` is not. A raw `startswith("system")` would take
-    # a name that merely begins with the same letters.
+    # §6.1 now reads: installation at a `system/*` path is authorized by *the
+    # same mechanism as any other registration* — `register` derives its
+    # pattern from `EXECUTE.resource.targets[0]`, and the standard dispatch
+    # capability check on `resource` (§6.13) decides whether the caller may
+    # install there. The protocol places no additional constraint on the
+    # prefix.
     #
-    # Returns BEFORE any emit, which is the §2.4a negative half — a refusal
-    # that published the manifest, handler entity or grant anyway would satisfy
-    # a status-only check while defeating the reservation entirely.
-    if derived_pattern == "system" or derived_pattern.startswith("system/"):
-        return _error(403, "forbidden_pattern",
-                      f"pattern {derived_pattern!r} is reserved: user-installed "
-                      "handlers MUST NOT register at system/* (V7 §6.2)")
-
+    # The withdrawal's reasoning is worth keeping because it is the argument
+    # against re-adding this: the rule entered the spec as an unexplained row
+    # in a migration table and was never justified afterwards; it named a
+    # party — "user" — the specification does not define and cannot
+    # distinguish from an operator or an extension author; and it was enforced
+    # by a hardcoded prefix match **ahead of authorization**, so it overrode
+    # the grant a deployment had deliberately issued. A peer that refuses
+    # `system/*` registrations is applying deployment policy and remains
+    # conformant; so does one that permits them. We permit, and the capability
+    # check is the enforcement point.
     manifest = params_data.get("manifest")
     if not isinstance(manifest, dict):
         return _error(400, "invalid_request",
@@ -280,6 +313,23 @@ async def _handle_unregister(
     eliminated and params is empty primitive/any.
     """
     targets = getattr(ctx, "resource_targets", None) or []
+    if not targets:
+        # 0.8.2.17: `path_required` is the code when an operation **whose own
+        # specification requires a `resource`** is invoked without one, and
+        # §6.2 is that specification here — *"Both `register` and
+        # `unregister` derive the pattern from `EXECUTE.resource.targets[0]`
+        # … the handler MUST require exactly one resource target."*
+        #
+        # This site answered `ambiguous_resource` for the absent case until
+        # the §3.3 slot was censused **by the row's input** rather than by the
+        # token: grepping for `path_required` finds where we already emit it
+        # and can never find where we should. Zero targets and two targets are
+        # different inputs with different remedies — *supply a resource* is not
+        # *disambiguate the one you sent* — and §3.3 says selecting the remedy
+        # is what the code is for.
+        return _error(400, "path_required",
+                      "unregister requires a resource target "
+                      "(system/handler/{pattern}) — §6.2, §3.2 path-as-resource")
     if len(targets) != 1:
         return _error(400, "ambiguous_resource",
                       "unregister requires exactly one resource target (system/handler/{pattern})")

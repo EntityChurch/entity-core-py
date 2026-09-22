@@ -291,6 +291,76 @@ async def test_control_undelegated_connection_cap_registers(peer):
 
 
 @pytest.mark.asyncio
+async def test_a_refused_register_publishes_nothing(peer):
+    """GUIDE-CONFORMANCE §2.4a's negative half, re-based onto a **live,
+    attributable** refusal (0.8.2.13).
+
+    A refusal that published the artifacts anyway satisfies a status-only
+    check while defeating the refusal entirely — *403 but wrote anyway*. That
+    coverage used to hang off the `system/*` prefix reservation, which is
+    withdrawn, so it had to move to a refusal that still exists rather than be
+    deleted with the rule. Arch named this re-base specifically: the valuable
+    thing was never the prefix, it was the conjunct.
+
+    The refusal driven here is the one that **replaced** the prefix rule — a
+    caller whose grant does not cover `system/handler` → `403
+    capability_denied` at the dispatch check. So this row is simultaneously
+    the negative-half coverage and the demonstration that withdrawing the
+    prefix rule left an enforcement point behind, which is the whole basis of
+    the withdrawal.
+
+    All three of what the positive path writes must be absent: the interface
+    at `system/handler/{pattern}`, the handler entity at `{pattern}`, and the
+    grant at `system/capability/grants/{pattern}`.
+    """
+    conn = await _connect(peer)
+    # A `system/*` pattern nothing has registered. The first draft used
+    # `system/tree`, which the bootstrap owns — so the "published anyway" rows
+    # read the bootstrap's own entities and failed against a peer that had
+    # refused correctly. A negative-space assertion has to be pointed at
+    # negative space.
+    pattern = "system/shadow-probe"
+    try:
+        child, child_sig = _mint_child(
+            delegator_kp=conn.keypair,
+            parent_hash=conn.capability["content_hash"],
+            # Wide open except for the one thing that matters: the resource
+            # scope does not reach `system/handler/…`.
+            grants=_grants([f"/{peer.keypair.peer_id}/app/*"]),
+        )
+        chain = [child_sig, conn.capability, *(conn.capability_chain or [])]
+        resp = await asyncio.wait_for(
+            conn.execute(
+                uri=f"entity://{peer.keypair.peer_id}/system/handler",
+                operation="register",
+                params=_register_params(pattern),
+                resource=_register_resource(pattern),
+                capability_override=child,
+                capability_chain_override=chain,
+            ),
+            timeout=5.0,
+        )
+        assert resp.status == 403, resp.result
+        code = (resp.result.get("data") or {}).get("code", "")
+        assert code == "capability_denied", (
+            f"the refusal is not attributable to the capability check: {code}"
+        )
+
+        tree = peer.entity_tree
+        for path in (
+            f"system/handler/{pattern}",
+            f"system/capability/grants/{pattern}",
+        ):
+            uri = tree.normalize_uri(path)
+            assert tree.get(uri) is None, (
+                f"a refused register published {path!r} anyway"
+            )
+    finally:
+        conn.close()
+        await conn.wait_closed()
+
+
+@pytest.mark.asyncio
 async def test_control_handler_scope_is_enforced_in_the_cross_peer_form(peer):
     """Handler scope narrowed off `system/handler`, resources in the cross-peer
     form → 403.

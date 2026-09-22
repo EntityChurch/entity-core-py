@@ -94,6 +94,15 @@ class RawValidator:
         await send_envelope(self._conn.writer, auth.to_envelope())
         return execute.request_id
 
+    async def execute_raw(self, uri: str, operation: str, params) -> ExecuteResponse:
+        """One EXECUTE, one EXECUTE_RESPONSE. Used by the rows that drive
+        `dispatch-outbound` with a request the reentry helper cannot express
+        (no credential at all, or a partial one)."""
+        req_id = await self._send_execute(uri, operation, params)
+        env = await asyncio.wait_for(recv_envelope(self._conn.reader), timeout=10)
+        assert env.root.get("data", {}).get("request_id") == req_id
+        return ExecuteResponse.from_entity(env.root)
+
     async def echo(self, payload, *, operation: str = "echo") -> ExecuteResponse:
         params = Entity(type="primitive/any", data={"value": payload}).to_dict()
         uri = f"entity://{self.target_peer_id}/{ECHO_HANDLER_PATTERN}"
@@ -244,6 +253,82 @@ async def test_dispatch_outbound_reentry(target_peer):
         # must have returned 200.
         inner = resp.result["data"]
         assert inner["status"] == 200
+    finally:
+        await v.close()
+
+
+async def test_dispatch_outbound_ambient_at_a_foreign_peer_is_refused(target_peer):
+    """0.8.2.17 §9.1's **negative** arm, over the wire — the half of the
+    two-arm row that is new and that a peer is red on until it builds it.
+
+    *Drive `system/validate/dispatch-outbound` at a foreign peer presenting no
+    capability → MUST refuse.* `test_dispatch_outbound_reentry` above is the
+    positive arm and has been green since §7a landed; arch's phrasing is the
+    reason both live here: *"a check that only exercises the refusal passes on
+    a peer that refuses everything."*
+
+    .. rubric:: Why the handler had to change for this row to mean anything
+
+    Omitting the three §7a.2a in-band authority fields used to be a `400
+    invalid_params` — a refusal, at param validation, before any dispatch was
+    attempted. A probe cannot tell that apart from Dimension 4 doing its job,
+    which is the attribution trap this repo has hit from the other side (a
+    control that makes a measurement attributable also stops it covering the
+    neighbour). The three fields are now optional as a set, and the refusal
+    the probe sees is relayed as `403 capability_denied` rather than wrapped
+    in the generic `502`.
+
+    The `403` is therefore asserted as a **pair with its code**, and the
+    positive arm's `200` is asserted beside it, because a peer answering the
+    same thing to both inputs has one gate, not two.
+    """
+    peer, p_kp, host, port = target_peer
+    v = await RawValidator.connect(host, port, Keypair.generate())
+    try:
+        data = {
+            "target": f"entity://{v.peer_id}/{ECHO_HANDLER_PATTERN}",
+            "operation": "echo",
+            "value": "ambient-payload",
+            # No reentry_capability / reentry_granter / reentry_cap_signature.
+        }
+        params = Entity(type="primitive/any", data=data).to_dict()
+        uri = f"entity://{v.target_peer_id}/{DISPATCH_OUTBOUND_HANDLER_PATTERN}"
+        resp = await v.execute_raw(uri, "dispatch", params)
+
+        assert resp.status == 403, (
+            f"ambient outbound sub-dispatch at a foreign peer was not refused "
+            f"(status={resp.status}, result={resp.result}) — §1.4 PD-2's "
+            "negative arm is unarmed on the wire"
+        )
+        assert resp.result["type"] == "system/protocol/error"
+        assert resp.result["data"]["code"] == "capability_denied"
+    finally:
+        await v.close()
+
+
+async def test_dispatch_outbound_rejects_a_partial_credential(target_peer):
+    """Some of the three fields and not others is still a malformed request.
+
+    The set is optional; the members are not individually optional. Without
+    this row, a probe that drops one field by accident silently gets the
+    ambient arm and reads its refusal as the negative arm passing.
+    """
+    peer, p_kp, host, port = target_peer
+    v = await RawValidator.connect(host, port, Keypair.generate())
+    try:
+        cap_ent, _granter_ent, _sig_ent = v._mint_reentry_cap(p_kp)
+        data = {
+            "target": f"entity://{v.peer_id}/{ECHO_HANDLER_PATTERN}",
+            "operation": "echo",
+            "value": "partial",
+            "reentry_capability": cap_ent.to_dict(),
+        }
+        params = Entity(type="primitive/any", data=data).to_dict()
+        uri = f"entity://{v.target_peer_id}/{DISPATCH_OUTBOUND_HANDLER_PATTERN}"
+        resp = await v.execute_raw(uri, "dispatch", params)
+
+        assert resp.status == 400
+        assert resp.result["data"]["code"] == "invalid_params"
     finally:
         await v.close()
 

@@ -46,8 +46,48 @@ __all__ = [
     "canonicalize",
     "matches_pattern",
     "matches_scope",
+    "matches_id_scope",
+    "id_scope_pattern_matches",
+    "scope_type_for_dimension",
+    "ID_SCOPE",
+    "PATH_SCOPE",
     "granter_frame_peer_id",
 ]
+
+# §3.6's two scope types. A grant dimension's type is fixed by the dimension,
+# not carried per value: the spec's pseudocode reads `scope.type` because its
+# scope entity is typed by the `type_ref` in the §3.6 field spec, and the field
+# spec is what pins `handlers`/`resources` to path-scope and `operations`/
+# `peers` to id-scope. Deriving it from the dimension name is the same fact
+# read from the same place; nothing on the wire changes.
+PATH_SCOPE = "system/capability/path-scope"
+ID_SCOPE = "system/capability/id-scope"
+
+_SCOPE_TYPE_BY_DIMENSION = {
+    "handlers": PATH_SCOPE,
+    "resources": PATH_SCOPE,
+    "operations": ID_SCOPE,
+    "peers": ID_SCOPE,
+}
+
+
+def scope_type_for_dimension(dimension: str) -> str:
+    """The §3.6 scope type of a grant dimension.
+
+    Raises for an unknown dimension rather than defaulting: a new dimension
+    silently inheriting one of the two matchers is the F40 defect arriving
+    from the other direction, and there is no correct default (a path
+    dimension matched literally over-refuses; an id dimension canonicalized
+    over-grants — the A-SQL-008 ALLOW-bug class §5.2 names).
+    """
+    try:
+        return _SCOPE_TYPE_BY_DIMENSION[dimension]
+    except KeyError:
+        raise ValueError(
+            f"no scope type declared for grant dimension {dimension!r} — "
+            "§3.6 fixes the type per dimension; add it there rather than "
+            "picking a matcher at the call site"
+        ) from None
 
 
 def granter_frame_peer_id(
@@ -238,6 +278,57 @@ def matches_scope(scope: CapabilityScope | dict[str, Any], value: str) -> bool:
     return True
 
 
+def id_scope_pattern_matches(pattern: str, value: str) -> bool:
+    """One id-scope pattern against one raw value — §5.2 `scope_value_matches`,
+    the ``system/capability/id-scope`` arm.
+
+    Exactly two wildcard forms and no path transforms: bare ``*`` matches any
+    value, a trailing ``/*`` matches by **literal** segment-prefix, everything
+    else is string equality. The §5.4 transforms are the thing this arm exists
+    to refuse — no leading-``/`` universal-scope reading, no ``/*/`` interior
+    peer-wildcard, no peer-relative qualification. So ``/*/*`` is a literal
+    that matches nothing, not a universal wildcard, and ``entity://…`` is a
+    string, not an address.
+    """
+    if pattern == "*":
+        return True
+    if pattern.endswith("/*"):
+        return value.startswith(pattern[:-1])
+    return value == pattern
+
+
+def matches_id_scope(
+    scope: CapabilityScope | dict[str, Any], value: str,
+) -> bool:
+    """`matches_scope` for a ``system/capability/id-scope`` dimension
+    (``operations``, ``peers``) — §5.2, pseudocode corrected at 0.8.2.16.
+
+    Split out from :func:`matches_scope` rather than selected by a parameter
+    so that **which matcher a dimension uses is visible at the call site**.
+    §5.2 states the split as normative and says an id dimension canonicalized
+    is a conformance defect; a defect that consists of reaching for the wrong
+    helper is one a reader has to be able to see.
+
+    Note for anyone measuring this: on the values these two dimensions can
+    carry, this function and :func:`matches_scope` **agree** — the §5.4
+    transforms all require a leading ``/`` on the *value*, and an operation
+    name or a peer id never has one. The divergence this split forecloses is
+    a future call site that canonicalizes the value before matching, which is
+    exactly how the delegation path (:mod:`entity_core.capability.delegation`)
+    came to canonicalize operation excludes.
+    """
+    if isinstance(scope, dict):
+        scope = CapabilityScope.from_dict(scope)
+
+    if not any(id_scope_pattern_matches(p, value) for p in scope.include):
+        return False
+    if scope.exclude:
+        for pattern in scope.exclude:
+            if id_scope_pattern_matches(pattern, value):
+                return False
+    return True
+
+
 def extract_peer(uri_or_path: str, local_peer_id: str) -> str:
     """The peer a dispatch targets — V7 §5.2 ``extract_peer``.
 
@@ -276,7 +367,7 @@ def grant_allows_peer(
     peers_scope = grant.get("peers")
     if peers_scope is None:
         peers_scope = {"include": [local_peer_id]}
-    return matches_scope(peers_scope, target_peer)
+    return matches_id_scope(peers_scope, target_peer)
 
 
 def check_handler_scope(
@@ -324,7 +415,7 @@ def check_handler_scope(
     for grant in capability_data.get("grants", []):
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
-        if not matches_scope(operations_scope, operation):
+        if not matches_id_scope(operations_scope, operation):
             continue
 
         # §5.2 peers dimension — the same grant must cover the target peer.
@@ -412,7 +503,7 @@ def check_resource_scope(
 
             # Check operation scope
             operations_scope = get_scope(grant, "operations")
-            if not matches_scope(operations_scope, operation):
+            if not matches_id_scope(operations_scope, operation):
                 continue
 
             # §5.2 peers dimension — one grant must cover all four axes.
@@ -513,7 +604,7 @@ def check_path_permission(
     for grant in capability_data.get("grants", []):
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
-        if not matches_scope(operations_scope, operation):
+        if not matches_id_scope(operations_scope, operation):
             continue
 
         # If handler_pattern provided, filter by handlers scope first
@@ -586,7 +677,7 @@ def find_matching_grant(
 
     for grant in capability_data.get("grants", []):
         operations_scope = get_scope(grant, "operations")
-        if not matches_scope(operations_scope, operation):
+        if not matches_id_scope(operations_scope, operation):
             continue
 
         handlers_scope = get_scope(grant, "handlers")

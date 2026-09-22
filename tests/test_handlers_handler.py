@@ -161,15 +161,28 @@ class TestRegister:
         assert et.get("system/compute/builtins/map") is None
 
     @pytest.mark.asyncio
-    async def test_register_rejects_reserved_system_pattern(self):
-        """V7 §6.2: *"Implementations MUST NOT allow user-installed handlers to
-        register at `system/*` paths."*
+    async def test_a_system_path_register_is_not_refused_by_the_prefix(self):
+        """0.8.2.13 — **the `system/*` reservation is withdrawn.**
 
-        We guarded only `system/compute/builtins/*` and let the rest of the
-        namespace through — a live cross-impl run answered 200 to a register at
-        a reserved `system/*` pattern. §6.6 resolves by longest prefix, so a
-        handler bound in front of `system/tree` takes every dispatch to that
-        prefix.
+        This row asserted the opposite until 0.8.2.13, citing V7 §6.2's
+        *"Implementations MUST NOT allow user-installed handlers to register
+        at `system/*` paths."* That sentence is gone and *"is no longer a
+        conformance requirement"*; §6.1 now says installation at a `system/*`
+        path is authorized by **the same mechanism as any other registration**
+        — the dispatch capability check on `resource.targets[0]` (§6.13).
+
+        So the row is inverted rather than deleted: it pins that **the prefix
+        is not the gate**. What replaces the refusal is not "nothing" — it is
+        the capability, and this handler is being called directly here, with
+        no dispatch in front of it. The authorization half is asserted where
+        authorization actually happens, over a real connection, in
+        `test_delegated_register_probe.py`.
+
+        Two things the withdrawal turns on, kept here because they are the
+        argument against re-adding the guard: the rule named a party
+        ("user") the specification does not define, and it was enforced by a
+        hardcoded prefix match **ahead of** authorization — so it overrode
+        the grant a deployment had deliberately issued.
         """
         ep, cs, et, kp = _setup()
 
@@ -182,51 +195,50 @@ class TestRegister:
             _ctx(ep, kp.peer_id, kp,
                  resource_targets=["system/handler/system/tree"]),
         )
-        assert result["status"] == 403
-        assert result["result"]["data"]["code"] == "forbidden_pattern"
+        assert result["status"] == 200, (
+            "a `system/*` register was refused by this handler. 0.8.2.13 "
+            f"withdrew the prefix rule: {result}"
+        )
+        assert result["result"]["data"].get("code") != "forbidden_pattern"
 
     @pytest.mark.asyncio
-    async def test_reserved_register_publishes_nothing(self):
-        """GUIDE-CONFORMANCE §2.4a negative half — the conjunct that matters.
+    async def test_the_builtin_prohibition_is_a_component_boundary(self):
+        """The rule that did NOT go away, and its boundary.
 
-        A refusal that published the artifacts anyway satisfies a status-only
-        check while defeating the reservation entirely. All three of what the
-        positive path writes must be absent: the interface at
-        `system/handler/{pattern}`, the handler entity at `{pattern}`, and the
-        grant at `system/capability/grants/{pattern}`.
+        EXTENSION-COMPUTE v3.29 re-based the builtin override prohibition
+        when the core reservation was withdrawn — it had described itself as
+        *"a subset of"* that reservation, which after the withdrawal named a
+        rule that no longer exists. It now stands on its own as a **cross-peer
+        determinism** requirement: two peers disagreeing about what `"add"`
+        means is an interop failure, which is why this is a MUST while local
+        install policy is not.
+
+        The boundary is the same defect go hit in DOMAIN-LOCAL-FILES §8.3: a
+        raw `startswith` takes a name that merely begins with the same
+        letters. This row moved here from the withdrawn reservation, which is
+        where the boundary used to live — the prefix is different, the defect
+        class is identical.
         """
         ep, cs, et, kp = _setup()
 
-        manifest = _manifest("system/capability", "shadow",
-                             {"request": {"output_type": "primitive/any"}})
-        result = await handlers_handler(
-            HANDLERS_HANDLER_PATTERN, "register",
-            {"data": {"manifest": manifest}},
-            _ctx(ep, kp.peer_id, kp,
-                 resource_targets=["system/handler/system/capability"]),
-        )
-        assert result["status"] == 403
-        assert et.get("system/handler/system/capability") is None
-        assert et.get("system/capability") is None
-        assert et.get("system/capability/grants/system/capability") is None
-
-    @pytest.mark.asyncio
-    async def test_reservation_is_a_component_boundary(self):
-        """`system` and `system/...` are reserved; `systemic/...` is not. The
-        same boundary defect go hit in DOMAIN-LOCAL-FILES §8.3 — a raw
-        `startswith("system")` takes a name that merely begins with the letters
-        and refuses a legitimate registration."""
-        ep, cs, et, kp = _setup()
-
-        manifest = _manifest("systemic/foo", "ok",
-                             {"do": {"output_type": "primitive/any"}})
-        result = await handlers_handler(
-            HANDLERS_HANDLER_PATTERN, "register",
-            {"data": {"manifest": manifest}},
-            _ctx(ep, kp.peer_id, kp,
-                 resource_targets=["system/handler/systemic/foo"]),
-        )
-        assert result["status"] == 200, result
+        for pattern, expected in (
+            ("system/compute/builtins/map", 403),
+            ("system/compute/builtins", 403),
+            ("system/compute/builtinsextra", 200),
+            ("systemic/foo", 200),
+        ):
+            manifest = _manifest(pattern, "probe",
+                                 {"do": {"output_type": "primitive/any"}})
+            result = await handlers_handler(
+                HANDLERS_HANDLER_PATTERN, "register",
+                {"data": {"manifest": manifest}},
+                _ctx(ep, kp.peer_id, kp,
+                     resource_targets=[f"system/handler/{pattern}"]),
+            )
+            assert result["status"] == expected, (
+                f"{pattern!r} -> {result['status']}, expected {expected}: "
+                f"{result}"
+            )
 
     @pytest.mark.asyncio
     async def test_register_uses_requested_scope_over_internal_scope(self):
@@ -343,14 +355,42 @@ class TestRegister:
         assert result["status"] == 400
 
     @pytest.mark.asyncio
-    async def test_register_rejects_missing_resource(self):
-        """Per P-V7-1: register requires exactly one resource target."""
+    async def test_register_with_no_resource_is_path_required(self):
+        """0.8.2.17: absent and ambiguous are different inputs.
+
+        §6.2 is `register`'s own specification and it requires a resource, so
+        invoking it without one is exactly the input §3.3 assigns
+        `path_required`. This row asserted `ambiguous_resource` until the slot
+        was censused by input rather than by token — and it passed the whole
+        time, because it was our constant checked against our constant.
+
+        The remedy is what separates them: *supply a resource* is not
+        *disambiguate the one you sent*, and §3.3 says selecting the remedy is
+        what the code is for.
+        """
         ep, _, _, kp = _setup()
         manifest = _manifest("local/foo", "foo", {"do": {}})
         params = {"data": {"manifest": manifest}}
         result = await handlers_handler(
             HANDLERS_HANDLER_PATTERN, "register", params,
             _ctx(ep, kp.peer_id, kp),  # no resource_targets
+        )
+        assert result["status"] == 400
+        assert result["result"]["data"]["code"] == "path_required"
+
+    @pytest.mark.asyncio
+    async def test_register_with_two_resources_is_still_ambiguous(self):
+        """The teeth control. Without it, a peer that answers `path_required`
+        to every resource-count problem passes the row above — and the §6.2
+        MUST ("exactly one") would have lost its own code.
+        """
+        ep, _, _, kp = _setup()
+        manifest = _manifest("local/foo", "foo", {"do": {}})
+        result = await handlers_handler(
+            HANDLERS_HANDLER_PATTERN, "register", {"data": {"manifest": manifest}},
+            _ctx(ep, kp.peer_id, kp, resource_targets=[
+                "system/handler/local/foo", "system/handler/local/bar",
+            ]),
         )
         assert result["status"] == 400
         assert result["result"]["data"]["code"] == "ambiguous_resource"
@@ -429,12 +469,26 @@ class TestUnregister:
         assert et.get("system/capability/grants/local/foo") is None
 
     @pytest.mark.asyncio
-    async def test_unregister_rejects_missing_resource(self):
-        """Per P-V7-2: unregister requires exactly one resource target."""
+    async def test_unregister_with_no_resource_is_path_required(self):
+        """0.8.2.17, same split as `register` — and the same §6.2 sentence
+        covers both ops, so a fix to one that misses the other is the
+        two-hand-rolled-copies shape at the level of a spec row."""
         ep, _, _, kp = _setup()
         result = await handlers_handler(
             HANDLERS_HANDLER_PATTERN, "unregister", {"data": {}},
             _ctx(ep, kp.peer_id, kp),
+        )
+        assert result["status"] == 400
+        assert result["result"]["data"]["code"] == "path_required"
+
+    @pytest.mark.asyncio
+    async def test_unregister_with_two_resources_is_still_ambiguous(self):
+        ep, _, _, kp = _setup()
+        result = await handlers_handler(
+            HANDLERS_HANDLER_PATTERN, "unregister", {"data": {}},
+            _ctx(ep, kp.peer_id, kp, resource_targets=[
+                "system/handler/local/foo", "system/handler/local/bar",
+            ]),
         )
         assert result["status"] == 400
         assert result["result"]["data"]["code"] == "ambiguous_resource"

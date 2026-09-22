@@ -672,7 +672,32 @@ fails the gates rather than slipping past them.
 - **A ruling routed to you carries an assumed baseline, and the baseline is the claim to check
   first.** ***RATIFIED 2026-08-21*** *— second instance of "a routed report's claims about our repo
   are hearsay", and the first where the wrong claim was about our **version** rather than our
-  architecture or our coverage.* `ROUTING-2026-08-21-a` routes COMPUTE **v3.26** with the sentence
+  architecture or our coverage.*
+  **Fourth instance, 2026-09-09, and the assumed baseline was in a section written TO US, by ARCH,
+  that says it is scoped by a diff.** `ROUTING-2026-09-09-i` is addressed to `entity-core-go` and
+  carries *"For `entity-core-rust` and `entity-core-py` — relay this section"*, opening with
+  **"Scoped by the diff, not by what you shipped."** That sentence reads as a guarantee of
+  completeness and is one — **for go**, whose baseline was 0.8.2.14. This repo was on **0.8.2.11**,
+  so `.12`/`.13`/`.14` were never in anyone's diff and were never routed here at all. `0.8.2.13`
+  had live work in it: the `system/*` registration reservation is **withdrawn**, and this peer was
+  still enforcing it with a hardcoded prefix match ahead of authorization. Nothing in the relay
+  mentions it, correctly, because go had absorbed it a revision earlier.
+  **Why this axis is worse than the sibling-relay shapes above.** A sibling's packet is obviously
+  written from a sibling's seat, and *"a routed report's claims about our repo are hearsay"* is
+  already the reflex. This one is **arch's**, it is addressed to us by name, and its scoping
+  sentence is *about* completeness — so the one place you would look for the caveat is the place
+  that reassures you. A relay's per-seat worklist is scoped by **the routing seat's** diff, and no
+  amount of care in writing it can make it scoped by yours.
+  **The check, and it is the same two seconds as every other instance:** before working a routed
+  worklist, `grep` your own tree for the protocol level you last absorbed and diff it against the
+  ruling's. Here `grep -o "0\.8\.2\.[0-9]\+" ... | sort -V | uniq -c` answered it — 36 hits at
+  `.11`, none above — and reframed a four-item worklist into a six-item one. **Then state your
+  corrected baseline in the reply**, because the relaying seat's board is tracking you against the
+  version it assumed. Enforcement point: the version census is the first command of any
+  catch-up pass, and `0.8.2.13`'s withdrawal is recorded at the site it was removed from
+  (`entity_handlers/handlers.py`) as an argument against re-adding it — a withdrawn rule leaves no
+  failing test behind, so the comment is the only thing that stops it coming back.
+ `ROUTING-2026-08-21-a` routes COMPUTE **v3.26** with the sentence
   *"rust and py are not yet on v3.26."* True and useless: **this repo was on v3.23.** v3.24 and
   v3.25 were never routed here at all, so §3.5's three contained positions — `assoc`'s `value`,
   `concat`'s elements, `group-by`'s `members` — **did not exist to carve out.** The ruling's entire
@@ -1959,8 +1984,32 @@ fails the gates rather than slipping past them.
   that is also an internal one was never a spec question.*
 
 - **A mutation that reddens NOTHING is a finding about the code, not a shortfall in the test —
-  and the usual culprit is a defensive arm that already answers the same thing.** *Candidate,
-  2026-09-04, landing the type-op alignment.* The new `404 type_not_found` gate went onto five
+  and the usual culprit is a defensive arm that already answers the same thing.** ***RATIFIED
+  2026-09-09*** *— second instance in a different shape, and the two shapes want **opposite**
+  remedies, which is the part the candidate could not yet say.*
+  **Second shape, 2026-09-09, building PD-2's presented-authority arm.** Four verifications, four
+  mutations. Two reddened the predicted row. **Two reddened nothing:** disabling the `granter`
+  check and disabling the `grantee` check both left 15/15 green. Asking *what else answers this?*
+  found, in each case, a **legitimately independent** second refusal rather than a dead arm:
+  - the third-party-minted capability the granter row drove is *also* rejected by chain
+    verification, whose root check runs in the target's frame;
+  - the grantee row left the third party's identity out of the bundle, so `grantee` did not
+    **resolve** — a weaker and different refusal than a *mismatched* grantee.
+  **So the remedy was the fixture, not the code.** The configuration that isolates the granter
+  check is a chain **rooted at the target** whose leaf was delegated on to a third party:
+  chain-valid, leaf granter not the target, and nothing else refuses it. Both mutations now
+  redden exactly one row.
+  **The discriminator between the two remedies, which is what ratification adds:** ask whether
+  the second path refuses **the same input for the same reason** or **a different input for a
+  different reason**. Same-and-same (the `adopt` shape) is redundancy — delete the arm, because
+  the next seat will delete the load-bearing one instead. Different-and-different (this shape) is
+  defence in depth, and the finding is that **your fixture is not the discriminating
+  configuration** — it is satisfying two refusals at once, so it can never tell you which one is
+  doing the work. The tell is cheap: if you can describe an input that the *other* path accepts,
+  the arm is live and the fixture is wrong.
+  **And the non-discriminating rows are kept and labelled**, not deleted — a reader who finds
+  four rows in a class counts four rows of coverage unless one of them says otherwise.
+  *(Original candidate, 2026-09-04, landing the type-op alignment:)* The new `404 type_not_found` gate went onto five
   operations and each got a mutation. `converge`'s unarming reddened the two predicted rows;
   `adopt`'s reddened **nothing — 33/33 green with the gate deleted**. The reason is not a weak
   assertion: `op_adopt` raises `ValueError` for exactly one cause, the `except ValueError` arm
@@ -1987,6 +2036,44 @@ fails the gates rather than slipping past them.
   green recorded at the call site so a later reader restoring it "for safety" is told what it
   costs; the row that now discriminates is
   `test_an_unresolvable_type_is_404_type_not_found[adopt]`, re-verified RED.
+
+- **A cohort poll is ruling input, so a wrong answer moves a specification rather than failing a
+  build — measure it, and then check whether your answer is a POSITION or an accident.**
+  *Candidate, 2026-09-09 — F60/N-4, and both halves were wrong on the first pass.*
+  `entity-core-go` polled the three seats: when a handler **is** registered, its operation **is**
+  in the manifest, and **no body is bound to run**, what `code` do you emit? go spells it
+  `no_handler_body`; the spec defines none; the question is whether an impl may mint one at all.
+  **Half one — I answered from a source read and it was wrong.** The tree-walk resolver returns
+  `None` when it can bind no implementation, which falls through to handler resolution, so: `404
+  handler_not_found`. Measured: **`501 unsupported_operation`.** (The site's own log line says
+  *"returning 501"* and returns `None`, so the comment was closer to the wire answer than my
+  reading of the code was, for the wrong reason.)
+  **Half two, and this is the part worth carrying.** The `501` is **not a decision about the
+  bodyless handler**. Resolution falls through to the wildcard `*` handler a default peer
+  registers, and *that* handler answers `501 unsupported_operation` because `ping` is not an
+  operation **it** implements. Driven on a peer built without the `*` fallback, the identical
+  input answers `404`. **So the code is a property of the deployment's handler table, not of the
+  request** — and reporting it as py's answer, into a three-way comparison of spellings, would
+  have contributed a number with no opinion behind it and let the ruling read it as one.
+  **Why the standing laws do not cover this.** *"Verify with pytest, not inline scripts"* is about
+  facts in our own tree; *"a routed report's claims about our repo are hearsay"* is about claims
+  someone else makes. This is the inverse: **a claim WE make about ourselves, into someone else's
+  ruling**, where the normal forcing function is absent in both directions — nothing fails if the
+  answer is wrong, and nothing fails if the answer is meaningless.
+  **The two checks, in order:**
+  1. **Answer a poll with an assertion, not a paragraph.** A row that pins the measured pair is
+     reproducible, survives a later refactor changing it, and costs one test.
+  2. **Then ask whether a peer configured differently answers differently.** If yes, you have a
+     coincidence of your handler table and you must say so — that fact is *more* useful to the
+     ruling than the code is, because it says the row cannot be a conformance row until the
+     code is pinned. Here it also supplied an argument *from the spec*: `501` asserts *this peer
+     does not implement that operation* while the manifest in the tree says it does, and §6.6
+     makes the tree the resolution surface — so a caller who reads then dispatches gets two
+     contradicting answers. That is go's conclusion, reached from a different defect, which is
+     worth more to arch than a third spelling.
+  Enforcement point: `tests/integration/test_registered_handler_with_no_body.py` — the measured
+  pair, and `test_the_answer_comes_from_the_wildcard_fallback_not_from_a_decision`, which builds
+  a peer without the `*` handler and asserts the answer **changes**.
 
 - **A filing posed as "which of these two readings" asserts that they are alternatives — check
   whether they are at different LAYERS before you make arch choose.** *Candidate, 2026-09-06 —

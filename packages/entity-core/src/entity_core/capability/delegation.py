@@ -1029,9 +1029,12 @@ def is_attenuated(
     Args:
         child: The child capability entity.
         parent: The parent capability entity.
-        local_peer_id: Local peer ID — used for handler/operation/peers
-            canonicalization (no §PR-8 there) and as the resource-frame
-            fallback when granter peer_ids are not supplied.
+        local_peer_id: Local peer ID — the canonicalization frame for the
+            **handlers** dimension (no §PR-8 there), the value the absent
+            `peers` scope defaults to on both sides (§5.5a), and the
+            resource-frame fallback when granter peer_ids are not supplied.
+            It is **not** a frame for `operations` or `peers`: both are
+            id-scope and canonicalizing them is the 0.8.2.16 defect.
         child_granter_peer_id: Peer ID whose namespace the child cap's
             peer-relative resource patterns canonicalize against (§PR-8).
             Defaults to `local_peer_id`.
@@ -1137,9 +1140,31 @@ def grant_subset(
     - Child handlers are subset of parent handlers
     - Child operations are subset of parent operations
     - Child resources are covered by parent resources
+    - Child peers are covered by parent peers (0.8.2.16 — see below)
     - Child inherits THIS parent grant's excludes (per scope)
 
     V6.0: Updated to handle CapabilityScope structure.
+
+    .. rubric:: 0.8.2.16 — this function dispatches on scope type
+
+    §5.5a's ``scope_subset`` matches **by the dimension's §3.6 scope type**,
+    exactly as §5.2's ``matches_scope`` does and for the same reason. Both
+    normative code blocks canonicalized unconditionally until 0.8.2.16, and
+    this implementation followed the pseudocode it was written from — the
+    comment on the operations branch below used to cite §5.4 as authority for
+    matching operations with the *path* matcher. That is the F40 defect, and
+    on the delegation path it widens authority **down a chain nobody
+    re-checks**: ``operations: {include: ["/*/*"]}`` is a universal wildcard
+    to the path matcher and a literal that matches nothing to the id matcher,
+    so a child operation the parent never granted was judged covered.
+
+    ``peers`` was not checked here **at all**, in any dimension — a child
+    grant could widen its peer scope past its parent's without refusal. That
+    was latent while nothing enforced Dimension 4 on the outbound path and
+    became reachable the moment 0.8.2.17's check landed. Reported
+    independently by ``entity-core-go`` in their own ``grantCovers``; both
+    findings are in both trees, which is what makes them a class rather than
+    a bug.
 
     Args:
         child_grant: The child grant.
@@ -1168,12 +1193,15 @@ def grant_subset(
     if not scope_includes_subset(child_handlers.include, parent_handlers.include):
         return False
 
-    # Operations: per V7 §3.6 line 836 + §5.4 line 1868 + §5.6 scope_subset,
-    # operations follow the SAME pattern-matching rule as handlers and
-    # resources. `operations: ["*"]` parent covers any narrower child.
-    # (Earlier code used `set.issubset` here, which treated `*` literally
-    # — a bug per V7. Fixed in PROPOSAL-ROLE-V1.5-SPEC-FIXES SI-24.)
-    if not scope_includes_subset(child_operations.include, parent_operations.include):
+    # Operations: `system/capability/id-scope` (§3.6), so the includes are
+    # covered by the **literal** grammar — bare `*`, trailing `/*` as a
+    # literal segment-prefix, otherwise string equality. `operations: ["*"]`
+    # still covers any narrower child, which is what the earlier `set.issubset`
+    # got wrong (SI-24); what the fix for *that* got wrong was reaching for the
+    # path matcher, which reads `/*/*` and `entity://…` as addresses.
+    if not id_scope_includes_subset(
+        child_operations.include, parent_operations.include,
+    ):
         return False
 
     # Resources: every child resource must be matched by some parent resource.
@@ -1222,10 +1250,31 @@ def grant_subset(
             ):
                 return False
 
-    # Operation excludes
+    # Operation excludes — id-scope, so NO canonicalization frame. This call
+    # used to pass `local_peer_id`, which turned an operation exclude into
+    # `/{local}/write` and then compared it against a bare `write`: the parent
+    # exclude read as un-inherited for every child that did inherit it, so a
+    # parent grant carrying operation excludes could not be delegated at all.
+    # Fail-closed, and still the literal defect §5.2 names — an id dimension
+    # canonicalized.
     if parent_operations.exclude:
         for parent_exclude in parent_operations.exclude:
-            if not scope_exclude_inherited(parent_exclude, child_operations, local_peer_id):
+            if not id_scope_exclude_inherited(parent_exclude, child_operations):
+                return False
+
+    # Peers: `system/capability/id-scope`, and absent means
+    # `{include: [local_peer_id]}` **on both sides** (§5.5a). This dimension
+    # was not checked here in any form before 0.8.2.16 — a child could name a
+    # peer scope its parent never held. Ordering: after the three dimensions
+    # above so a delegation that fails for a narrower reason still reports the
+    # narrower reason.
+    child_peers = _peers_scope_or_default(child_grant, local_peer_id)
+    parent_peers = _peers_scope_or_default(parent_grant, local_peer_id)
+    if not id_scope_includes_subset(child_peers.include, parent_peers.include):
+        return False
+    if parent_peers.exclude:
+        for parent_exclude in parent_peers.exclude:
+            if not id_scope_exclude_inherited(parent_exclude, child_peers):
                 return False
 
     # V7.14: Constraint attenuation — key retention + byte equality
@@ -1258,6 +1307,71 @@ def grant_subset(
             return False  # Value changed — deny by default (byte equality)
 
     return True
+
+
+def _peers_scope_or_default(
+    grant: dict[str, Any], local_peer_id: str,
+) -> CapabilityScope:
+    """§5.5a: ``grant.peers or {include: [local_peer_id]}``.
+
+    The default is constructed here rather than left absent because absent is
+    a **default, not a skip** (§5.2 Dimension 4) — and because a subset check
+    with no arm for the absent case is the shape that decides policy while
+    reading as a null guard.
+    """
+    peers = grant.get("peers")
+    if isinstance(peers, dict):
+        return CapabilityScope.from_dict(peers)
+    return CapabilityScope(include=[local_peer_id])
+
+
+def id_scope_pattern_covers(outer: str, inner: str) -> bool:
+    """§5.5a `pattern_covers`, the ``system/capability/id-scope`` arm.
+
+    Does `outer` authorize at least everything `inner` does? Same type split
+    as §5.2's `scope_value_matches`, applied to a pattern rather than a value:
+    bare ``*`` covers everything, a trailing ``/*`` covers by literal
+    segment-prefix, otherwise the two patterns must be identical.
+
+    Deliberately **not** :func:`pattern_covers` — that one reads ``/*/*`` as a
+    universal wildcard, rewrites an ``entity://`` prefix into a path, and
+    recurses through a ``/*/`` peer position. All three are §5.4 path
+    transforms, and all three over-grant when applied to an operation or a
+    peer id.
+    """
+    if outer == "*":
+        return True
+    if outer.endswith("/*"):
+        return inner.startswith(outer[:-1])
+    return inner == outer
+
+
+def id_scope_includes_subset(
+    child_includes: list[str], parent_includes: list[str],
+) -> bool:
+    """Every child include pattern is covered by some parent include pattern,
+    under the id-scope grammar (§5.5a `scope_subset`)."""
+    return all(
+        any(id_scope_pattern_covers(pp, cp) for pp in parent_includes)
+        for cp in child_includes
+    )
+
+
+def id_scope_exclude_inherited(
+    parent_exclude: str, child_scope: CapabilityScope,
+) -> bool:
+    """The child scope carries an exclude covering `parent_exclude` (§5.5a).
+
+    The id-scope twin of :func:`scope_exclude_inherited`, and it takes no
+    ``local_peer_id`` **on purpose**: there is no frame to canonicalize
+    against, and a parameter that exists can be passed.
+    """
+    if not child_scope.exclude:
+        return False
+    return any(
+        id_scope_pattern_covers(child_exclude, parent_exclude)
+        for child_exclude in child_scope.exclude
+    )
 
 
 def scope_includes_subset(child_includes: list[str], parent_includes: list[str]) -> bool:

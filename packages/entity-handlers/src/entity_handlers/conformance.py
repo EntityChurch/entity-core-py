@@ -166,11 +166,58 @@ class DispatchOutboundHandler:
                 400, "invalid_params",
                 "dispatch-outbound requires target and operation",
             )
-        if cap_raw is None or granter_raw is None or sig_raw is None:
+        presented = (cap_raw, granter_raw, sig_raw)
+        if all(x is None for x in presented):
+            # §1.4 PD-2's **ambient** arm, and the reason this is reachable at
+            # all: the negative arm of 0.8.2.17's conformance row is *"drive
+            # `system/validate/dispatch-outbound` at a foreign peer presenting
+            # no capability → MUST refuse"*, and a handler that refuses the
+            # request at param validation answers it for the wrong reason. A
+            # probe would see a refusal and could not attribute it to
+            # Dimension 4 — the same shape as a peer that refuses everything
+            # passing a refusal-only check.
+            #
+            # So the three in-band authority fields are optional **as a set**.
+            # Supplying them is unchanged (§7a.2a, ruled shape (a)); omitting
+            # all three originates on the handler's own grant, which is what
+            # the ambient arm is. Supplying some and not others stays a 400:
+            # a partial credential is a malformed request, not a decision to
+            # dispatch ambiently.
+            #
+            # This widens what the test handler accepts and nothing else — an
+            # ambient outbound dispatch is now *attempted* and the outbound
+            # check is what refuses it. Routed to the cohort so all three
+            # seats drive the same input rather than three different ones.
+            outbound_params = Entity(type="primitive/any", data=value).to_dict()
+            result = await ctx.execute(target, op, outbound_params)
+            if result.status == 403:
+                # Relayed, not wrapped. A blanket 502 here would make the
+                # negative arm unattributable a second time — one status for
+                # "Dimension 4 refused this" and for "there was no route",
+                # which are the two outcomes the arm exists to tell apart.
+                return _error(
+                    403, "capability_denied",
+                    "ambient outbound sub-dispatch refused before leaving the "
+                    f"peer (§1.4 PD-2): {result.error or ''}".strip(),
+                )
+            if not result.ok:
+                return _error(
+                    502, "reentry_dispatch_failed",
+                    "originate ambient EXECUTE: "
+                    f"status={result.status} {result.error or ''}".strip(),
+                )
+            inner = {"status": result.status, "result": result.result}
+            return {
+                "status": 200,
+                "result": Entity(type="primitive/any", data=inner).to_dict(),
+            }
+        if any(x is None for x in presented):
             return _error(
                 400, "invalid_params",
                 "dispatch-outbound requires reentry_capability + "
-                "reentry_granter + reentry_cap_signature in-band per §7a.2a",
+                "reentry_granter + reentry_cap_signature together, or none "
+                "of the three (§7a.2a; omitting all three originates on the "
+                "handler's own grant — §1.4 PD-2's ambient arm)",
             )
 
         # Re-canonicalize the three in-band authority entities: recompute each
