@@ -1493,6 +1493,35 @@ fails the gates rather than slipping past them.
   Enforcement point: `tests/integration/test_connect_error_table_4_7.py`, which drives all four
   unprobed rows plus the two probed ones, each as a `(status, code)` pair, and carries
   `TestTheRowsDoNotCollapse` for §4.7's actual MUST (which is about the table, not any row).
+  **Third instance, 2026-09-02, and the two new parts are *where* the unprobed arm lives and
+  *why* a second walk of a row you already walked is not redundant.** core-go routed one row
+  (`connect_ping_before_hello`: a pre-handshake `ping` answered `400 invalid_request` where
+  0.8.2.4 pins `409 connection_sequence_error`). Walking row 10 *again* — the same row this
+  entry's second instance had just walked — found the **mirror** defect: an unknown operation on
+  an **established** connection answered `409 connection_already_established`. One predicate
+  (*does the responder implement this operation*), two wire boundaries, classified by two
+  hand-rolled comparisons that disagreed in opposite directions. The two-representations law with
+  the **classifier** as the subject, and the fix is a set both call sites read
+  (`IMPLEMENTED_CONNECT_OPERATIONS`) plus a structural row that fails a seat which re-rolls one.
+  1. **A probe family's blind spot has a shape, and it is the seat the prober sits in.** A
+     conformance probe dials in, so *every* state it can reach cheaply is a pre-handshake state;
+     reaching the established side means completing a handshake first, which a probe author
+     writes as **setup**, not as a state under test. So *"in any state"* clauses are
+     systematically driven in one state, in every seat, and the arm nobody probes is not random —
+     it is the far side of the setup. rust and go both happen to hold this arm correctly (checked
+     first-hand, `connection.rs` `_ =>` and `execute.go`'s switch); **we were the only seat wrong,
+     and no cross-impl run in the cohort could have said so.**
+  2. **Walking a row once does not retire it — the *second* report on the same row is the cue to
+     re-walk, not to patch.** The instance above walked row 10 and fixed both of its named inputs;
+     this defect was live the whole time, in the same row, one state over. What changed was that
+     0.8.2.4 re-cut the row on a *predicate* rather than on a list of inputs, and a predicate is
+     what makes the unnamed cases enumerable. **When a ruling replaces a row's examples with a
+     rule, re-derive every input from the rule** — the examples are what your last walk covered.
+  Enforcement point: `TestTheSplitIsClassifiedByWhatWeImplement` in the same file — the routed
+  row, its mid-handshake sibling, the established-state arm, row 9 as teeth (undriven on the wire
+  until now), a control asserting we *serve* `ping` (the 409 is only conformant for a peer that
+  does — go's probe carries that caveat in prose and nothing asserted it), and the structural row
+  pinning both boundaries to one set. Four mutations, four correct predictions.
 
 - **A DRAFT ruling is a thing to build, not a thing to wait on — the fold ratifies what the
   seats built.** *Candidate, 2026-09-01. Cost: one pass of held work and a packet arguing for
@@ -1515,6 +1544,100 @@ fails the gates rather than slipping past them.
   semantic is not *"discriminating on an unruled semantic"* — the standing rule is about
   **unruled**, and we cited it at a row arch had ruled. The check was correct and our FAIL was
   ours.
+
+- **A default argument is a wire decision with no call site to review it.** ***RATIFIED
+  2026-09-02*** *— the `entity-core/7.0` law (a constant we chose, on a wire surface, that no
+  local test can see) in a third shape, with an **error code** as the constant and a **default
+  parameter** as its hiding place. Found by walking §3.3's code SET after core-go walked the
+  §4.7 row set.* `ExecuteResponse.bad_request(..., code: str = "bad_request")` and
+  `ConnectError(..., code: str = "bad_request")`. **`bad_request` is in no spec code set** —
+  §3.3's 400 row declares *"Default `code` = `invalid_request`"* (landed at the 0.8.2.2 PD-1
+  fold) and 0.8.2.4 adds *"MUST NOT mint a synonym"*; the string appears in the corpus once, at
+  §5.1's M3 rule, as the thing you must **not** surface. Twelve kernel sites inherited it.
+  **The mechanism, and it is the whole entry.** The *same peer* emits the correct
+  `invalid_params` from ~80 handler-tier sites and the synonym from 12 kernel sites — and the
+  difference is not care, it is that the handler sites **state** their code and the kernel sites
+  **inherit** one. A default is invisible to exactly the review that reads call sites: every
+  call site is correct-looking, because the wrong value is not written at any of them. Same
+  family as *"a binary operator with no arm for the absent case is a policy decision wearing a
+  type guard"*, one construct over — there the ruling hid in an `if`, here in an `=`.
+  **Three things made it survive a suite that names it.** (1) Six test files *mention*
+  `bad_request`; **none asserted our emission of it** — our constant on both sides, the version
+  string's exact configuration. (2) The §4.7 table file's own docstring states the default
+  accurately, **one session earlier**, while fixing the rows a probe named: *a probe family
+  names rows, and nobody was assigned the default.* (3) It is a **code**, not a status, so every
+  refusal still refused — nothing observable was ever wrong for a caller who did not read the
+  code, which is every caller in our own tests.
+  **The checks, in the order they are cheap:**
+  1. **Grep your defaults for wire values.** Any `= "…"` in a constructor signature that reaches
+     `result.data.code`, a type name, a format byte, or a protocol string is a spec value with
+     no reviewer. Pin it against the **spec's declared literal**, never against what you emit.
+  2. **When a sibling's report makes you re-read a spec section, read the paragraphs around the
+     rows, not just the rows.** The sentence that produced this finding sits directly under the
+     §4.7 table and is about the *code set*, not about any row — so a reader who arrives via a
+     row-numbered relay scrolls past it. The row-walk rule (*walk every row when N are reported*)
+     has a set-walk sibling: **walk the enumeration the rows draw from.**
+  Enforcement point: `tests/integration/test_generic_400_code_is_invalid_request.py` — the wire
+  pair for a codeless refusal, a spread row that fails a peer which special-cases one raise,
+  both constructor defaults pinned against §3.3's text, and an **AST ratchet at zero** on the
+  literal. *The gate corrected its author on its first run* (the standing "a gate's first act
+  should be able to correct its author" shape, fourth instance): it found `peer.py`'s
+  `getattr(e, "code", "bad_request")` — a fallback on an exception that always carries a code,
+  invisible to the read that fixed the constructor — and one site that is **not** ours to fix,
+  `EXTENSION-SIGNALING` §9.2's closed enum, which pins `bad_request` for the same class core
+  §4.7 forbids a synonym for. Filed as SA-PY-33 rather than changed: core-go carries the
+  identical string at the matching site, so it is the corpus disagreeing with itself.
+  **And one place the value must NOT become the right code:** `connect_refusal` reports what the
+  **remote** said, so filling an absent code with the plausible generic would fabricate a claim
+  about a peer that made none. It carries `""`. *A default is a decision; the correct decision
+  is not always the correct value.*
+
+- **A cohort-consistency argument is only as good as the census behind it — and the generated
+  family is the one a ground-up seat forgets it is in a cohort with.** *Candidate, 2026-09-02 —
+  SA-PY-31 ruled against the arm we shipped.* §4.5 left the absent/empty `protocols` arm
+  undefined; we picked reading 1 (unconstrained), **matching `entity-core-go` byte for byte**,
+  and filed rather than settling — on the stated ground that *"a responder that refuses where
+  its sibling accepts partitions the cohort, and inventing that out of a gap is the error this
+  repo exists to find."* That reasoning is sound and the ruling went the other way, because
+  **the cohort is not the ground-up seats**: keystone's generated `csharp` and `typescript`
+  peers already **required** the field, so reading 1 would have made 46 peers non-conformant.
+  We polled two of three families and called it the cohort.
+  **And reading the third family first-hand — rather than through the relay that named it —
+  found the second half.** The ruling's L16 cites those peers as *"already require the field
+  and pass conformance."* Measured in `entity-core-keystone` (`ConnectHandler.cs:70`,
+  `connect-handler.ts:80`, both `Ecf.require` → `EntityProtocolException(status=400)`):
+  - **absent** → the exception is caught at the dispatcher's handler boundary and answered
+    **`400 handler_error`** — a refusal, but not the ruled pair, and `handler_error` is in no
+    §3.3 code set (their `request_error` / `internal_error` are the same class — SA-PY-33's
+    shape at the conformance anchor).
+  - **empty list** → passes `require`, fails the membership test, and answers **`400
+    incompatible_protocol`** — **reading 3**, which 0.8.2.4 explicitly forecloses (*"row 1 is
+    reserved for a non-empty set"*).
+  So the peers the ruling cites as its evidence **do not implement the ruling**, on the arm the
+  ruling names in its own sentence (*"no `protocols` field, **or an empty list**"*). The
+  citation is right about the direction and wrong about the pair. **A ruling's justification is
+  a claim about a peer, and it stays a claim when the peer is a third party's** — the standing
+  law with the subject moved one seat over. Routed; `connect_absent_protocols` will FAIL against
+  a keystone peer, and the tempting read of that FAIL is *"the check is wrong"*, because
+  keystone is the conformance anchor.
+  **Why the generated family is the one that gets dropped:** it has no `AGENTS.md`, files no
+  SAs, routes nothing, and is invisible to the `git log`/`grep` sweep we run across
+  `entity-core-{go,rust}` — the whole habit of *"read the source, not memory"* is pointed at the
+  trees that talk back. It is nonetheless conformance-passing peers on the wire, and 46 of them.
+  **This is the standing *"the conjunction of two readings bounds the disagreement, not the
+  error"* law with a census as the subject** — both seats can be wrong in the same direction, and
+  a cohort-consistency argument inherits that shared error *and dresses it as evidence*.
+  **The check, and it is one grep in a tree we do not usually open:** before arguing "changing
+  this partitions the cohort," grep `entity-core-keystone` for the field. If a generated peer
+  already implements the arm you are declining to implement, your partition argument is
+  backwards — **you are the partition.**
+  **What this does NOT retract:** filing rather than inventing was still right, and our
+  *argument* is what carried the ruling (arch adopted the remedy-selection reasoning verbatim).
+  The defect was in the fallback, not the filing. Enforcement point:
+  `test_connect_protocols_intersection_4_5.py::TestTheAbsentArmIsARuling`, whose retirement
+  condition fired **as written** and which flipped rather than being deleted — the second
+  recorded instance of a deferral's forward half executing, and the reason nobody had to
+  re-litigate whether the arm was ever going to move.
 
 - **A field with no consumer *anywhere in the cohort* is not a converged field — it is an
   unmeasured one, and the first seat to implement it creates the divergence rather than

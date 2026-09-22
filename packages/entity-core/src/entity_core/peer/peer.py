@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.connect import (
     CONNECT_URI,
+    IMPLEMENTED_CONNECT_OPERATIONS,
     ConnectError,
     ConnectState,
     handle_connect_hello,
@@ -2570,6 +2571,21 @@ class Peer:
         # shim to tolerate both forms.
         params = data.get("params", {})
 
+        # V7 §4.7 row 10 (0.8.2.4) — "an operation name the responder does not
+        # implement, **in any state**" is `400 invalid_request`. State-
+        # independent, so it is classified before any phase is read: the
+        # alternative is a peer that answers `invalid_request` for `frobnicate`
+        # pre-hello and `connection_already_established` for the same frame one
+        # round-trip later, which is two rows for one input.
+        if operation not in IMPLEMENTED_CONNECT_OPERATIONS:
+            response = ExecuteResponse.bad_request(
+                request_id=request_id,
+                message=f"Unknown connect operation: {operation}",
+                code="invalid_request",
+            )
+            await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
+            return
+
         if conn_state.connect.is_complete:
             if operation == "authenticate":
                 # V7 §4.6 Hardening / 0.8.1 RT-6 — same single-use-nonce
@@ -2817,38 +2833,38 @@ class Peer:
                 )
 
             else:
-                # V7 §4.7 row 10 — the LANDED row names two inputs, "a second
-                # `hello` after `hello_done`, **or an unknown connect
-                # operation**", and gives both one code and one status. That
-                # single pair is what the ruling below undid. The sibling input
-                # (the state conflict) is raised in `handle_connect_hello`;
-                # this is the unknown-operation one, which answered a generic
-                # `bad_request` — in no §4.7 row — until G-28.
+                # V7 §4.7's out-of-order row — an operation this responder
+                # IMPLEMENTS, arriving in a state that forbids it, is `409
+                # connection_sequence_error`. Reaching this arm means exactly
+                # that: the unknown-operation row was answered at the top of
+                # this method (state-independently), and `hello` /
+                # `authenticate` are handled above, so the only member of
+                # `IMPLEMENTED_CONNECT_OPERATIONS` that lands here is a
+                # pre-handshake `ping` — §5.1 keepalive, which this peer serves
+                # on an ESTABLISHED connection (`_handle_execute`) and which is
+                # gated the inverse way from the handshake ops.
                 #
-                # arch ruled 2026-09-01 (FM-2 Edit D) that the row is TWO
-                # failures, and this input — an operation name that exists in
-                # no state — is `400 invalid_request`. Nothing is out of order;
-                # telling a client its ORDERING was wrong when its NAME was
-                # wrong misdirects the remedy, which is the contract §4.7 exists
-                # to provide. The sequence half (a re-hello) is the other input
-                # and is `409 connection_sequence_error`, raised in
-                # `handlers/connect.py`.
+                # This arm previously did not exist: the unknown-operation
+                # branch stood here, so a pre-hello ping answered `400
+                # invalid_request` — the row for an operation we do not
+                # implement, which is false of ping and misdirects the remedy
+                # exactly as row 10's split says. Measured by `entity-core-go`'s
+                # `connect_ping_before_hello` (routed 2026-09-02-e); go answered
+                # `403 connection_required`, a code in no spec, and rust the
+                # ruled 409.
                 #
-                # Landed ahead of the FM-2 fold, matching `entity-core-go` and
-                # `entity-core-rust`, so all three seats are on the ruled
-                # behaviour before it is ratified rather than after. Edit D also
-                # declares `invalid_request` at core level (it closes PD-1g);
-                # until that lands, the code we emit here is one §3.3 already
-                # names as the generic 400 — so this is not a code nobody
-                # declares, it is the declared generic reaching a row that will
-                # name it explicitly.
-                #
-                # If the fold moves this, it moves for the cohort at once and
-                # `connect_unknown_operation` is the gate that says so.
-                response = ExecuteResponse.bad_request(
+                # Written as a fall-through on the SET rather than `operation ==
+                # "ping"`, so a connect operation added later is classified by
+                # its membership — the two boundaries diverging on which
+                # operations exist is what produced this bug.
+                response = ExecuteResponse.conflict(
                     request_id=request_id,
-                    message=f"Unknown connect operation: {operation}",
-                    code="invalid_request",
+                    message=(
+                        f"connection_sequence_error: {operation} requires an "
+                        f"established connection (phase "
+                        f"{conn_state.connect.phase})"
+                    ),
+                    code="connection_sequence_error",
                 )
                 await send_envelope(
                     writer, Envelope(root=response.to_entity())
@@ -2870,7 +2886,7 @@ class Peer:
             # another status says so at the raise, where the failure mode is
             # known — deriving it here from the code would put the §4.7 table
             # in two places.
-            code = getattr(e, "code", "bad_request")
+            code = getattr(e, "code", "invalid_request")
             status = getattr(e, "status", None) or 400
             if status == 401:
                 response = ExecuteResponse.unauthorized(
@@ -3636,6 +3652,11 @@ class Peer:
             response = ExecuteResponse.bad_request(
                 request_id=request_id,
                 message=f"Invalid path: {validation_error}",
+                # §3.3 names `invalid_path` in its 400 set "where one applies",
+                # and this is where. `entity-core-go` emits it at the same seam
+                # (`core/protocol/execute.go`, `core/tree/handler.go`); we
+                # emitted the generic here only because we never stated a code.
+                code="invalid_path",
             )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
             return
@@ -3694,6 +3715,25 @@ class Peer:
         # of any granted resource. Everything else on the connect path is
         # rejected after connect is complete.
         if path == CONNECT_URI:
+            # V7 §4.7 row 10 (0.8.2.4) — "in any state", and this is the other
+            # state. An operation name this peer does not implement is `400
+            # invalid_request` here exactly as it is pre-handshake; it fell
+            # through to `connection_already_established` below, which says the
+            # frame was refused for the connection's STATE when the defect is
+            # its NAME — the misdirected remedy the row split exists to stop,
+            # arriving on the established side where no probe drove it. The
+            # classifier is the same set the pre-connect boundary reads, so the
+            # two cannot disagree about which operations exist.
+            if operation not in IMPLEMENTED_CONNECT_OPERATIONS:
+                response = ExecuteResponse.bad_request(
+                    request_id=request_id,
+                    message=f"Unknown connect operation: {operation}",
+                    code="invalid_request",
+                )
+                await self._send_locked(
+                    writer, conn_state, Envelope(root=response.to_entity())
+                )
+                return
             if operation == "ping":
                 payload = params.get("data", params) if isinstance(params, dict) else {}
                 pong = {
@@ -3724,6 +3764,8 @@ class Peer:
                 )
                 await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
                 return
+            # §4.7 row 9 — the only implemented operation left is `hello`, and a
+            # hello on an established connection is the row-9 state conflict.
             response = ExecuteResponse.conflict(
                 request_id=request_id,
                 message="Connect already complete",
@@ -4018,6 +4060,7 @@ class Peer:
                         response = ExecuteResponse.bad_request(
                             request_id=request_id,
                             message=f"Invalid resource target: {target_error}",
+                            code="invalid_path",  # §3.3 — same seam, same code.
                         )
                         await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
                         return
@@ -4057,7 +4100,12 @@ class Peer:
             # Validate deliver_token is required with deliver_to
             if deliver_token is None:
                 logger.warning("[dispatch] deliver_to without deliver_token")
-                logger.debug("[dispatch] -> response status=400 code=missing_deliver_token")
+                # The log named `missing_deliver_token` and the wire carried the
+                # generic code — a debug line stating a `(status, code)` pair the
+                # response does not have is the first thing a cross-impl debug
+                # reads, and no spec names that code. §3.3: an extension-surface
+                # structural refusal is the generic `invalid_request`.
+                logger.debug("[dispatch] -> response status=400 code=invalid_request")
                 response = ExecuteResponse.bad_request(
                     request_id=request_id,
                     message="deliver_to requires deliver_token",
@@ -4070,7 +4118,7 @@ class Peer:
             token_entity = self.content_store.get(deliver_token)
             if token_entity is None:
                 logger.warning("[dispatch] deliver_token not found in content store")
-                logger.debug("[dispatch] -> response status=400 code=invalid_deliver_token")
+                logger.debug("[dispatch] -> response status=400 code=invalid_request")
                 response = ExecuteResponse.bad_request(
                     request_id=request_id,
                     message="deliver_token not found",
@@ -4612,6 +4660,10 @@ class Peer:
             return ExecuteResponse.bad_request(
                 request_id=request_id,
                 message="Missing entity in params",
+                # §3.3's `invalid_params` — a required params field is absent,
+                # which is what that code names. go answers it at the matching
+                # seam (`execute.go`, "params entity missing type field").
+                code="invalid_params",
             )
 
         entity = Entity.from_dict(entity_data)

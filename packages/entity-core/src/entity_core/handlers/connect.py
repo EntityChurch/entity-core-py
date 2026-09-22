@@ -60,6 +60,29 @@ logger = logging.getLogger(__name__)
 
 CONNECT_URI = "system/protocol/connect"
 
+#: The connect-URI operations **this responder implements**, in any state.
+#:
+#: V7 §4.7 (0.8.2.4) splits what used to be one row on exactly this predicate:
+#: *"an operation the responder implements, arriving in a forbidden state,
+#: emits **409 `connection_sequence_error`**; an operation it does not
+#: implement emits **400 `invalid_request`**"* — and the unknown-operation row
+#: says **"in any state"**, so membership here, not the connection's phase, is
+#: what picks the row. §4.6 step 1 / §4.7 row 6 carve the pre-hello
+#: ``authenticate`` out of the 409 side and pin it to ``401 invalid_nonce``;
+#: that carve-out lives at the raise in :func:`handle_connect_authenticate`,
+#: not here, because it is a rule about one input rather than about the set.
+#:
+#: **This is a set, not a chain of ``==`` comparisons, because the two wire
+#: boundaries were classifying by different means.** ``ping`` is served
+#: post-connect in ``_handle_execute`` and was unnamed in ``_handle_connect``,
+#: so a pre-hello ping fell through to the unknown-operation arm and answered
+#: ``400 invalid_request`` — the row for an operation this peer *does*
+#: implement (`entity-core-go`'s ``connect_ping_before_hello``, routed
+#: 2026-09-02; go had the same defect wearing a different costume, ``403
+#: connection_required``, a code in no spec). The next operation added to the
+#: connect surface is classified by adding it here, once.
+IMPLEMENTED_CONNECT_OPERATIONS = frozenset({"hello", "authenticate", "ping"})
+
 #: V7 §8.4 *Protocol Version* — the wire identifier advertised in a hello's
 #: ``protocols`` and echoed by the responder. §4.5 negotiates it as
 #: *"Intersection, must be non-empty"*, so it is the one hello field whose
@@ -128,10 +151,13 @@ class ConnectError(Exception):
     """Connect handshake failed.
 
     ``code`` is the V7 §4.7 wire response code (defaults to
-    ``"bad_request"``); call sites set it to a more specific value
-    (e.g. ``"unsupported_key_type"``) so the wire-boundary handler
-    in ``peer.py`` emits the canonical error code rather than
-    collapsing every connect failure to ``bad_request``.
+    ``"invalid_request"``, §3.3's declared generic 400 and the code
+    0.8.2.4 names for a malformed connect request); call sites set it
+    to a more specific value (e.g. ``"unsupported_key_type"``) so the
+    wire-boundary handler in ``peer.py`` emits the canonical error code
+    rather than collapsing every connect failure to the generic one.
+    The default was ``"bad_request"`` — a synonym no spec code set
+    contains — until 2026-09-02; see ``ExecuteResponse.bad_request``.
 
     **Both directions carry the code.** Responder-side that was fixed once
     already (the cohort sweep caught Python answering a generic
@@ -154,7 +180,7 @@ class ConnectError(Exception):
     """
 
     def __init__(
-        self, message: str, *, code: str = "bad_request", status: int | None = None
+        self, message: str, *, code: str = "invalid_request", status: int | None = None
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -170,7 +196,13 @@ def connect_refusal(prefix: str, response: "ExecuteResponse") -> ConnectError:
     the remote's ``code`` and ``status`` land on the exception AND in its
     message, so an assertion can reach either.
     """
-    code = "bad_request"
+    # The fallback is deliberately NOT a wire code. This value reports what the
+    # *remote* said, so filling an absent `code` with a plausible one (the
+    # generic `invalid_request`, say) would have this extractor fabricate a
+    # claim about a peer that made none — and a non-conformant peer answering a
+    # coded status with no code is exactly the case worth being able to see.
+    # It was `"bad_request"`, which read as a code and is not one.
+    code = ""
     message = ""
     if isinstance(response.result, dict):
         data = response.result.get("data")
@@ -302,26 +334,47 @@ def handle_connect_hello(
     # FM-2's Edit B leaves the row itself untouched. Nothing here is downstream
     # of the draft.
     #
-    # **The absent case is a ruling, not a null check** — the standing law that
-    # a binary operator with no arm for the absent case is a policy decision
-    # wearing a type guard. §4.5 marks `protocols` Required: Yes, so a hello
-    # omitting it is arguably malformed; we nevertheless treat an omitted or
-    # empty list as UNCONSTRAINED and refuse only a NON-EMPTY disjoint set.
-    # Two reasons, and neither is "it reads more naturally":
-    #   1. `entity-core-go` chose the same arm. A responder that refuses an
-    #      omitted list while its sibling accepts one is a divergence we would
-    #      be manufacturing out of a gap, on a surface where a divergence is a
-    #      refused connection rather than a wrong field.
-    #   2. §4.7 row 1's failure is "incompatible protocol VERSIONS" — a
-    #      statement about two sets, which an absent set does not make. A hello
-    #      with no `protocols` is a *missing required field*, which is a
-    #      different (and unruled) refusal; collapsing it into this row would
-    #      answer `incompatible_protocol` for a peer that named no version at
-    #      all.
-    # Filed as SA-PY-31 rather than settled here, because the two readings
-    # diverge across a peer boundary the moment any seat picks the other arm.
+    # **The absent case is RULED, and it went the other way from what we
+    # shipped (0.8.2.4, §4.5 + §4.7; SA-PY-31 closed).** We shipped reading 1 —
+    # an omitted or empty list is UNCONSTRAINED — matching `entity-core-go`,
+    # and filed the gap rather than settling it, because on this surface a
+    # divergence is a *refused connection* and two seats declining to widen it
+    # is not the same as agreement.
+    #
+    # §4.5 now carries the arm in normative text: `protocols` is Required with
+    # **no default**, so unlike `hash_formats` and `key_types` there is no floor
+    # to fall back to, and "a hello carrying no `protocols` field, or an empty
+    # list, MUST be rejected with `400 invalid_request`". §4.7's row 1 was
+    # narrowed in the same fold to a **non-empty** disjoint set.
+    #
+    # Our filing's own argument is what carried it and it is worth keeping,
+    # because it is the half a reader can re-derive: `incompatible_protocol`
+    # says *"we compared and share nothing"*, which cannot be said to a caller
+    # that named no version — the remedies differ (send the field vs. change the
+    # version) and §4.7 exists so the code selects the remedy. That is arch's
+    # row-10 split applied one row up. What the filing got wrong was the
+    # *fallback*: we reasoned from the two ground-up seats and reading 1 was
+    # never the cohort position — keystone's `csharp` and `typescript` peers
+    # already required the field and passed conformance, so reading 1 would have
+    # made 46 generated peers non-conformant.
+    #
+    # Ordered AFTER the key_type gate and BEFORE the intersection, matching
+    # `entity-core-go`: the empty set is refused as malformed before anything
+    # tries to compare it, so `incompatible_protocol` can only ever be answered
+    # about a comparison that actually happened.
+    #
+    # Absent and empty are ONE input here by ruling ("no `protocols` field, or
+    # an empty list") — the `or []` fold that used to be a silent second ruling
+    # is now the ruled shape. Both arms keep their own row in the tests.
     initiator_protocols = params_data.get("protocols") or []
-    if initiator_protocols and not (set(initiator_protocols) & set(ADVERTISED_PROTOCOLS)):
+    if not initiator_protocols:
+        raise ConnectError(
+            "protocols is required and MUST be non-empty (§4.5): a hello that "
+            "names no protocol version is a malformed request, not a version "
+            "incompatibility",
+            code="invalid_request",
+        )
+    if not (set(initiator_protocols) & set(ADVERTISED_PROTOCOLS)):
         raise ConnectError(
             f"no common protocol version: initiator {initiator_protocols}, "
             f"responder {ADVERTISED_PROTOCOLS}",

@@ -32,10 +32,16 @@ half-fix FM-1 already documented (`400 invalid_nonce`, a pair in no row).
 that a peer answering "401 authentication_failed for anything that fails after
 hello" would score green on individually.
 
-Row 10's **status** is contested and is asserted at the table's 400 with that
-stated: go emits 409 (spec-issue `2026-09-01-b` asks which is authoritative)
-and only the status is in question — the code is uncontested and was wrong
-here. If arch rules 409, this row moves; nothing else in the file does.
+Row 10's status was contested when this file was written and is now **ruled**
+(0.8.2.4, folding FM-2 Edit D): the row is two failures, a state conflict at
+`409 connection_sequence_error` and an unknown operation at `400
+invalid_request`, and the discriminator is *does the responder implement this
+operation*. `TestTheSplitIsClassifiedByWhatWeImplement` is that predicate
+driven at both wire boundaries — the second pass over the same row, which
+found a pre-handshake `ping` on the unknown-operation arm (routed) and an
+established-connection unknown operation on the state-conflict arm (nobody's
+probe reaches it). **A row is not closed by fixing the input a report names**;
+the same read, one paragraph wider, is where the unnamed arms are.
 """
 
 from __future__ import annotations
@@ -208,6 +214,41 @@ async def _authenticate_after_hello(
 
 def _pair(response: ExecuteResponse) -> tuple[int, str]:
     return int(response.status), response.result["data"]["code"]
+
+
+def _connect_execute(peer_id: str, operation: str, request_id: str) -> Execute:
+    """A well-formed connect-URI EXECUTE for an arbitrary operation.
+
+    `params` is a `ping` body throughout: §5.3's `timestamp`/`sequence` are what
+    the keepalive rows need, and for the unknown-operation rows the body is
+    irrelevant by construction — row 10 keys on the NAME, so a frame that could
+    be faulted for its params instead would not attribute.
+    """
+    return Execute(
+        request_id=request_id,
+        uri=f"entity://{peer_id}/{CONNECT_URI_PATH}",
+        operation=operation,
+        params=Entity(
+            type="system/network/ping",
+            data={"timestamp": 1, "sequence": 1},
+        ).to_dict(),
+    )
+
+
+async def _established(keypair: Keypair) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """A completed handshake, socket left open, so the rows below can drive
+    connect operations in the ESTABLISHED state — the second of the two states
+    §4.7 row 10 says it covers."""
+    reader, writer, issued = await _hello_and_nonce(keypair.peer_id)
+    execute, included = _authenticate_frames(keypair, issued)
+    await send_envelope(
+        writer, Envelope(root=execute.to_entity(), included=included)
+    )
+    response = ExecuteResponse.from_entity((await recv_envelope(reader)).root)
+    assert int(response.status) == 200, (
+        f"the handshake these rows stand on did not complete: {_pair(response)}"
+    )
+    return reader, writer
 
 
 # --------------------------------------------------------------------------
@@ -522,3 +563,204 @@ class TestTheRowsDoNotCollapse:
         finally:
             conn.close()
             await conn.wait_closed()
+
+
+# --------------------------------------------------------------------------
+# The row-10 split, applied to the operation this peer implements and to the
+# state nobody drove
+# --------------------------------------------------------------------------
+
+
+class TestTheSplitIsClassifiedByWhatWeImplement:
+    """0.8.2.4 settles both halves of row 10 on ONE predicate — *does the
+    responder implement this operation* — and this peer read it two different
+    ways at its two wire boundaries.
+
+    * `_handle_connect` (pre-established) knew `hello` and `authenticate` and
+      called everything else unknown, so a **pre-handshake `ping`** answered
+      `400 invalid_request` — the row for an operation we do not implement,
+      about the one operation `_handle_execute` serves on this URI. Routed by
+      `entity-core-go` as `connect_ping_before_hello` (ROUTING-2026-09-02-e),
+      where the same defect wore a different costume: `403
+      connection_required`, a code in no spec.
+    * `_handle_execute` (established) knew `ping` and `authenticate` and called
+      everything else a **state conflict**, so `frobnicate` on a live
+      connection answered `409 connection_already_established` — the mirror
+      error, and the arm row 10's *"in any state"* clause exists for. **No
+      probe drives it**, in any seat: go's `connect_unknown_operation` sends
+      pre-hello. Found by walking the row rather than the report.
+
+    Both boundaries now classify on `IMPLEMENTED_CONNECT_OPERATIONS`, which is
+    why these two rows sit together: they are one finding.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_ping_before_hello_is_409_connection_sequence_error(
+        self, server_peer: Peer
+    ):
+        """The routed row. `ping` is §5.1 keepalive — an operation this peer
+        implements, gated the inverse way from the handshake ops (it rides an
+        established connection), so pre-handshake it is a STATE conflict."""
+        response = await _drive(
+            None, (_connect_execute(server_peer.peer_id, "ping", "ping-prehello"), [])
+        )
+        assert _pair(response) == (409, "connection_sequence_error"), (
+            f"a pre-handshake ping answered {_pair(response)}; §4.7's "
+            f"out-of-order row pins (409, 'connection_sequence_error') for an "
+            f"operation the responder IMPLEMENTS arriving in a forbidden state"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_ping_mid_handshake_is_the_same_row(self, server_peer: Peer):
+        """The arm the probe does not drive: after hello, before authenticate.
+
+        §4.7's row is about the state forbidding the operation, not about which
+        forbidden state it is — a peer that special-cased the `awaiting_hello`
+        phase and left `awaiting_authenticate` on the unknown-operation arm
+        would pass the routed row and still answer two codes for one row.
+        """
+        keypair = Keypair.generate()
+        response = await _drive(
+            _hello_execute(keypair.peer_id, os.urandom(32)),
+            (_connect_execute(server_peer.peer_id, "ping", "ping-midhandshake"), []),
+        )
+        assert _pair(response) == (409, "connection_sequence_error"), (
+            f"a ping between hello and authenticate answered {_pair(response)}; "
+            f"both pre-handshake phases forbid it and both are the same row"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_peer_actually_serves_ping_once_established(
+        self, server_peer: Peer
+    ):
+        """The control that makes the two rows above attributable, and it is
+        load-bearing rather than decorative.
+
+        409-vs-400 here is decided entirely by whether this peer implements
+        `ping`: for a peer that does not, `400 invalid_request` is the
+        *conformant* answer and the rows above assert non-conformance. go's
+        probe carries the same caveat in prose; this asserts it. If §5.1
+        keepalive is ever removed from this peer, this row fails first and says
+        so, instead of the two above quietly asserting the wrong pair.
+        """
+        keypair = Keypair.generate()
+        reader, writer = await _established(keypair)
+        try:
+            await send_envelope(
+                writer,
+                Envelope(
+                    root=_connect_execute(
+                        server_peer.peer_id, "ping", "ping-established"
+                    ).to_entity()
+                ),
+            )
+            response = ExecuteResponse.from_entity((await recv_envelope(reader)).root)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        assert int(response.status) == 200, (
+            f"ping on an established connection answered "
+            f"{int(response.status)}; the 409 rows above are only correct for a "
+            f"peer that implements §5.1 keepalive"
+        )
+        assert response.result["type"] == "system/network/pong", (
+            f"ping answered 200 with result type {response.result['type']!r} — "
+            f"the rows above rest on this being a served operation, not on a "
+            f"200 from somewhere else"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_operation_on_an_established_connection_is_400(
+        self, server_peer: Peer
+    ):
+        """Row 10's *"in any state"* clause, on the state no probe reaches.
+
+        This peer answered `409 connection_already_established` — which is not
+        merely the wrong pair, it is the precise misdirection the 0.8.2.4 split
+        removed: it tells the caller its frame was refused for the connection's
+        STATE when the defect is its NAME, and re-handshaking (the remedy that
+        code selects) cannot help.
+        """
+        keypair = Keypair.generate()
+        reader, writer = await _established(keypair)
+        try:
+            await send_envelope(
+                writer,
+                Envelope(
+                    root=_connect_execute(
+                        server_peer.peer_id, "not-a-connect-operation", "unknown-established"
+                    ).to_entity()
+                ),
+            )
+            response = ExecuteResponse.from_entity((await recv_envelope(reader)).root)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        assert _pair(response) == (400, "invalid_request"), (
+            f"an unknown connect operation on an established connection "
+            f"answered {_pair(response)}; row 10 says 'in any state' and the "
+            f"pre-hello input of the same frame answers "
+            f"(400, 'invalid_request')"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_hello_on_an_established_connection_is_still_row_9(
+        self, server_peer: Peer
+    ):
+        """Teeth for the row above, and the first in-tree drive of row 9.
+
+        `connection_already_established` is what the established branch is FOR;
+        routing unknown operations away from it must not empty it. A fix that
+        moved the whole established branch to 400 passes the row above and
+        fails this one — and nothing else in the suite watched row 9 on the
+        wire.
+        """
+        keypair = Keypair.generate()
+        reader, writer = await _established(keypair)
+        try:
+            await send_envelope(
+                writer,
+                Envelope(
+                    root=_hello_execute(server_peer.peer_id, os.urandom(32)).to_entity()
+                ),
+            )
+            response = ExecuteResponse.from_entity((await recv_envelope(reader)).root)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        assert _pair(response) == (409, "connection_already_established"), (
+            f"a second hello on an established connection answered "
+            f"{_pair(response)}; §4.7 row 9 pins "
+            f"(409, 'connection_already_established') — distinct from the "
+            f"mid-handshake re-hello, which is the out-of-order row"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_two_boundaries_agree_on_which_operations_exist(
+        self, server_peer: Peer
+    ):
+        """The row that carries the finding rather than either symptom.
+
+        Both boundaries were individually defensible and disagreed about the
+        SET; each of the four rows above passes against a peer that still holds
+        two lists as long as the lists happen to be right. This one reads the
+        classifier both call sites use and fails a seat that re-introduces a
+        second inventory — which is how a pre-handshake ping and an established
+        `frobnicate` came to be classified by different code in the first place.
+        """
+        import inspect
+
+        from entity_core.handlers.connect import IMPLEMENTED_CONNECT_OPERATIONS
+        from entity_core.peer import peer as peer_module
+
+        assert IMPLEMENTED_CONNECT_OPERATIONS == {"hello", "authenticate", "ping"}, (
+            "the connect surface changed; classify the new operation by adding "
+            "it to IMPLEMENTED_CONNECT_OPERATIONS and give it a row here"
+        )
+        source = inspect.getsource(peer_module)
+        assert source.count("not in IMPLEMENTED_CONNECT_OPERATIONS") == 2, (
+            "both connect boundaries (`_handle_connect` pre-established, "
+            "`_handle_execute` established) must classify row 10 off the same "
+            "set; a hand-rolled comparison at either one is the two-inventories "
+            "bug this class exists for"
+        )

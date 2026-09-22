@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-01 · public: v0.8.0 (master)_
+_Updated: 2026-09-02 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -36,8 +36,8 @@ dispatching to pattern strings rather than importing them.
 - **entity-cli** — the user-facing CLI (`entity-core start` / `connect` /
   `list-identities`), holding no protocol knowledge of its own.
 
-Maturity: reasonably mature for a research preview. A broad suite — 3,611 test functions
-across 196 files (unit, integration, interop, and conformance directories), 4,061 passing
+Maturity: reasonably mature for a research preview. A broad suite — 3,722 test functions
+across 209 files (unit, integration, interop, and conformance directories), 4,165 passing
 with 0 failures — backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release.
 The next release is **0.9.0** — this package set's own version, which since 0.9.0 is deliberately
 **not** the protocol version it implements (0.8.2); at Genesis the two coincided because the
@@ -49,7 +49,55 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1618 · 1603 P · 15 W · 0 F · 0 S @ core-go `7262f17`` (2026-09-01)** —
+**The citable number is `1622 · 1607 P · 15 W · 0 F · 0 S @ core-go `00261f3`` (2026-09-02)** —
+all seven `validate-complete.sh` passes exit 0 against a committed tree, `connectivity`
+**34/34**. The count moved 1619 → 1622 on three checks core-go added for the fold's other half
+(`connect_second_hello_mid_handshake`, `connect_ping_before_hello`,
+`connect_authenticate_peer_id_mismatch_hello`); we owed one of the three and it is landed.
+
+**The routed row and the row nobody probes are one defect.** core-go measured a pre-handshake
+`ping` here at `400 invalid_request` where 0.8.2.4 pins `409 connection_sequence_error`. Their
+other two findings were verified here rather than accepted — the peer-id cross-check and the
+mid-handshake second hello were already right, as reported. Walking row 10 a second time (the
+first walk was 2026-09-01, and the row had since been re-cut on a **predicate** rather than on a
+list of inputs) found the mirror: an unknown operation on an **established** connection answered
+`409 connection_already_established`. One predicate — *does the responder implement this
+operation* — classified by two hand-rolled inventories at the two wire boundaries, disagreeing in
+opposite directions. Both now read one set. **go and rust hold the established arm correctly
+(checked first-hand), so py was the only seat wrong and no cross-impl run could have said so:** a
+probe dials in, so every state it reaches cheaply is a pre-handshake state, and an *"in any
+state"* clause is systematically driven in one state. Routed with the suggested probe in
+`docs/status/ROUTING-2026-09-02-b-…`.
+
+**The previous citable number was `1619 · 1604 P · 15 W · 0 F · 0 S @ core-go `5cd60fe`` (2026-09-02)** —
+all seven `validate-complete.sh` passes exit 0 against a committed tree, `connectivity`
+**31/31**. The count moved 1618 → 1619 because the oracle gained exactly one check —
+`connect_absent_protocols` — and it PASSes; the 15 W is unchanged from the previous run, which
+is measured rather than assumed.
+
+**FM-2e is landed, and it is the arm we filed, ruled the other way.** SA-PY-31 asked what a
+hello with no `protocols` field means; we had shipped *unconstrained*, matching
+`entity-core-go`, on the ground that refusing where a sibling accepts partitions the cohort.
+0.8.2.4 ruled it **`400 invalid_request`** — a malformed request, not a version incompatibility
+— and §4.7 row 1 narrowed to a *non-empty* disjoint set. Our filing's argument carried the
+ruling (`incompatible_protocol` says *"we compared and share nothing"*, which cannot be said to
+a caller that named no version); our cohort-consistency **fallback** was wrong, because the
+cohort is not the two ground-up seats — keystone's 46 generated peers already required the
+field. SA-PY-32 was ruled in our shape in the same fold: §4.5's row now names §8.4's literal.
+
+**Two findings went back with it.** Read first-hand, the keystone peers the ruling *cites as
+its justification* do not implement it — the absent arm answers `400 handler_error` and the
+empty arm answers `400 incompatible_protocol` (reading 3, which 0.8.2.4 forecloses), so
+`connect_absent_protocols` will FAIL against the conformance anchor and that FAIL is the check
+working. And walking §3.3's **code set** (rather than §4.7's rows) found that `bad_request` —
+this kernel's generic 400, carried in a *default argument* at 12 sites — is in no spec code
+set; it is now `invalid_request`, with `invalid_path` / `invalid_params` where §3.3 names them.
+The one survivor is `EXTENSION-SIGNALING` §9.2's **closed** enum, which pins `bad_request` for
+the class §4.7 forbids a synonym for — a corpus conflict `entity-core-go` shares verbatim,
+filed as SA-PY-33 and exempted by name rather than fixed unilaterally. See
+`docs/status/ROUTING-2026-09-02-a-…`.
+
+**The previous citable number was `1618 · 1603 P · 15 W · 0 F · 0 S @ core-go `7262f17`` (2026-09-01)** —
 all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b
 `761 · 646 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute `8/8`, pass 4
 `2/2`, pass 0/0b static `63 PASS · 0 FAIL`.

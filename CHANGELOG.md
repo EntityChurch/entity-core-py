@@ -64,6 +64,14 @@ _Protocol: Entity Core Protocol 0.8.2 (wire identifier `entity-core/1.0`, V7 §8
   `connection_already_established`. An unknown connect operation is `400 invalid_request`:
   nothing is out of *order* when the operation name exists in no state, and
   `connection_sequence_error` told a client its ordering was wrong when its name was wrong.
+- **Row 10's split is applied to the operation this peer implements, and in both states.**
+  0.8.2.4 decides the row on one predicate — *does the responder implement this operation* —
+  and the two wire boundaries answered it differently. A pre-handshake `ping` (§5.1 keepalive,
+  which this peer serves) was refused `400 invalid_request`, the row for an operation we do not
+  implement; it is now `409 connection_sequence_error`. An unknown operation on an **established**
+  connection was refused `409 connection_already_established` — the connection's state blamed for
+  a defect in the frame's name; row 10 says *"in any state"*, so it is now `400 invalid_request`
+  there too. Both boundaries classify from one set.
 - **A handshake refusal at the `hello` step now carries the remote's `(status, code)`.**
   Both the TCP and HTTP dialers read `peer_id`/`nonce` straight out of the hello response
   and reported *"Missing peer_id or nonce"* for what was actually a coded refusal, dropping

@@ -374,16 +374,29 @@ class ExecuteResponse:
     @classmethod
     def bad_request(
         cls, request_id: str, message: str = "Bad request",
-        *, code: str = "bad_request",
+        *, code: str = "invalid_request",
     ) -> ExecuteResponse:
         """Create a 400 response.
 
-        ``code`` defaults to the generic ``"bad_request"`` but callers
-        emitting a V7 §4.7 connection-error subcode (e.g.
-        ``"unsupported_key_type"`` for v7.66 §4.4 surface 6,
-        ``"unsupported_content_hash_format"`` for v7.66 §5.2) pass the
-        spec-canonical identifier so cross-impl conformance vectors see
-        the right wire surface.
+        ``code`` defaults to **``"invalid_request"``**, which is what §3.3's
+        status table declares as *"Default `code`"* for 400 — and what
+        0.8.2.4's §4.7 paragraph then names normatively as the generic
+        malformed-request code, adding *"MUST NOT mint a synonym"*. Callers
+        emitting a more specific 400 subcode pass it explicitly: §3.3's
+        enumerated set is ``invalid_path``, ``invalid_params``,
+        ``unexpected_params``, ``chain_depth_exceeded``,
+        ``signature_path_conflict``, plus the §4.7 connect-error codes
+        (``unsupported_key_type``, ``incompatible_protocol``, …).
+
+        **This default was ``"bad_request"`` until 2026-09-02 — a code in no
+        spec code set, i.e. exactly the synonym 0.8.2.4 forbids.** It is the
+        version-string finding in a third shape: a constant *we* chose, on a
+        wire surface, that no test could see because both sides of every local
+        assertion spelled it our way (six of them did). What makes the default
+        the dangerous place for it is that a default has **no call site to
+        review** — the same peer emits the correct ``invalid_params`` from
+        eighty handler sites, which state their code, and the wrong generic
+        from twelve kernel sites, which do not.
         """
         return cls(request_id=request_id, status=Uint(400), result={"code": code, "message": message})
 

@@ -167,42 +167,83 @@ class TestRow1TheIntersectionIsChecked:
 
 
 class TestTheAbsentArmIsARuling:
-    """The arm `min`-style code writes as a null check. SA-PY-31.
+    """The arm `min`-style code writes as a null check — RULED, and the other way.
 
-    §4.5 marks `protocols` **Required: Yes**, so an omitted list is arguably a
-    malformed hello — and we nevertheless accept it, matching `entity-core-go`,
-    because refusing where a sibling accepts manufactures a partition out of a
-    spec gap on the one surface where a divergence *is* a refused connection.
+    **The retirement condition fired.** These rows were written to accept
+    (reading 1, matching `entity-core-go`) with the condition stated in the
+    docstring: *they flip to a refusal iff FM-2 or a successor rules the absent
+    case, for the cohort at once.* 0.8.2.4 ruled it — §4.5 in normative text, and
+    §4.7's row 1 narrowed to a **non-empty** disjoint set in the same fold — so
+    the rows flip and keep pinning the arm. That is what a test written as a
+    decision rather than as an outcome is for.
 
-    **Retirement condition:** these two rows flip to a refusal if and only if
-    FM-2 (or a successor) rules the absent case, and whatever it rules must be
-    ruled for the cohort at once. Until then the arm is a decision, and the
-    point of the rows is that it is written down as one rather than living
-    inside an `or []`.
+    **What the flip cost, and it is the reusable half:** our filing's *argument*
+    carried the ruling and our *fallback* was wrong. We reasoned "two ground-up
+    seats both accept, so refusing manufactures a partition" — but the cohort is
+    not the ground-up seats: keystone's generated `csharp` and `typescript`
+    peers already **required** the field and passed conformance, so reading 1
+    would have made 46 peers non-conformant. **A cohort-consistency argument is
+    only as good as the census behind it**, and ours had counted two of three
+    families. Same shape as this repo's standing *"the conjunction of two
+    readings bounds the disagreement, not the error"* entry: the seats we polled
+    agreed, and the rows nobody re-examines are exactly the ones they agree on.
+
+    Absent and empty are one input by ruling ("no `protocols` field, or an empty
+    list"), so the `or []` fold that used to be a silent second ruling is now the
+    ruled shape — the two rows stay separate anyway, because a fold that happens
+    to be correct is still a fold, and the next arm to move needs somewhere
+    visible to move.
     """
 
-    async def test_an_omitted_protocols_list_is_unconstrained(
+    async def test_an_omitted_protocols_list_is_400_invalid_request(
         self, server_peer
     ) -> None:
+        """§4.5: Required with no default, so there is no floor to fall back to."""
         status, code = await _hello_over_the_wire(...)
-        assert status == 200, (
-            f"an omitted `protocols` was refused ({status}, {code!r}). That may "
-            "well be correct — but it is a cohort decision (SA-PY-31), and go "
-            "accepts it today, so changing this row alone partitions the cohort."
+        assert (status, code) == (400, "invalid_request"), (
+            "§4.5 (0.8.2.4) pins an absent `protocols` as a malformed hello — "
+            f"(400, 'invalid_request'); got ({status}, {code!r})"
         )
 
-    async def test_an_empty_protocols_list_is_unconstrained(
+    async def test_an_empty_protocols_list_is_400_invalid_request(
         self, server_peer
     ) -> None:
-        """Present-but-empty, kept as its own row.
-
-        `params_data.get("protocols") or []` collapses absent and empty into one
-        value. That collapse is fine *today* because both arms are accepted —
-        this row exists so that if either arm ever moves, the collapse becomes
-        visible instead of silently carrying the other one with it.
-        """
+        """Present-but-empty, kept as its own row."""
         status, code = await _hello_over_the_wire([])
-        assert status == 200, f"an empty `protocols` was refused ({status}, {code!r})"
+        assert (status, code) == (400, "invalid_request"), (
+            "§4.5 (0.8.2.4) names the empty list alongside the absent field; got "
+            f"({status}, {code!r})"
+        )
+
+    async def test_it_is_not_incompatible_protocol(self, server_peer) -> None:
+        """The discriminating row: the ruling is about WHICH code, not whether.
+
+        **Mutation-verified, and the prediction was wrong in the useful
+        direction.** Deleting the guard was predicted to restore reading 1 and
+        leave this row green; it turned the peer into **reading 3** instead and
+        this row went red — because narrowing the guard leaves the intersection
+        comparison *unguarded*, and an empty set trivially fails it. Reading 1
+        needs a second edit (re-guarding the comparison with `initiator_protocols
+        and`), and that mutation fails the two rows above and NOT this one. So
+        the two wrong readings are caught by different rows, and reading 3 —
+        the one an author reaches for by deleting a line — is the one only this
+        row can see.
+
+
+        Reading 3 — an empty set intersects to empty, so answer row 1 — is the
+        tidy implementation and the one an author reaches for when narrowing the
+        `or []`. It refuses the same hello with the same status, so a row
+        asserting only `status == 400` scores it green. The whole content of the
+        ruling is that a caller who named no version cannot be told the
+        comparison failed: the remedy is *send the field*, not *change the
+        version*, and §4.7 exists so the code selects the remedy.
+        """
+        _, absent_code = await _hello_over_the_wire(...)
+        _, empty_code = await _hello_over_the_wire([])
+        assert "incompatible_protocol" not in (absent_code, empty_code), (
+            "row 1 is reserved for a NON-EMPTY set that does not intersect "
+            "(§4.7, narrowed at 0.8.2.4)"
+        )
 
 
 class TestTheVersionStringItself:
