@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable
 
-from entity_core.capability.checking import matches_pattern
+from entity_core.capability.checking import matches_pattern, unmatchable_scope_pattern
 from entity_core.capability.temporal import temporal_validity
 from entity_core.protocol.entity import Entity
 from entity_core.capability.token import (
@@ -656,6 +656,31 @@ def verify_capability_chain(
     chain_format_check = _check_chain_format_code_freeze(chain)
     if chain_format_check is not None:
         return chain_format_check
+
+    # §5.4 (0.8.2.21): a capability any of whose scope patterns canonicalizes
+    # to NEVER_MATCH is INVALID — at mint, at delegation, AND here at chain
+    # verification. Checked over EVERY link, not just the leaf: an unmatchable
+    # `exclude` on an ancestor is an exclusion that carves out nothing, and the
+    # widening it hides is inherited by every descendant.
+    #
+    # This is the third of the rule's three moments and the only one that binds
+    # a capability minted by a peer that does not implement the other two — so
+    # it is what makes the refusal hold against a FOREIGN granter rather than
+    # only against our own authoring surface.
+    for depth, current in enumerate(chain):
+        found = unmatchable_scope_pattern(current.get("data", {}).get("grants"))
+        if found is not None:
+            dimension, side, pattern = found
+            return DelegationResult(
+                valid=False,
+                error=(
+                    f"Capability carries an unmatchable scope pattern "
+                    f"(depth {depth}): `{dimension}.{side}` = {pattern!r} "
+                    f"canonicalizes to NEVER_MATCH (§5.4)"
+                ),
+                chain_depth=depth,
+                error_code="invalid_path",
+            )
 
     # PR-3 (V7 v7.39 §3.6): per-link grantee resolution. Every cap in the
     # chain has its own `grantee`, and each MUST resolve to a `system/identity`

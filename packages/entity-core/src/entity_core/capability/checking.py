@@ -292,6 +292,119 @@ def matches_pattern(pattern: str, uri: str) -> bool:
     return uri == pattern
 
 
+def strip_wildcard(pattern: str) -> str:
+    """§5.2's ``strip_wildcard`` — the prefix a pattern constrains.
+
+    A concrete path is returned unchanged, which is what makes
+    :func:`patterns_overlap` correct for the mixed concrete/pattern case.
+    """
+    if pattern.endswith("/*"):
+        return pattern[:-2]
+    if pattern == "*":
+        return ""
+    return pattern
+
+
+def patterns_overlap(a: str, b: str) -> bool:
+    """§5.2's ``patterns_overlap`` — could any concrete path match both?"""
+    prefix_a = strip_wildcard(a)
+    prefix_b = strip_wildcard(b)
+    return prefix_a.startswith(prefix_b) or prefix_b.startswith(prefix_a)
+
+
+def is_covered_by(
+    path_or_pattern: str, pattern_set: list[str], local_peer_id: str,
+) -> bool:
+    """§5.2's ``is_covered_by`` — does some pattern in the set cover the input?
+
+    Note the argument order against :func:`matches_pattern`. The spec writes
+    ``matches_pattern(path, pattern)`` and this module writes
+    ``matches_pattern(pattern, uri)`` — the two are **reversed**, consistently,
+    at every call site in this file. Stated here because this function is the
+    one place both orders appear in one expression.
+    """
+    return any(
+        matches_pattern(canonicalize(p, local_peer_id), path_or_pattern)
+        for p in pattern_set
+    )
+
+
+#: The frame used when asking whether a pattern is unmatchable. The verdict is
+#: **frame-independent** — :func:`canonicalize` decides ``NEVER_MATCH`` on the
+#: ``./`` / ``../`` / ``*/`` prefix alone and never consults the peer id — so
+#: any frame gives the same answer and passing a real one would imply a
+#: dependence that does not exist. Pinned by
+#: ``test_the_unmatchable_verdict_is_frame_independent``.
+_ANY_FRAME = "1" * 46
+
+
+def is_unmatchable_pattern(pattern: str) -> bool:
+    """True iff *pattern* canonicalizes to :data:`NEVER_MATCH` (§5.4).
+
+    .. rubric:: Why a predicate rather than an inline comparison
+
+    The sentinel's safety is **directional** (§5.4, 0.8.2.21). *Matches
+    nothing* is fail-**closed** in an ``include`` — covers nothing, so the
+    grant grants nothing — and fail-**OPEN** in an ``exclude``: it carves out
+    nothing, so **the grant is silently wider than its author wrote**, with no
+    error anywhere, because the sentinel is designed not to raise.
+
+    ``matches_pattern`` therefore stays **uniform over its operands** — it
+    cannot know which side it is on, and a matcher that guessed would be
+    untranscribable. The position-dependent reading belongs where the position
+    is known, which is every ``exclude`` loop in this module.
+    """
+    return canonicalize(pattern, _ANY_FRAME) == NEVER_MATCH
+
+
+#: The **path-scope** grant dimensions (§5.2). Only these are canonicalized, so
+#: only these can yield the sentinel. ``operations`` and ``peers`` are
+#: *id-scope* — compared as literal identifiers, and §5.2 says in terms that
+#: *"an id dimension canonicalized is a conformance defect"* — so
+#: ``canonicalize`` is never applied to them and 0.8.2.21's MUST, which is
+#: written as ``canonicalize(pattern) == NEVER_MATCH``, cannot bind them.
+#:
+#: **An id-scope exclude can nonetheless match nothing** (``*/foo`` is a
+#: literal no operation name can equal), which is the same fail-open shape one
+#: dimension over and is NOT ruled. Deliberately not invented here — refusing
+#: it would refuse capabilities `entity-core-go` and `entity-core-rust` mint.
+#: Routed as SA-PY-53.
+_PATH_SCOPE_DIMENSIONS = ("handlers", "resources")
+
+
+def unmatchable_scope_pattern(grants: Any) -> tuple[str, str, str] | None:
+    """The first ``(dimension, side, pattern)`` that is unmatchable, or None.
+
+    §5.4 (0.8.2.21): *"a capability any of whose scope patterns canonicalizes
+    to ``NEVER_MATCH`` MUST be refused"* — at mint, at delegation, and at chain
+    verification.
+
+    **Both sides, not just ``exclude``.** The security argument is about the
+    exclude side, but the MUST is written over *any* scope pattern, and an
+    unmatchable ``include`` is a grant that grants nothing — dead authority its
+    author will debug later. Refusing at authoring is the only moment the
+    **granter** — the party a silent widening harms — is still present to be
+    told.
+    """
+    if not isinstance(grants, list):
+        return None
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        for dimension in _PATH_SCOPE_DIMENSIONS:
+            scope = grant.get(dimension)
+            if not isinstance(scope, dict):
+                continue
+            for side in ("include", "exclude"):
+                patterns = scope.get(side)
+                if not isinstance(patterns, list):
+                    continue
+                for pattern in patterns:
+                    if isinstance(pattern, str) and is_unmatchable_pattern(pattern):
+                        return (dimension, side, pattern)
+    return None
+
+
 def matches_scope(scope: CapabilityScope | dict[str, Any], value: str) -> bool:
     """Check if a value matches a capability scope.
 
@@ -322,6 +435,13 @@ def matches_scope(scope: CapabilityScope | dict[str, Any], value: str) -> bool:
     # Check if any exclude pattern matches
     if scope.exclude:
         for pattern in scope.exclude:
+            # AN UNMATCHABLE EXCLUDE EXCLUDES EVERYTHING (§5.2, 0.8.2.21).
+            # Reached by every dimension of every grant, so this is the widest
+            # of the three arms. A granter writing `exclude: ["*/secret"]` for
+            # *not `secret`, in any peer's namespace* otherwise gets an
+            # exclusion that carves out nothing.
+            if is_unmatchable_pattern(pattern):
+                return False
             if matches_pattern(pattern, value):
                 return False
 
@@ -695,6 +815,43 @@ def check_resource_scope(
             if resources_scope.exclude:
                 for excl in resources_scope.exclude:
                     canonical_excl = canonicalize(excl, grant_frame)
+                    # Unmatchable exclude excludes everything (§5.2, 0.8.2.21)
+                    # — the `CORE-EXCLUDE-UNMATCHABLE-1` arm. Without it a
+                    # grant exclude the granter misspelled carves out NOTHING
+                    # and the grant is wider than written.
+                    if canonical_excl == NEVER_MATCH:
+                        grant_excluded = True
+                        break
+
+                    if is_pattern(canonical_target):
+                        # §5.2's PATTERN arm, which this peer did not have at
+                        # all — no `patterns_overlap`, no `is_covered_by`.
+                        #
+                        # A concrete target is refused by the exact-match test
+                        # below; a PATTERN target that SPANS the exclusion was
+                        # not, because `matches_pattern(exclude, pattern)`
+                        # compares the exclude against the pattern *string*
+                        # and a concrete exclude never equals it. So a grant
+                        # exclude was neutralized by re-spelling the request:
+                        # grant `/{p}/*` except `/{p}/data/secret`, target
+                        # `/{p}/data/*` -> ALLOW. Measured.
+                        #
+                        # Same family as `F68` — a gate caller-controlled
+                        # input can make vacuous — with the SPELLING of the
+                        # target as the input rather than an `exclude`.
+                        #
+                        # The rule: for each grant exclude overlapping this
+                        # target, the CALLER must carve it out too, or the
+                        # effective target includes paths the grant forbids.
+                        if not patterns_overlap(canonical_target, canonical_excl):
+                            continue
+                        if not is_covered_by(
+                            canonical_excl, resource_exclude or [], local_peer_id,
+                        ):
+                            grant_excluded = True
+                            break
+                        continue
+
                     if matches_pattern(canonical_excl, canonical_target):
                         grant_excluded = True
                         break
@@ -793,6 +950,19 @@ def check_path_permission(
         if resources_scope.exclude:
             for excl in resources_scope.exclude:
                 canonical_exclude = canonicalize(excl, grant_frame)
+                # Unmatchable exclude excludes everything (§5.2, 0.8.2.21).
+                # 0.8.2.21 enumerates THREE sites — `matches_scope`'s exclude
+                # loop, `check_resource_scope`'s concrete arm, and the pattern
+                # arm. This is a FOURTH, and it is the **handler-level** check
+                # (§6.3), which 0.8.2.20 promoted from defense-in-depth to the
+                # enforcement for any subject derived after dispatch. Fixing
+                # only the dispatch-level sites would leave the fail-open live
+                # on exactly the path that carries the guarantee when the
+                # dispatch-level check has been made vacuous. Routed as
+                # SA-PY-52.
+                if canonical_exclude == NEVER_MATCH:
+                    excluded = True
+                    break
                 if matches_pattern(canonical_exclude, canonical_path):
                     excluded = True
                     break

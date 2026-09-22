@@ -155,16 +155,36 @@ class TestR11ThePeerWildcardPatternMatchesNothingAndDoesNotError:
         )
         assert granted is False
 
-    def test_a_star_slash_grant_EXCLUDE_denies_nothing_and_does_not_raise(self):
-        """The same string on the exclude side. An unmatchable exclude carves
-        out nothing, so the include still covers — and crucially the check
-        returns a verdict rather than raising."""
+    def test_a_star_slash_grant_EXCLUDE_denies_EVERYTHING_and_does_not_raise(self):
+        """⭐ The same string on the exclude side — and the answer is the
+        OPPOSITE of the include side `[flipped 0.8.2.21]`.
+
+        This row asserted ``True`` for one revision, with the reasoning in its
+        own docstring: *"an unmatchable exclude carves out nothing, so the
+        include still covers."* 0.8.2.21 withdraws that: **the sentinel's
+        safety is directional.** Matches-nothing is fail-**closed** in an
+        ``include`` (the row above — covers nothing, grants nothing) and
+        fail-**OPEN** here, where carving out nothing leaves the grant
+        *silently wider than its author wrote*.
+
+        It is the sharpest illustration in this file of why 0.8.2.20's own
+        argument was incomplete rather than wrong: the include row and this
+        row take the **same string through the same matcher** and must answer
+        differently, so no property of the *value* can decide it. Only the
+        **position** can, which is why the rule is stated at the scope layer
+        and ``matches_pattern`` stays uniform over its operands.
+
+        The *"returns a verdict rather than raising"* half is unchanged and
+        still load-bearing (§1.11 fail-closed / F5).
+        """
         granted = check_resource_scope(
             _cap(["*"], exclude=["../escape"]), handler_pattern="*",
             operation="get", resource_targets=[f"/{PEER}/files"],
             resource_exclude=None, local_peer_id=PEER,
         )
-        assert granted is True
+        assert granted is False, (
+            "an unmatchable exclude excludes EVERYTHING (§5.2, 0.8.2.21)"
+        )
 
     def test_teeth_a_well_formed_grant_pattern_still_grants(self):
         assert check_resource_scope(

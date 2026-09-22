@@ -46,7 +46,14 @@ from entity_handlers.compute import (
     walk_tree_lookups,
 )
 
-PEER_ID = "test-peer-id"
+# 46 Base58 characters — §5.4's minimum, and the alphabet excludes `0 O I l`
+# (hence `Bui1tin`-style spellings elsewhere). This was `"test-peer-id"`: 12
+# characters with a `-`, i.e. an id no conformant peer can hold. Nothing could
+# see it until 0.8.2.20's G6 rule put `validate_absolute_path` on the
+# authorization path — a peer-relative target qualifies to `/{PEER_ID}/...`,
+# whose first segment was then not a peer_id, so the handler-grant ceiling
+# check refused targets its own wildcard grant covers.
+PEER_ID = "2KTestComputePeerJdaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 WILDCARD_CAP = {
     "grants": [{

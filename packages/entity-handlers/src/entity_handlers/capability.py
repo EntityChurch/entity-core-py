@@ -37,6 +37,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from entity_core.capability.checking import unmatchable_scope_pattern
 from entity_core.capability.delegation import is_attenuated
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.auth import create_identity_entity, create_signature_entity
@@ -164,6 +165,33 @@ def _parse_grants_payload(
     if ttl_ms is not None and (not isinstance(ttl_ms, int) or isinstance(ttl_ms, bool)):
         return None, None, "`ttl_ms` must be an integer when present"
     return grants, ttl_ms, None
+
+
+def _reject_unmatchable_scope(grants: Any) -> dict[str, Any] | None:
+    """§5.4 (0.8.2.21) — refuse a capability carrying an unmatchable pattern.
+
+    **`400 invalid_path`, and a MUST rather than a MAY**, because the two
+    readings diverge across a peer boundary: one conformant peer refusing the
+    capability and another honouring a grant wider than written are *different
+    authorization decisions on the same bytes*.
+
+    This is the **authoring** half of a two-layer rule — the evaluation half
+    (an unmatchable ``exclude`` excludes everything) lives in
+    ``entity_core.capability.checking``. Two layers, because a single layer
+    that author input can make vacuous is not a gate.
+    """
+    found = unmatchable_scope_pattern(grants)
+    if found is None:
+        return None
+    dimension, side, pattern = found
+    return _error(
+        400, "invalid_path",
+        f"grant `{dimension}.{side}` pattern {pattern!r} canonicalizes to "
+        "NEVER_MATCH (§5.4). An unmatchable pattern in an `exclude` carves out "
+        "nothing, leaving the grant silently wider than written; in an "
+        "`include` it grants nothing. Refused at authoring, which is the only "
+        "moment the granter can be told.",
+    )
 
 
 #: `expires_at` is a `primitive/uint` on the wire, and every other
@@ -498,6 +526,9 @@ async def _handle_request(
     grants, ttl_ms, err = _parse_grants_payload(params)
     if err is not None:
         return _error(400, "invalid_request", err)
+    unmatchable = _reject_unmatchable_scope(grants)
+    if unmatchable is not None:
+        return unmatchable
 
     caller_cap = _caller_cap_data(ctx)
     if caller_cap is None:
@@ -603,6 +634,9 @@ async def _handle_delegate(
     grants, ttl_ms, err = _parse_grants_payload(params)
     if err is not None:
         return _error(400, "invalid_request", err)
+    unmatchable = _reject_unmatchable_scope(grants)
+    if unmatchable is not None:
+        return unmatchable
 
     data = _params_data(params)
     parent_hash = data.get("parent")

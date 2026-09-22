@@ -16,6 +16,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from entity_core.capability.checking import NEVER_MATCH, canonicalize, is_pattern
+from entity_core.utils.path import validate_absolute_path, validate_path_chars
 
 if TYPE_CHECKING:
     from entity_core.handlers.context import HandlerContext
@@ -200,15 +201,75 @@ def unresolvable_tree_path(
     unresolvable*, and a refusal that runs before tells it nothing it did not
     supply itself.
 
-    Returns None when the path is resolvable.
+    .. rubric:: Total, and a property of the BOUNDARY rather than the channel
+       `[MUST]` — §5.4 (0.8.2.21)
+
+    *"Every path that reaches the location index, the content store, or the
+    tree is validated at that boundary — whatever carried it.* A resource
+    target, a URI suffix, a ``params`` field, an entry of a caller-supplied
+    array, or a path the handler built by concatenation are all the same kind
+    of input at the point of use."
+
+    This function tested **only** the sentinel until 0.8.2.21, which is one of
+    three refusable shapes, and it was called on the two paths a caller names
+    directly and on none of the paths a caller supplies through ``params``.
+    Measured consequence in this tree: ``tree:extract`` with
+    ``paths: ["\\x01x"]`` answered **200**, and ``tree:merge`` with
+    ``target_prefix: "\\x01x"`` **bound a control character as a tree key**.
+    Control characters are not reserved prefixes, so the sentinel test passed
+    them through — the two validators that would have caught it
+    (``validate_path_chars``, ``validate_absolute_path``) had one call site
+    between them, on ``put``.
+
+    **A comment asserting the input is pre-validated is not an enforcement
+    point**, and a rule stated over an enumeration of channels invites an
+    implementation that enumerates channels. So the three checks are composed
+    HERE, once, and every caller-derived path is routed through this function.
+
+    Returns None when the path is safe to resolve, store, or key on.
     """
-    if canonicalize(path, local_peer_id) == NEVER_MATCH:
+    # 1. Control characters (§1.4) — form-agnostic, so run it on the RAW input
+    #    before any transform can hide one.
+    char_error = validate_path_chars(path)
+    if char_error is not None:
+        return error_response(400, "invalid_path", char_error)
+
+    # 2. The sentinel (§5.4) — reserved `./` / `../` and ambiguous bare `*/`.
+    canonical = canonicalize(path, local_peer_id)
+    if canonical == NEVER_MATCH:
         return error_response(
             400, "invalid_path",
             f"path cannot be canonicalized: {path!r} (§1.4 reserves a "
             "leading `./` and `../`; a bare `*/` is ambiguous without a "
             "leading slash — use `/*/rest`)",
         )
+
+    # 3. Structure (§5.4 R12). Patterns are exempt by the same sentence that
+    #    exempts them at `check_resource_scope`: they go through pattern
+    #    matching, not tree access. `is_pattern` is the same discriminator.
+    if not is_pattern(canonical):
+        # An empty segment is always the CALLER's, wherever the path came
+        # from — `canonicalize` never introduces one.
+        if "//" in canonical:
+            return error_response(
+                400, "invalid_path", f"empty segment in path: {canonical}",
+            )
+
+        # The peer_id segment is only the caller's claim when the caller wrote
+        # an ABSOLUTE path. For a peer-relative path `canonicalize` prepends
+        # OUR id, so validating it here tests this peer's own identity rather
+        # than the caller's input — it would refuse every request on a peer
+        # whose id is malformed, which is a misconfiguration to surface at
+        # startup, not a `400` to hand a caller who supplied nothing wrong.
+        #
+        # This is the distinction `G6`'s discriminating row turns on: `/short/x`
+        # is refusable precisely BECAUSE the caller named the peer segment. A
+        # relative `x` is not the same input and must not inherit its verdict.
+        if path.startswith("/"):
+            structure_error = validate_absolute_path(canonical)
+            if structure_error is not None:
+                return error_response(400, "invalid_path", structure_error)
+
     return None
 
 

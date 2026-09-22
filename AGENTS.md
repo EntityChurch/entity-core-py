@@ -268,6 +268,82 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **An ENUMERATION of the sites a rule binds is a claim about YOUR call graph, and the ruling
+  that writes it cannot see yours.** ***RATIFIED 2026-09-11*** *— eighth axis of the "a routed
+  report's claims about our repo are hearsay" law (after our architecture, coverage, version,
+  behaviour, filing record, remedy, build state and schedule), and the first where the carrier is
+  a **count**. Cost: none, because the count was checked — which is the only reason this reads as
+  a discipline rather than as an incident.*
+  0.8.2.21's `H1` fixes the fail-OPEN exclude and says *"measured here it is **THREE** sites, not
+  the one filed — `matches_scope`'s exclude loop, `check_resource_scope`'s concrete arm, and the
+  pattern arm."* All three were live here. **`check_path_permission` (§6.3) is a fourth**, with
+  its own `resources.exclude` loop, fail-open identically — measured: a grant excluding
+  `*/secret` granted `get` on `/{peer}/secret` through it.
+  **Why the fourth site is the one that matters, which is the part that generalizes.** 0.8.2.20
+  **withdrew** the *"defense-in-depth"* characterization of that check and made it *the
+  enforcement* for any subject derived after dispatch. So a peer that fixes the three enumerated
+  sites has closed the fail-open on the dispatch path and **left it live on the path that carries
+  the guarantee when the dispatch path has been made vacuous** — the exact composition `F68`
+  established is reachable. The two rulings are four days apart and the second does not cite the
+  first.
+  **A count is more persuasive than a list and carries less information.** *"Three sites"* reads
+  as a completed census; it is a census of the **routing seat's** tree, and *"measured here"* says
+  so outright while reading as thoroughness. A list of names at least invites you to check whether
+  yours are on it — a number invites you to stop at three. **So: when a ruling enumerates sites,
+  grep your own tree for the CONCEPT (an `exclude` loop, a traversal, a validator) and reconcile
+  the count before implementing.** One grep; it found a fourth here and the fourth was the
+  load-bearing one. Enforcement point:
+  `test_exclude_unmatchable_and_params_path_total_82221.py::TestTheFourthSiteArchDidNotEnumerate`,
+  mutation-verified RED with **no other row in the file covering it** — which is the measurement
+  that says it is an independent site rather than one rule reached three ways. Routed as SA-PY-52.
+
+- **An ABSENT arm is invisible to every method that starts from the code — mutation, grep and
+  review all need a call site, and it has none.** *Candidate, 2026-09-11 — found auditing
+  0.8.2.21, not routed by it; `SA-PY-54`.* §5.2's `check_resource_scope` has **two** arms and
+  says so in its own opening comment. This tree had the concrete one and fell through to it for
+  patterns, so against `include:["/{p}/*"] exclude:["/{p}/data/secret"]`: the **concrete** target
+  `/{p}/data/secret` was DENIED and the **pattern** `/{p}/data/*` — which spans the exclusion —
+  was **ALLOWED**. A caller neutralizes a grant exclude by re-spelling its own target, needing no
+  authority it does not already have. `F68`'s law with the **spelling of the target** as the
+  vacuum-inducing input.
+  **The three helpers §5.2 names by name — `patterns_overlap`, `strip_wildcard`, `is_covered_by`
+  — had ZERO occurrences in this repo.** That is what makes this class different from a weak
+  check: there is no line to mutate, no token to grep, no call site for a reviewer to stop at, and
+  the function containing the hole reads as complete because the arm it is missing was never
+  written. **Landing it broke no existing test among 4580** — the same fact from the other side.
+  **The only method that finds it is walking the spec's normative pseudocode against your function
+  BLOCK BY BLOCK**, asking *which branches does this function have that mine does not* — the
+  inverse of the usual direction, which reads your code and asks whether it is right. Schedule it
+  the way the corpus's source-audit rows are scheduled: on the catch-up pass, per normative
+  algorithm, not when something fails. Nothing will ever fail.
+  **And an existing vector set can be structurally unable to discriminate it.**
+  `CORE-RESOURCE-EFFECTIVE-1` arm (e) *does* drive a single pattern target — at a
+  resource-**requiring** operation, where §3.3 answers `malformed_resource` **before** this arm is
+  reached. So the one vector in the corpus that looks like coverage of pattern targets cannot tell
+  a peer with this arm from a peer without it. Enforcement point:
+  `tests/integration/test_resource_scope_pattern_arm.py` — the bypass, the **concrete-form
+  control** (which is what shows the defect was a divergence between two spellings of one request
+  rather than a missing exclusion), both allow-arms, and the row where the caller supplies *an*
+  exclude but not the overlapping one.
+
+- **A predicate anchored at the START of a string stops holding the moment someone concatenates a
+  prefix onto it — so the unit to validate is what the CALLER wrote, not what you built from it.**
+  *Candidate, 2026-09-11, landing 0.8.2.21's `H3`.* `canonicalize` decides `NEVER_MATCH` on a
+  leading `./` / `../` / `*/`. The first draft of the params-path guard validated the **joined**
+  path (`full_prefix + entry`), which is the form that reaches the tree and therefore looks like
+  the right unit — and `paths: ["../escape"]` still answered **200**, because concatenation had
+  moved the reserved prefix into the interior where nothing looks for it.
+  **Two things to carry.** The caller's entry is the unit because it is the thing the caller
+  authored and the thing the rule is written about; the joined path is *derived*, and validating a
+  derived value tests your derivation rather than their input. And **when a validator's predicate
+  is positional, every caller that transforms the value before validating has silently opted out**
+  — grep for concatenation on the path between a caller-supplied path and its validator.
+  *Same pass, the mirror error: the guard also ran `validate_absolute_path` on the canonical form,
+  whose peer_id-segment check is only the CALLER's claim when the caller wrote an absolute path.
+  For a peer-relative path `canonicalize` prepends OUR id, so the check tested this peer's own
+  identity and reddened 34 unrelated rows. **A validator applied to a value you supplied half of
+  is not validating input.***
+
 - **A safety property that rests on *nothing happens to match it* is not a property — and the
   ARGUMENT for it is what stops anyone re-checking.** ***RATIFIED 2026-09-11*** *— second shape of
   R-27 clause 4's law (*write down the strongest reason you know, not the one that convinced
@@ -304,6 +380,33 @@ fails the gates rather than slipping past them.
   *And `entity-core-go` diverges here: their `validConcreteTarget` checks the leading slash and
   the path characters and **not** the peer_id segment — the one clause that bites against a
   `/*/*` grant. Routed.*
+
+- **A SCOPED test run is a claim about the scope, and this repo's tests live at THREE levels.**
+  *Candidate, 2026-09-11 — cost: two real regressions rode four commits.* The session's baseline
+  was the full `uv run pytest`; every run after it was `pytest tests/unit tests/integration`, for
+  speed. **`tests/` also holds root-level modules** (`tests/test_compute.py`,
+  `tests/test_handlers_handler.py`, …), and `tests/test_compute.py` is where two G6 regressions
+  sat green-by-omission until the final full run. The narrowing was invisible because the scoped
+  run *grew* (4099 → 4178) while the full suite's count is 4534 — **a rising number reads as
+  coverage**, and nothing in the output names what was not collected.
+  **The check:** re-run bare `pytest` before every commit that touches a shared predicate, and
+  when you scope a run, scope it to a *file*, never to a directory that has siblings. The
+  charter's own build section says `uv run pytest` for the full suite and the scoped forms are
+  documented as *one file* / *one test by name* — the directory form is the one nobody sanctioned.
+
+- **Fifth instance of the fixed-port class, and the probe is no longer the defect — the
+  ASSUMPTION about which peer is.** *2026-09-11.* `tests/interop/test_type_parity.py` failed
+  against `127.0.0.1:9000` with *"Remote peer missing types: [all 37]"*. The 2026-08-22 fix made
+  `peer_liveness.peer_available` complete a **handshake** rather than test for a socket, and it
+  worked: the process holding 9000 (`entity-avalonia`, an unrelated app from the
+  `entity-browser-rust` family on this host) **is** an entity peer and answers the handshake.
+  So the probe is right and the test's premise is what is wrong — it assumes the peer at 9000
+  is *the reference peer*, and no handshake can establish that.
+  **Deliberately not "fixed":** the obvious repair — skip when the peer serves none of the core
+  types — converts the exact regression this test exists to catch into a skip. What the class
+  actually needs is an identity assertion (a pinned peer_id or a served marker), which is design
+  work rather than a guard. Recorded so the next session does not re-diagnose it: `ss -ltnp |
+  grep 9000` first, and if something answers, ask **which** peer before reading the failure.
 
 - **A status slot nobody NAMES is a slot nobody walks — every census this repo has run was
   triggered from outside it.** *Candidate, 2026-09-11.* 501 came from a 0.8.2.7 ruling, 500 from

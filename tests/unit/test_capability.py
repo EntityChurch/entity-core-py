@@ -1090,21 +1090,38 @@ class TestMalformedResourcePatternFailClosed:
             assert granted is False, f"malformed grant pattern {bad!r} must DENY"
 
     def test_malformed_grant_exclude_denies_not_raises(self):
-        """A malformed pattern in the grant's EXCLUDE list must also be a
-        verdict, not a crash (same canonicalize call path)."""
+        """A malformed pattern in the grant's EXCLUDE list must be a verdict,
+        not a crash — and the verdict is **DENY** `[flipped 0.8.2.21]`.
+
+        This row asserted ``True`` from 0.8.2.20 until 0.8.2.21, on the
+        reasoning written into its own body: *"malformed exclude passes
+        through, matches nothing, so the target stays covered."* That is
+        exactly the fail-OPEN §5.4 now names. The sentinel's safety is
+        **directional** — *matches nothing* is fail-closed in an ``include``
+        (covers nothing, so the grant grants nothing) and fail-open in an
+        ``exclude`` (carves out nothing, so **the grant is silently wider than
+        its author wrote**), with no error anywhere because the sentinel is
+        designed not to raise.
+
+        The row is **flipped rather than deleted**: the original half of its
+        claim — *a verdict, not an exception* (§1.11 fail-closed / F5) — is
+        still live and is what the call below proves by returning at all.
+        """
         from entity_core.capability.checking import check_resource_scope
 
         cap = self._cap(["*"])
         cap["grants"][0]["resources"]["exclude"] = ["../escape"]
         target = f"/{self.PEER}/local/files/doc.txt"
-        # include "*" covers; malformed exclude passes through, matches nothing,
-        # so the target stays covered -> ALLOW (and crucially, no exception).
         granted = check_resource_scope(
             cap, handler_pattern="*", operation="get",
             resource_targets=[target], resource_exclude=None,
             local_peer_id=self.PEER,
         )
-        assert granted is True
+        assert granted is False, (
+            "an unmatchable grant exclude excludes EVERYTHING (§5.2, "
+            "0.8.2.21) — carving out nothing would leave the grant wider "
+            "than its author wrote"
+        )
 
     def test_valid_grant_pattern_still_grants(self):
         """Positive control: a well-formed grant pattern still covers."""

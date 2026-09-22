@@ -49,6 +49,23 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
+> ⚠ **0.8.2.21 landed after the number below was taken, and it moved the authorization path
+> at five sites. The conformance number is therefore STALE by construction and a re-run is
+> OWED** — see `docs/status/ROUTING-2026-09-11-c-…`. It was not taken because the pre-flight
+> found another session's `validate-complete.sh` mid-run on this box's fixed ports, where a
+> concurrent run makes *neither* result citable. What **is** measured on the current tree is
+> the canonical containerized suite: **`make test` → 4579 passed, 58 skipped, 0 failed.**
+>
+> **Absorbed at `0.8.2.21`, all four security-relevant and all four measured live first:**
+> the fail-**OPEN** `exclude` (`H1`) at **four** sites — one more than the ruling enumerates,
+> the extra being §6.3's handler-level check, which `0.8.2.20` had promoted to *the*
+> enforcement; the authoring refusal at mint / delegate / **chain-verify**; `H3`'s
+> boundary path validation, where `validate_path_chars` had **one** call site in the repo and
+> `tree:merge` was binding a control character as a tree key under a `200`; and §5.2's
+> **pattern arm**, which was absent outright — a grant `exclude` was neutralized by
+> re-spelling the target as a pattern. `H2` was already correct (arch ruled it in our shape,
+> SA-PY-50), `H4` is not ours, `H5` landed at `d7d6a9b`. Filed: **SA-PY-52 / -53 / -54**.
+
 **The citable number is `1644 · 1628 P · 15 W · 0 F · 1 S @ core-go `c3eaa82`` (2026-09-11)** —
 all seven `validate-complete.sh` passes exit 0 on `80a54e7`. The `+6` over the previous sample
 is go's new **`resource_effective`** category (`CORE-RESOURCE-EFFECTIVE-1`, six arms), and it

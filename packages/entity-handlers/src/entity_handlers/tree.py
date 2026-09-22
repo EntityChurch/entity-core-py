@@ -871,9 +871,23 @@ async def _handle_merge(
     # Per I3: snapshot has no prefix — use source_prefix/target_prefix from params
     bindings = _extract_bindings_from_snapshot(snapshot, ctx.emit_pathway.content_store)
 
-    # Pre-check: verify put authorization on all target paths (atomic)
+    # Pre-check: verify put authorization on all target paths (atomic).
+    #
+    # §5.4 (0.8.2.21) — the path is validated at the BOUNDARY, whatever carried
+    # it. `target_path` is built by concatenating a caller-supplied
+    # `target_prefix`/`source_prefix` (params) onto a handler-derived relative
+    # key, so it is caller-derived and reaches `tree.set` — and no
+    # resource-target pre-validator sees it. Measured before this guard:
+    # `target_prefix: "\x01x"` answered **200** and bound a control character
+    # as a tree key. The reserved-prefix forms (`../`, `./`, `*/`) were refused
+    # only BY ACCIDENT, as `403 capability_denied` — the sentinel makes them
+    # match no grant — which is a refusal resting on the authorization check
+    # rather than on the validator, and the wrong status besides.
     for relative in bindings:
         target_path = _apply_prefix(relative, source_prefix, target_prefix)
+        invalid = _unresolvable_tree_path(target_path, ctx.local_peer_id)
+        if invalid is not None:
+            return invalid
         if not ctx.check_caller_permission("put", target_path):
             return _error_response(
                 403,
@@ -1012,8 +1026,26 @@ async def _handle_extract(
     bindings: dict[str, bytes] = {}
 
     if paths_filter:
-        # Filtered: read specific paths directly
+        # Filtered: read specific paths directly.
+        #
+        # §5.4 (0.8.2.21) — path validation is a property of the BOUNDARY, not
+        # of the channel. Every entry of this caller-supplied array reaches
+        # `tree.get` and is the same kind of input as a resource target at the
+        # point of use, but no resource-target pre-validator ever sees it.
+        # `CORE-PARAMS-PATH-TOTAL-1` is this exact vector: before this guard
+        # `paths: ["\x01x"]` answered **200**, which is the row's stated
+        # false-pass shape ("a peer that pre-validates only the resource
+        # target answers 200 or dies").
+        # The unit is the caller's ENTRY, not the joined path. Validating
+        # `full_prefix + path` instead lets a reserved form through: the
+        # sentinel's `./` / `../` / `*/` test is anchored at the START of the
+        # string, so concatenation moves the reserved prefix into the interior
+        # where nothing looks for it. Measured — `paths: ["../escape"]`
+        # validated as the joined `/{peer}/data/../escape` still answered 200.
         for path in paths_filter:
+            invalid = _unresolvable_tree_path(path, ctx.local_peer_id)
+            if invalid is not None:
+                return invalid
             uri = full_prefix + path
             h = tree.get(uri)
             if h:
