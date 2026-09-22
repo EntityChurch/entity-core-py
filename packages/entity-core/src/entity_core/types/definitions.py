@@ -6753,6 +6753,10 @@ def type_system_relay_forward_request() -> Entity:
 
     `route` is the optional source-routed hop list (RELAY v1.1); `next_hop`
     is the single-hop shorthand. `ttl_hops` is the relay-transport hop budget.
+
+    `expires_at` (v1.3, §3.1 — D7) is the originator's storage deadline, on
+    the OUTER request because §9 forbids the relay to read the inner
+    envelope's `bounds.ttl_absolute`.
     """
     return Entity(
         type="system/type",
@@ -6766,6 +6770,7 @@ def type_system_relay_forward_request() -> Entity:
                 "next_hop": {"type_ref": "system/peer-id", "optional": True},
                 "ttl_hops": {"type_ref": "primitive/uint"},
                 "envelope_inner": {"type_ref": "system/hash"},
+                "expires_at": {"type_ref": "primitive/uint", "optional": True},
             },
         },
     )
@@ -6796,6 +6801,14 @@ def type_system_relay_advertise_limits() -> Entity:
 
     All sub-fields optional; the `advertise` entity MUST carry `limits` but its
     members are the optional bits.
+
+    `max_retention_ms` (v1.3, §8.1) is the retention CEILING — how long, where
+    the rest of `limits` is how big. §4.1 makes it `[MUST when present]`: a
+    relay that enforces a ceiling MUST publish it here, because a sender
+    choosing a relay and a peer naming relays in its §3.5 inbox-relay
+    declaration both depend on how long an entry is held and can learn it
+    nowhere else. Absent means the relay declares no ceiling; it does **not**
+    mean unbounded.
     """
     return Entity(
         type="system/type",
@@ -6804,6 +6817,7 @@ def type_system_relay_advertise_limits() -> Entity:
             "fields": {
                 "max_envelope_size": {"type_ref": "primitive/uint", "optional": True},
                 "max_storage_bytes": {"type_ref": "primitive/uint", "optional": True},
+                "max_retention_ms": {"type_ref": "primitive/uint", "optional": True},
                 "forward_rate_limit": {"type_ref": "primitive/uint", "optional": True},
             },
         },

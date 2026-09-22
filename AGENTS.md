@@ -313,6 +313,15 @@ fails the gates rather than slipping past them.
   unrelated project counts. (Also: before running the validator, check `ps aux | grep
   validate-complete` — the fixed ports mean a **concurrent** run by another session collides
   with yours, and neither result is citable.)
+  **And that pre-flight is a point-in-time sample, which is the half it does not say.**
+  *2026-09-01:* the check was clean, and a `validate-complete.sh rust` from another session
+  started **after** it and ran alongside. **The collision does not announce itself** — there is
+  no port error and no message naming another run. The tell is the *count*: pass 1 reported
+  `PARTIAL — 4 total ran` against an expected ~1616, i.e. the peer never came up and the run
+  reported a shape, not a failure. **So the rule is: read pass 1's total before reading its
+  verdict, and re-check `ps aux` when it is anomalous** — a two-order-of-magnitude shortfall is
+  a harness fact, never a conformance result, and it is the one number that separates
+  "collided" from "failed" without any log-reading at all.
   **Fourth instance, 2026-08-22, and the leftover was a peer *this session* started and could not
   stop.** `validate-complete.sh python` came back `1591 P · 6 F`, all six `peer_issued`, all six
   saying `bind: address already in use` on `127.0.0.1:9401` — which is where `-peer-issued-addr`
@@ -1461,6 +1470,52 @@ fails the gates rather than slipping past them.
   configuration in which the old shape was observably lying. Enforcement:
   `tests/integration/test_sdk_revision.py::TestCheckout::test_under_auto_version_the_head_is_not_the_target`.
   Owed to core-go: the same field, and their probe cannot see it.
+  ***RATIFIED 2026-09-01 — second instance, and the unit is a normative TABLE rather than a
+  result's fields, which is what makes it worse.*** core-go's G-28 probe family measured us on
+  §4.7 and reported two rows FAIL. Both reports were right. **Fixing them meant reading the
+  table against the function, and four more rows were also wrong** — none of them probed:
+  row 6's *mismatch* arm (FM-1 had fixed the same row's *pre-hello* arm three frames up and
+  stopped), row 8's *second* named input, §4.6 step 2's *absent*-signature arm, and row 10,
+  whose code we emitted for neither of its two inputs.
+  **Why a table is the dangerous unit.** A result's fields are at least visible together in one
+  decode. A §4.7 row is a `(failure, code, status)` triple whose *inputs* are scattered across a
+  handler, and the probe family is named for the **table** — `connect_authenticate_*` reads as
+  coverage of the connect-error contract. Three of ten rows were driven. **The report's scope is
+  the probes it seeds; the reader's impression is the section it cites**, and nobody writes down
+  the difference.
+  **The check, and it is the cheap half of a relayed fix:** when a sibling reports N rows of a
+  spec table failing, open the table and walk **every** row against your own code before fixing
+  the N. It is the same read either way — you are already in the function — and the rows nobody
+  drove are where a peer stays non-conformant *after* the cross-impl run goes green. Then say
+  which rows they cannot reach, so their next probe family is not written to the same scope.
+  Enforcement point: `tests/integration/test_connect_error_table_4_7.py`, which drives all four
+  unprobed rows plus the two probed ones, each as a `(status, code)` pair, and carries
+  `TestTheRowsDoNotCollapse` for §4.7's actual MUST (which is about the table, not any row).
+
+- **A new wire field has THREE homes and only two of them have a test that fails when you miss
+  one.** *Candidate, 2026-09-01, building RELAY v1.3 — the two-representations law with the
+  **declared type** as the representation nobody enumerated.* Adding `forward-request.
+  expires_at` and `limits.max_retention_ms` touched the constructor (`make_*`), the handler
+  that reads them, and `types/definitions.py`. The first two are exercised by every behavioural
+  row you write *because you are writing them to test the behaviour*; the third is a separate
+  file nothing in the feature's own test set imports. So the field shipped, worked, was
+  mutation-verified — and was **undeclared**.
+  **The only thing that saw it was a sibling's type census**, reporting `field "expires_at":
+  optional locally, missing remotely`. Open-type-tolerable, hence a WARN rather than a FAIL, and
+  still a real defect: a peer type-checking against our published `system/type` rejects a
+  request *we ourselves send*. A WARN in a 446-row category is also the least-read line in the
+  run.
+  **The check:** after adding a wire field, grep `types/definitions.py` for it before you
+  commit. And build the gate against the **constructors**, not against a field list — a
+  hand-maintained list is the artifact that goes stale, and the constructor already knows every
+  key it can emit. Enforcement point:
+  `test_relay_store_bounds_v13.py::TestTheDeclaredTypesCarryTheNewFields`, which asserts
+  `set(make_forward_request(...).data) - set(declared_fields)` is empty, so the *next* field is
+  caught here rather than by whoever reads our types next. Mutation-verified.
+  *And the mutation cost the work twice: it was run against an **uncommitted** type edit, so the
+  `git checkout --` restore took the fix out with the mutation. The "mutate a committed file"
+  rule below, hit in exactly the shape it describes — it is a rule about the restore step, and
+  the restore step is the one you run on autopilot.*
 
 - **Python's unbounded `int` turns a decode failure into a silent comparison — and a
   parsed-but-unread field is not a checked one.** *Two security defects, 2026-08-17, both

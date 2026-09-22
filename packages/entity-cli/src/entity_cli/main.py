@@ -755,6 +755,78 @@ def _env_max_lifetime() -> float:
     return value
 
 
+def _configure_relay_store_bounds(peer, args: argparse.Namespace) -> None:
+    """Apply `--relay-store-retention-ms` / `--relay-max-storage-bytes` to the
+    relay's `system/relay/config`, and publish the §4.1 advertise that declares
+    them.
+
+    Both are no-ops when unset, so an ordinary peer is unchanged: no config
+    entity is written and no advertise is published.
+
+    A NEGATIVE bound is a hard refusal, not a silent demotion to "unbounded".
+    A typo'd ceiling is a request for a ceiling, and handing back the unbounded
+    behaviour at the one moment the operator believed they had set a bound is
+    the failure mode `--max-lifetime` already taught this CLI. Zero is accepted
+    and means "no bound" — that is what the flag's own help says and what the
+    Go peer's flag means, so it is a value an operator can deliberately pass.
+
+    The config entity is MERGED, not replaced: `system/relay/config` also
+    carries `disable_default_fallback` (§9.5), and a start-up write that
+    replaced the whole entity would silently turn an operator's MX-required
+    posture off on the next restart.
+    """
+    from entity_core.protocol.entity import Entity
+    from entity_core.storage.emit import EmitContext
+    from entity_handlers.relay import (
+        CONFIG_MAX_STORAGE_BYTES,
+        CONFIG_STORE_RETENTION_MS,
+        RELAY_CONFIG_PATH,
+        publish_self_advertise,
+    )
+
+    retention = getattr(args, "relay_store_retention_ms", None)
+    max_bytes = getattr(args, "relay_max_storage_bytes", None)
+    if retention is None and max_bytes is None:
+        return
+    for flag, value in (
+        ("--relay-store-retention-ms", retention),
+        ("--relay-max-storage-bytes", max_bytes),
+    ):
+        if value is not None and value < 0:
+            raise SystemExit(
+                f"{flag} must be >= 0 (0 = no bound); got {value}. A negative "
+                f"bound is refused rather than treated as unbounded — see "
+                f"EXTENSION-RELAY §8."
+            )
+
+    config_uri = peer.emit_pathway.entity_tree.normalize_uri(RELAY_CONFIG_PATH)
+    existing = peer.emit_pathway.entity_tree.get(config_uri)
+    data = {}
+    if existing is not None:
+        current = peer.emit_pathway.content_store.get(existing)
+        if current is not None and isinstance(current.data, dict):
+            data = dict(current.data)
+    if retention is not None:
+        data[CONFIG_STORE_RETENTION_MS] = retention
+    if max_bytes is not None:
+        data[CONFIG_MAX_STORAGE_BYTES] = max_bytes
+    peer.emit_pathway.emit(
+        config_uri,
+        Entity(type="system/relay/config", data=data),
+        EmitContext.bootstrap(),
+    )
+
+    published = publish_self_advertise(
+        peer.emit_pathway, peer.keypair, peer.keypair.peer_id, data
+    )
+    if retention:
+        print(f"Relay: §8.1 retention ceiling {retention}ms (clamps, never refuses)")
+    if max_bytes:
+        print(f"Relay: §8.2 store bound {max_bytes} bytes (refuses, never evicts)")
+    if published is not None:
+        print(f"Relay: §4.1 advertise published at {published[0]}")
+
+
 def _keepalive_config_from_args(args: argparse.Namespace) -> dict[str, int] | None:
     """Map the ``--keepalive-*`` start flags to ``with_keepalive_config`` kwargs.
 
@@ -1013,6 +1085,10 @@ async def cmd_start(args: argparse.Namespace) -> None:
             config_uri = peer.emit_pathway.entity_tree.normalize_uri(config_path)
             peer.emit_pathway.emit(config_uri, config_entity, EmitContext.bootstrap())
             print(f"History: recording enabled for pattern '{pattern}'")
+
+    # EXTENSION-RELAY §8 (v1.3) store bounds → system/relay/config, which is
+    # where the handler reads every operator knob it has.
+    _configure_relay_store_bounds(peer, args)
 
     print(f"Peer ID: {keypair.peer_id}")
     print(f"Listening on {host}:{port}")
@@ -1858,6 +1934,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="EXTENSION-NETWORK §2.3: consecutive missed keepalives before "
              "the suspect→disconnected demotion (spec default 3). Cross-impl "
              "alias for the Go peer's -keepalive-max-missed.",
+    )
+
+    # EXTENSION-RELAY §8 (v1.3) store bounds. Both default OFF — an
+    # unconfigured relay behaves and encodes exactly as at v1.2. The names
+    # match the Go peer's `--relay-store-retention-ms` /
+    # `--relay-max-storage-bytes` character for character, because these are
+    # the knobs a cross-impl harness uses to ARM a peer for the §8 wire rows:
+    # peer-manager forwards a flag by name, and a peer whose knob is spelled
+    # differently reports could-not-look forever while looking conformant.
+    start_parser.add_argument(
+        "--relay-store-retention-ms",
+        dest="relay_store_retention_ms",
+        type=int,
+        default=None,
+        metavar="MS",
+        help="EXTENSION-RELAY §8.1 (v1.3): Mode-S store retention CEILING in "
+             "ms (0/unset = no ceiling). A :put whose store-entry expires_at "
+             "exceeds now+ceiling — or is null — is CLAMPED to the ceiling, "
+             "never refused; the ceiling is published as "
+             "limits.max_retention_ms in the relay's advertise (§4.1). "
+             "Cross-impl alias for the Go peer's --relay-store-retention-ms.",
+    )
+    start_parser.add_argument(
+        "--relay-max-storage-bytes",
+        dest="relay_max_storage_bytes",
+        type=int,
+        default=None,
+        metavar="BYTES",
+        help="EXTENSION-RELAY §8.2 (v1.3): relay-wide Mode-S store bound in "
+             "bytes (0/unset = unbounded). A :put that would exceed it is "
+             "refused with storage_full/507 and NOTHING is evicted; published "
+             "as limits.max_storage_bytes (§4.1). Cross-impl alias for the Go "
+             "peer's --relay-max-storage-bytes.",
     )
 
     # --- ls command ---

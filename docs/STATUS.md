@@ -49,7 +49,65 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1613 · 1598 P · 15 W · 0 F · 0 S @ core-go `50f2140`` (2026-09-01)** —
+**The citable number is `1616 · 1602 P · 14 W · 0 F · 0 S @ core-go `d7a5847`` (2026-09-01)** —
+all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b (core profile)
+`759 · 644 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute `8/8`, pass 0/0b
+static `63 PASS · 0 FAIL`. Three checks that FAILed or could not look against py before this
+session now PASS: `connectivity.connect_authenticate_bad_signature`,
+`connectivity.connect_authenticate_identity_mismatch`, and — against a peer started with
+`--relay-store-retention-ms` — both `relay_store_bounds` rows. The two v1.3 `type_system` relay
+WARNs are gone; the remaining 14 W is the standing baseline.
+
+**Two runs preceded that number and neither is citable — recorded because the verdict is not
+the measurement.** Run A scored `PASS 1` at **4 checks**: a `validate-complete.sh rust` started
+by another session was live on the host, which the standing pre-flight (`ps aux | grep
+validate-complete`) would have caught and did not, because it was run *before* the other
+session's began. Run B, immediately after that run drained, died mid-pass-1 — the peer dropped
+`4836/10000` requests in `concurrency.t2_1_sustained_load` and then stopped accepting, taking
+every subsequent category with it (~200 rows at `0s` elapsed, which is the signature of a dead
+peer rather than of a conformance failure). **Run C is the green one above, and the crash did
+not reproduce**: driven in isolation against a fresh container, `concurrency` is `6/6 PASS`
+including `t2_1`. So the honest statement is that the gate is green and that one run in three
+on a host under heavy concurrent load killed the peer under sustained load — *not* that the
+sustained-load path is sound. The distinguishing evidence has not been gathered, and the two
+claims ("not my diff" and "not the peer") are separate: t2_1 drives `tree.get`, which nothing
+in this session's diff is on.
+
+**Both units core-go routed on 2026-09-01 are closed (§4.7 and RELAY v1.3).**
+
+- **§4.7 connect-error rows (G-28/FM-1g).** go's probe family measured rows 7 and 8 — an
+  invalid authenticate signature, and a `peer_id` not derived from its `public_key` — as
+  `400 bad_request` here. Confirmed against our own tree before acting, and the cause was
+  the one FM-1d had already exposed one function up: the raises carried a message only, and
+  `ConnectError` defaults `code` to `bad_request`. Reading the whole table against the
+  function found **four more rows no probe drove**: row 6's *mismatch* arm (FM-1 fixed only
+  its pre-hello arm), row 8's *second* named input (`hello`/`authenticate` peer_id
+  disagreement), §4.6 step 2's *absent*-signature arm, and row 10, whose code
+  `connection_sequence_error` this peer emitted for neither of the row's two inputs. All now
+  carry the `(status, code)` pair. Row 10's status is the table's 400 with the contest stated
+  inline — go emits 409 and routed it as spec-issue `2026-09-01-b`; only the status is in
+  question, and `bad_request` was in no row at all.
+- **RELAY v1.3 `[RL-P]`** — D4 (§8.1 retention ceiling: clamps, never refuses, with the null
+  arm stated), D5 (§8.2: `storage_full`/507, no eviction, dedup-stable), D7 (§3.1
+  `forward-request.expires_at` honored on the §6.2.1 fallback, clamped, never extended), §4.1
+  publication of the enforced bounds — **and the advertise is now signed**, which §4.1
+  requires and a test *named* `test_advertise_publishes_signed_entity` had been asserting only
+  the bound path for. `storage_full` did not exist in this tree at all before this pass, which
+  is a step past go's and rust's dead constant. Operator knobs
+  `--relay-store-retention-ms` / `--relay-max-storage-bytes`, named to match the Go peer's
+  exactly so peer-manager can arm us by name.
+
+**Two findings routed back, both from building rather than from reading.** `SA-PY-30` —
+`forward-request.expires_at` is dropped at every intermediate hop, in both implementations
+that have D7, so on `A→B→C→D` the deadline dies at `B` and `C`'s fallback stores unbounded;
+that is §3.1's *"MUST NOT extend a deadline the originator set"* reached by omission, and
+neither seat's no-extend test catches it because both drive the single-hop shape. And a gap in
+our own landing that only the cross-impl run could see: the v1.3 **type definitions** were not
+updated with the behaviour, so `type_system_relay_forward_request_match` WARNed
+*"optional locally, missing remotely"* — a peer type-checking against our published
+`system/type` would have rejected a request we ourselves send.
+
+**The previous number was `1613 · 1598 P · 15 W · 0 F · 0 S @ core-go `50f2140`` (2026-09-01)** —
 all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b
 (core profile) `756 · 641 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute
 `8/8`, pass 0/0b static `63 PASS · 0 FAIL`. The 15 W is the standing baseline (it includes

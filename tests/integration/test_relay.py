@@ -63,6 +63,12 @@ def _ctx(peer, *, caller=None, included=None, relay_send=None) -> HandlerContext
         handler_pattern="system/relay",
         included=included or {},
         relay_send=relay_send,
+        # Production always sets this (`Peer` passes `keypair=self.keypair` at
+        # every HandlerContext construction); omitting it here left the relay's
+        # §4.1 signing path unreachable from any test, which is half of why the
+        # advertise shipped unsigned. A fixture that is missing a field
+        # production always supplies is a claim about production.
+        keypair=peer.keypair,
     )
 
 
@@ -275,6 +281,14 @@ async def test_expired_on_arrival(peer):
 
 @pytest.mark.asyncio
 async def test_advertise_publishes_signed_entity(peer):
+    """§4.1 — published at the canonical path AND signed by relay_peer_id.
+
+    The signature half was in the name and not in the assertions: this row
+    checked only that the path was bound, and the advertise shipped unsigned
+    for as long as it existed. Restored to what the name says (v1.3, alongside
+    the §8 bounds the advertise now carries — an unsigned ceiling at a
+    well-known path is forgeable by anyone who can write the tree).
+    """
     res = await _call(
         peer,
         "advertise",
@@ -282,7 +296,12 @@ async def test_advertise_publishes_signed_entity(peer):
     )
     assert res["status"] == 200
     path = f"system/relay/advertise/{peer.keypair.peer_id}"
-    assert peer.entity_tree.get(path) is not None
+    adv_hash = peer.entity_tree.get(path)
+    assert adv_hash is not None
+    assert peer.entity_tree.get(f"system/signature/{adv_hash.hex()}") is not None, (
+        "the advertise was published without its V7 §5.2 invariant-pointer "
+        "signature"
+    )
 
 
 # --- Mode F ----------------------------------------------------------------

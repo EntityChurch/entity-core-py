@@ -47,6 +47,7 @@ from typing import Any
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
+from entity_core.utils.ecf import ecf_encode as _ecf_encode
 from entity_handlers._common import (
     error_response as _error,
     now_ms as _now_ms,
@@ -118,6 +119,20 @@ _OP_ADVERTISE = "advertise"
 DEFAULT_POLL_LIMIT = 256
 # Default Mode-S fallback rendezvous: namespace = destination peer_id (§6.2.1).
 
+# §8 store bounds (v1.3). Both are read from the `system/relay/config` entity
+# and both default OFF, so an unconfigured relay encodes and behaves exactly as
+# it did at v1.2.
+#
+# `relay_store_retention` is the spec's own configuration name (§8.1); the
+# published form of the same number is `limits.max_retention_ms` (§4.1). They
+# are deliberately different strings in the corpus — one is the knob, one is
+# the advertised ceiling — and conflating them is how a relay ends up
+# publishing a bound it does not enforce.
+CONFIG_STORE_RETENTION_MS = "relay_store_retention"
+CONFIG_MAX_STORAGE_BYTES = "max_storage_bytes"
+LIMIT_MAX_RETENTION_MS = "max_retention_ms"
+LIMIT_MAX_STORAGE_BYTES = "max_storage_bytes"
+
 
 # ===========================================================================
 # Entity constructors (§3) — Base58 peer_id, refless raw-bytes system/hash
@@ -131,6 +146,7 @@ def make_forward_request(
     ttl_hops: int,
     next_hop: str | None = None,
     route: list[str] | None = None,
+    expires_at: int | None = None,
 ) -> Entity:
     """Construct a ``system/relay/forward-request`` (§3.1).
 
@@ -146,6 +162,16 @@ def make_forward_request(
     ``route`` is present and non-empty, ``next_hop`` is advisory and MUST equal
     ``route[0]`` if both are set (§3.1.1). Precedence on receipt is **source
     route > next_hop > route table** (§3.1.1).
+
+    ``expires_at`` (v1.3, §3.1 — D7) is the **originator's** deadline in ms
+    since epoch, OMITTED when ``None`` so a v1.2 request encodes
+    byte-identically. It exists for the same reason ``ttl_hops`` does: the
+    inner envelope's ``bounds.ttl_absolute`` is unreachable to a relay under §9
+    opacity, so on the §6.2.1 store fallback — where the relay constructs the
+    ``store-entry`` itself — the only party who knows how long the message is
+    worth holding would otherwise have no way to say so. *A bound whose
+    enforcing party cannot read it is not a bound.* It governs the fallback
+    entry's **storage lifetime** only, and has no effect on a live forward.
     """
     data: dict[str, Any] = {
         "destination": destination,
@@ -156,6 +182,8 @@ def make_forward_request(
         data["next_hop"] = next_hop
     if route:  # omitempty: None/empty dropped → byte-identical to v1.0
         data["route"] = list(route)
+    if expires_at is not None:  # omitempty → byte-identical to v1.2
+        data["expires_at"] = expires_at
     return Entity(type=FORWARD_REQUEST_TYPE, data=data)
 
 
@@ -275,6 +303,133 @@ def _store_namespace_prefix(namespace: str) -> str:
 
 
 # ===========================================================================
+# §8 store bounds (v1.3) — the retention ceiling and the storage bound
+# ===========================================================================
+
+
+def _relay_config(ctx: HandlerContext) -> dict[str, Any]:
+    """The operator's ``system/relay/config`` data, or ``{}``.
+
+    One read for every knob this handler has. It replaced a per-knob reader
+    because a second config field arriving with its own tree read is how two
+    operations end up disagreeing about one entity.
+    """
+    cfg = _get_entity(
+        ctx, ctx.emit_pathway.entity_tree.normalize_uri(RELAY_CONFIG_PATH)
+    )
+    if cfg is None or not isinstance(cfg.data, dict):
+        return {}
+    return cfg.data
+
+
+def _config_bound(cfg: dict[str, Any], key: str) -> int:
+    """A §8 bound from the config: a positive int, or 0 for "not enforced".
+
+    Fails **open** deliberately, and only here: a malformed bound in the tree
+    means the relay declares none, which is the v1.2 behaviour. The place a
+    malformed bound is refused is the CLI that writes it (a typo'd ceiling is a
+    request for a ceiling, and the operator is present to be told). By the time
+    a value is in the tree there is no operator to tell, and refusing every
+    `:put` because a config key is a string would take the relay down.
+    """
+    value = cfg.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return 0
+    return value
+
+
+def _clamp_expiry(now: int, expires_at: int | None, retention_ms: int) -> int | None:
+    """The §8.1 retention ceiling. **One implementation, both store-write
+    producers** — the direct ``:put`` (:func:`_handle_put`) and the §6.2.1
+    Mode-F→Mode-S fallback (:func:`_fallback_store`).
+
+    That is not tidiness. ``entity-core-go`` landed the ceiling on ``:put``
+    alone and left its fallback path writing an unconditional null expiry —
+    the second producer of the store shape inheriting none of the bound —
+    and had to file the miss against itself (`0f9eb65`). A relay whose two
+    write paths disagree about the bound does not have one.
+
+    With no ceiling configured this is the **identity**: a null stays null
+    ("hold until polled"), a set deadline survives verbatim. That is what lets
+    the fallback path call it unconditionally. With a ceiling it clamps
+    **down** only, so it can never EXTEND a deadline the originator set (§3.1
+    MUST NOT) and can never turn a future expiry into an expired-on-arrival
+    entry.
+
+    §8.1 states the null arm rather than deriving it, because ``min(x,
+    ceiling)`` has no arm for null — the same shape as REGISTRY §6a.9.1's ttl
+    ceiling, where a guard that read as a type check silently narrowed the MUST
+    to the values that already had a bound.
+    """
+    if retention_ms <= 0:
+        return expires_at
+    ceiling = now + retention_ms
+    if expires_at is None or expires_at > ceiling:
+        return ceiling
+    return expires_at
+
+
+def _entry_cost(store_entry: Entity, inner: Entity | None) -> int:
+    """The §8.2 byte cost of one stored entry.
+
+    **The metric is not defined by the spec** — §8.2's MUST turns on a byte
+    count and neither §8.2 nor §4.1 says which bytes. `entity-core-go` routed
+    that as spec-issue `2026-09-01-a` and documented its own choice; this is
+    the same choice, deliberately, so that two peers under one eventual
+    conformance vector count the same number: **the ECF bytes of the two
+    entities the relay physically persists** — the store-entry's data and the
+    opaque inner envelope's data — summed **relay-wide**.
+
+    Matching go here is *not* convergence and is not evidence the metric is
+    right; it is two seats declining to widen an unruled divergence while a
+    ruling is pending. We concur with go's filing rather than filing a
+    duplicate, and will move to whatever §8.2 is ruled to.
+
+    ECF is deterministic (V7 §1.5), so the count is stable across peers and a
+    hash-equal re-put costs exactly the same — which is what makes the §8.2
+    dedup rule below expressible at all.
+    """
+    cost = len(_ecf_encode(store_entry.data))
+    if inner is not None:
+        cost += len(_ecf_encode(inner.data))
+    return cost
+
+
+def _live_stored_bytes(ctx: HandlerContext, now: int) -> int:
+    """The relay-wide live byte total (§8.2).
+
+    Relay-wide, not per-namespace: §8.2 says *"the relay's advertised
+    max_storage_bytes"*, and a per-namespace reading would let a putter with
+    two namespaces hold twice the advertised bound.
+
+    Expired entries do not count. That is the §8.2 line that needs saying out
+    loud: expiry freeing bytes is **not** eviction-to-make-room — the relay
+    never removes a *live* entry to admit a new one, it only stops counting
+    entries whose own deadline has passed, which §4.2 already makes invisible
+    to a poller.
+
+    Walks the store subtree, which is only reached when a bound is configured;
+    an unbounded relay never pays for it.
+    """
+    total = 0
+    for uri in ctx.emit_pathway.entity_tree.list_prefix(STORE_PREFIX):
+        entry = _get_entity(ctx, uri)
+        if entry is None or entry.type != STORE_ENTRY_TYPE:
+            continue  # skips the `inner/` bindings, counted via their entry
+        exp = entry.data.get("expires_at")
+        if isinstance(exp, int) and exp <= now:
+            continue
+        inner_hash = entry.data.get("envelope_inner")
+        inner = (
+            ctx.emit_pathway.content_store.get(inner_hash)
+            if isinstance(inner_hash, bytes)
+            else None
+        )
+        total += _entry_cost(entry, inner)
+    return total
+
+
+# ===========================================================================
 # Handler dispatch
 # ===========================================================================
 
@@ -349,8 +504,9 @@ async def _handle_put(
             "store-entry.put_by does not match the authenticated caller",
         )
 
+    now = _now_ms()
     expires_at = data.get("expires_at")
-    if isinstance(expires_at, int) and expires_at <= _now_ms():
+    if isinstance(expires_at, int) and expires_at <= now:
         return _error(
             400, "expired_on_arrival", "expires_at is already past at put time"
         )
@@ -363,10 +519,23 @@ async def _handle_put(
             "store-entry must carry an envelope_inner system/hash",
         )
 
-    # Tree-bind the carried inner envelope (opaque, §9) under the namespace
-    # subtree so a later poll+fetch resolves it via `tree:get` (§3.2 ruling).
-    # It rides in the request envelope's `included`, keyed by envelope_inner.
-    _persist_included(ctx, envelope_inner, namespace, _OP_PUT)
+    # §8.1 retention ceiling (v1.3): CLAMP a long or null expires_at, never
+    # refuse. Refusing would convert an operator's capacity policy into a
+    # delivery failure the sender cannot tell from an outage — so the ceiling
+    # is invisible to a correct sender and fatal to none.
+    #
+    # Ordering: this runs BEFORE the store-entry is authored, so the clamped
+    # deadline is what gets hashed, stored, polled, and echoed. Clamping after
+    # would store one deadline and hash another. It runs AFTER the
+    # expired_on_arrival check because that check is about what the caller
+    # SENT; the clamp only ever lowers toward a future ceiling and can never
+    # produce the expired value the check refuses.
+    cfg = _relay_config(ctx)
+    retention_ms = _config_bound(cfg, CONFIG_STORE_RETENTION_MS)
+    max_storage_bytes = _config_bound(cfg, CONFIG_MAX_STORAGE_BYTES)
+    stored_expires_at = _clamp_expiry(
+        now, expires_at if isinstance(expires_at, int) else None, retention_ms
+    )
 
     # Re-author the store-entry locally so its hash is canonical (the caller's
     # claimed content_hash, if any, is not trusted as the store key).
@@ -374,11 +543,43 @@ async def _handle_put(
         namespace=namespace,
         envelope_inner=envelope_inner,
         put_by=put_by,
-        expires_at=expires_at if isinstance(expires_at, int) else None,
+        expires_at=stored_expires_at,
     )
     entry_hash = store_entry.compute_hash()
     storage_path = f"{_store_namespace_prefix(namespace)}{entry_hash.hex()}"
     full_uri = ctx.emit_pathway.entity_tree.normalize_uri(storage_path)
+
+    # §8.2 storage bound (v1.3): a put that would push the relay-wide live
+    # total over the advertised `max_storage_bytes` is REFUSED — and the relay
+    # MUST NOT evict an accepted entry to make room. Refuse-new rather than
+    # evict-old is the same call EXTENSION-NETWORK §8.4 already made for the
+    # sender-side pending queue: an accepted entry is a promise, and a store
+    # that breaks old promises to keep new ones is worse than one that says no.
+    #
+    # Checked before ANY write, including the inner-envelope binding below —
+    # §4.3 is fail-closed, so a refused put must leave nothing behind. Ordering
+    # this after `_persist_included` would store the payload and refuse the
+    # pointer, which is the worst of both.
+    #
+    # Dedup: a hash-equal re-put is already at this exact path (the path keys
+    # on the entry hash), costs no new bytes, and MUST NOT be refused on a full
+    # store — otherwise a retry, which is the one thing a sender does when it
+    # is unsure, is the request a full relay rejects.
+    if max_storage_bytes > 0 and ctx.emit_pathway.entity_tree.get(full_uri) is None:
+        inner_entity = _included_entity(ctx, envelope_inner)
+        cost = _entry_cost(store_entry, inner_entity)
+        if _live_stored_bytes(ctx, now) + cost > max_storage_bytes:
+            return _error(
+                507,
+                "storage_full",
+                f"accepting {cost} bytes would exceed max_storage_bytes "
+                f"{max_storage_bytes} (§8.2 — the relay refuses and does not evict)",
+            )
+
+    # Tree-bind the carried inner envelope (opaque, §9) under the namespace
+    # subtree so a later poll+fetch resolves it via `tree:get` (§3.2 ruling).
+    # It rides in the request envelope's `included`, keyed by envelope_inner.
+    _persist_included(ctx, envelope_inner, namespace, _OP_PUT)
 
     emit_ctx = EmitContext.from_handler_grant(ctx, _OP_PUT)
     ctx.emit_pathway.emit(full_uri, store_entry, emit_ctx)
@@ -389,7 +590,10 @@ async def _handle_put(
             "status": "stored",
             "stored_at": storage_path,
             "entry_hash": entry_hash,
-            "expires_at": expires_at if isinstance(expires_at, int) else None,
+            # The STORED deadline, not the submitted one. This is the only
+            # surface on which a clamp is observable to the sender, and it is
+            # what the cross-impl §8.1 rows read.
+            "expires_at": stored_expires_at,
         },
     )
 
@@ -477,18 +681,17 @@ async def _handle_advertise(
     limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
     expires_at = data.get("expires_at")
 
-    advertise = make_advertise(
+    storage_path, adv_hash = publish_advertise(
+        emit_pathway=ctx.emit_pathway,
+        keypair=getattr(ctx, "keypair", None),
+        local_peer_id=ctx.local_peer_id,
         modes=list(modes),
         endpoints=list(endpoints),
         caps_required=list(caps_required),
-        limits=limits,
+        limits=_published_limits(_relay_config(ctx), limits),
         expires_at=expires_at if isinstance(expires_at, int) else None,
+        emit_ctx=EmitContext.from_handler_grant(ctx, _OP_ADVERTISE),
     )
-    storage_path = f"{ADVERTISE_PREFIX}{ctx.local_peer_id}"
-    full_uri = ctx.emit_pathway.entity_tree.normalize_uri(storage_path)
-
-    emit_ctx = EmitContext.from_handler_grant(ctx, _OP_ADVERTISE)
-    adv_hash = ctx.emit_pathway.emit(full_uri, advertise, emit_ctx).hash
 
     return _ok(
         ADVERTISE_TYPE,
@@ -497,6 +700,124 @@ async def _handle_advertise(
             "advertise_hash": adv_hash,
             "modes": list(modes),
         },
+    )
+
+
+def publish_advertise(
+    *,
+    emit_pathway: Any,
+    keypair: Any,
+    local_peer_id: str,
+    modes: list[str],
+    endpoints: list[Any],
+    caps_required: list[str],
+    limits: dict[str, Any],
+    expires_at: int | None = None,
+    emit_ctx: EmitContext,
+) -> tuple[str, bytes]:
+    """Author, sign and bind a §4.1 advertise. Returns ``(path, hash)``.
+
+    **One implementation, two callers**: the `:advertise` operation, and the
+    peer-startup seam that publishes the §8 bounds when an operator configures
+    them (there is no handler dispatch at startup, and §4.1's MUST binds the
+    relay, not the operation that happened to publish). Two authoring paths
+    would be two advertise shapes, and the shape is signed.
+
+    Signature at the V7 §5.2 invariant pointer, bound BEFORE the advertise
+    itself: a reader that can see the advertise can always resolve the
+    signature that makes it trustworthy. The reverse order leaves a window in
+    which the published ceiling is unverifiable, which is precisely the state a
+    forger wants.
+    """
+    advertise = make_advertise(
+        modes=modes,
+        endpoints=endpoints,
+        caps_required=caps_required,
+        limits=limits,
+        expires_at=expires_at,
+    )
+    adv_hash = advertise.compute_hash()
+
+    if keypair is not None:
+        from entity_core.protocol.auth import (
+            create_identity_entity,
+            create_signature_entity,
+        )
+
+        signer_hash = create_identity_entity(keypair).compute_hash()
+        signature = create_signature_entity(keypair, adv_hash, signer_hash)
+        emit_pathway.emit(
+            f"system/signature/{adv_hash.hex()}", signature, emit_ctx
+        )
+
+    storage_path = f"{ADVERTISE_PREFIX}{local_peer_id}"
+    full_uri = emit_pathway.entity_tree.normalize_uri(storage_path)
+    bound_hash = emit_pathway.emit(full_uri, advertise, emit_ctx).hash
+    return storage_path, bound_hash
+
+
+def _published_limits(
+    cfg: dict[str, Any], requested: dict[str, Any]
+) -> dict[str, Any]:
+    """The §4.1 ``limits`` block, with the §8 bounds this relay actually
+    enforces written over whatever the caller asked for.
+
+    §4.1 is `[MUST when present]`: a relay enforcing a §8 ceiling MUST publish
+    it here. The enforced value is authoritative — an operator who passes a
+    different `max_retention_ms` gets the real one, because the alternative is
+    publishing a ceiling the relay does not honor, and the whole reason §8.1
+    makes publication a MUST is that *"a ceiling that is enforced but
+    unpublished configures behaviour no counterparty can observe before
+    depending on it."* A published ceiling that is not the enforced one is
+    worse than an absent one: it is observable and wrong.
+
+    A bound that is not enforced is OMITTED rather than published as 0 —
+    absent means *"this relay declares no ceiling"*, which §8.1 is careful to
+    say does **not** mean unbounded. An unconfigured relay's advertise is
+    therefore byte-identical to v1.2.
+    """
+    limits = dict(requested)
+    for config_key, limit_key in (
+        (CONFIG_STORE_RETENTION_MS, LIMIT_MAX_RETENTION_MS),
+        (CONFIG_MAX_STORAGE_BYTES, LIMIT_MAX_STORAGE_BYTES),
+    ):
+        enforced = _config_bound(cfg, config_key)
+        if enforced > 0:
+            limits[limit_key] = enforced
+    return limits
+
+
+def publish_self_advertise(
+    emit_pathway: Any, keypair: Any, local_peer_id: str, config: dict[str, Any]
+) -> tuple[str, bytes] | None:
+    """Publish this relay's own §4.1 advertise carrying its §8 bounds, or
+    ``None`` when no bound is configured.
+
+    The startup seam. §4.1 makes publication a MUST *when a ceiling is
+    enforced*, and the `:advertise` operation cannot discharge it on its own:
+    an operator who sets a bound and never calls `:advertise` would enforce a
+    ceiling no counterparty can read, which is the exact state §8.1 names as
+    the reason the MUST exists. So the bound and its publication are wired to
+    the same act.
+
+    An unbounded relay publishes nothing — there is no ceiling to declare, and
+    §8.1 is explicit that an absent `max_retention_ms` does **not** mean
+    unbounded. Publishing an empty advertise would assert reachability this
+    relay has not been configured to offer.
+    """
+    limits = _published_limits(config, {})
+    if not limits:
+        return None
+    return publish_advertise(
+        emit_pathway=emit_pathway,
+        keypair=keypair,
+        local_peer_id=local_peer_id,
+        # v1 serves Mode F (forward) + Mode S (store-poll) — §10.1's floor.
+        modes=["F", "S"],
+        endpoints=[],
+        caps_required=["system/capability/relay-poll"],
+        limits=limits,
+        emit_ctx=EmitContext.bootstrap(),
     )
 
 
@@ -531,6 +852,16 @@ async def _handle_forward(
     envelope_inner = data.get("envelope_inner")
     if not isinstance(envelope_inner, bytes) or not envelope_inner:
         return _error(400, "namespace_invalid", "forward-request missing envelope_inner")
+
+    # D7 (§3.1, v1.3) — the originator's storage deadline, read off the OUTER
+    # request because §9 forbids reading the inner envelope's bounds. It is
+    # consumed only on the §6.2.1 fallback (both fallback sites below); a live
+    # forward either succeeds or falls back within this one operation, so there
+    # is nothing for it to bound on the forwarding path. Absent (v1.2 shape) is
+    # None and reaches the ceiling's null arm.
+    request_expires_at = data.get("expires_at")
+    if not isinstance(request_expires_at, int) or isinstance(request_expires_at, bool):
+        request_expires_at = None
 
     # §3.1.1 per-hop next-hop determination — three sources in precedence order
     # (source route > next_hop shorthand > route table). `route` (v1.1) is the
@@ -597,7 +928,7 @@ async def _handle_forward(
             )
         # Store under the forwarder's relay-forward authority (§5.5) — the
         # caller needs no separate relay-put for the fallback.
-        _fallback_store(ctx, namespace, envelope_inner)
+        _fallback_store(ctx, namespace, envelope_inner, request_expires_at)
         # §4.2 (Rust R6 catch): forward-result.stored_at for queued-fallback is
         # the NAMESPACE (the destination polls it), NOT the full path+hash.
         return _ok(
@@ -614,6 +945,23 @@ async def _handle_forward(
     # Single-hop callers (next_hop only, no route) preserve the v1.0 shape:
     # `remaining` is empty, `route` drops via omitempty, and next_hop' is None
     # so the next relay chooses its own next hop.
+    #
+    # D7's `expires_at` travels with the request, unclamped. Two halves:
+    #
+    # It TRAVELS because the field is the originator's, and §3.1 grounds it as
+    # *"the same move `ttl_hops` already makes"* — an outer copy of a bounding
+    # concept, precisely because the inner one is unreachable. `ttl_hops` is
+    # carried hop to hop; a deadline that is dropped at the first intermediate
+    # relay leaves hop 2's §6.2.1 fallback storing with no bound at all, which
+    # is `MUST NOT extend a deadline the originator set` reached by omission.
+    # (`entity-core-go` rebuilds the relayed request without it — `ext/relay/
+    # relay.go` `relayed := types.ForwardRequestData{...}`. Filed as SA-PY-30
+    # and routed; we carry it because dropping it is the behaviour D7 exists to
+    # stop, not because our reading outranks theirs.)
+    #
+    # It is UNCLAMPED because §8.1's ceiling bounds what THIS relay stores, not
+    # what another relay may hold. Clamping here would silently impose our
+    # operator's capacity policy on a peer we are only transiting through.
     next_hop_relayed = remaining[0] if remaining else None
     forward_req = make_forward_request(
         destination=destination,
@@ -621,6 +969,7 @@ async def _handle_forward(
         ttl_hops=new_ttl,
         next_hop=next_hop_relayed,
         route=remaining or None,
+        expires_at=request_expires_at,
     )
     inner_entity = _included_entity(ctx, envelope_inner)
     included = (
@@ -661,7 +1010,7 @@ async def _handle_forward(
             code,
             "next hop unreachable and no usable inbox-relay (§3.5/§6.2.1)",
         )
-    _fallback_store(ctx, namespace, envelope_inner)
+    _fallback_store(ctx, namespace, envelope_inner, request_expires_at)
     return _ok(
         FORWARD_RESULT_TYPE,
         {"status": "queued-fallback", "next_hop": None, "stored_at": namespace},
@@ -706,19 +1055,34 @@ async def _deliver_terminal(
 
 
 def _fallback_store(
-    ctx: HandlerContext, namespace: str, envelope_inner: bytes
+    ctx: HandlerContext,
+    namespace: str,
+    envelope_inner: bytes,
+    expires_at: int | None = None,
 ) -> str:
     """Mode-S fallback store (§6.2.1): place the entry at the resolved
     ``namespace`` under the forwarder's authority (§5.5). Returns the full
     store path. ``put_by`` = the relay itself — the relay placed it on the
     origin's behalf; authorship stays the inner-envelope signature (§3.2; the
     one case where ``put_by`` diverges from authorship by design).
+
+    ``expires_at`` is the **originator's** deadline, carried on the outer
+    ``forward-request`` (§3.1, D7) because the inner envelope's
+    ``bounds.ttl_absolute`` is opaque to a relay under §9. This is the second
+    producer of the store shape, and it goes through the same
+    :func:`_clamp_expiry` as ``:put``: honored verbatim where the relay
+    declares no ceiling, clamped down where it does, never extended.
     """
     _persist_included(ctx, envelope_inner, namespace, _OP_FORWARD)
     store_entry = make_store_entry(
         namespace=namespace,
         envelope_inner=envelope_inner,
         put_by=ctx.local_peer_id,  # placement-identity = the relay (§3.2)
+        expires_at=_clamp_expiry(
+            _now_ms(),
+            expires_at,
+            _config_bound(_relay_config(ctx), CONFIG_STORE_RETENTION_MS),
+        ),
     )
     entry_hash = store_entry.compute_hash()
     storage_path = f"{_store_namespace_prefix(namespace)}{entry_hash.hex()}"
@@ -834,12 +1198,7 @@ def _disable_default_fallback(ctx: HandlerContext) -> bool:
     default-convention fallback is OFF and an undeclared / non-targeting
     destination yields ``no_inbox_relay``. Read from the tree config entity at
     ``system/relay/config`` (default off — default-convention works)."""
-    cfg = _get_entity(
-        ctx, ctx.emit_pathway.entity_tree.normalize_uri(RELAY_CONFIG_PATH)
-    )
-    if cfg is None or not isinstance(cfg.data, dict):
-        return False
-    return bool(cfg.data.get("disable_default_fallback", False))
+    return bool(_relay_config(ctx).get("disable_default_fallback", False))
 
 
 def _resolve_fallback_target(
