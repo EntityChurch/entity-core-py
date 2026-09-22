@@ -20,28 +20,42 @@ and serving the reentrant echo on the same socket.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
 from entity_core.capability.grant import Grant, create_capability_token
-from entity_core.capability.token import CapabilityScope
+from entity_core.capability.token import (
+    CapabilityScope,
+    CapabilityToken,
+    MultiGranter,
+)
 from entity_core.crypto.identity import Keypair
 from entity_core.peer import PeerBuilder
 from entity_core.peer.connection import Connection
 from entity_core.protocol.auth import (
     create_authenticated_request,
     create_identity_entity,
+    create_signature_entity,
 )
 from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.framing import recv_envelope, send_envelope
 from entity_core.protocol.messages import Execute, ExecuteResponse
-from entity_core.utils.ecf import ecf_encode
+from entity_core.utils.ecf import compute_ecf_hash, ecf_encode
 from entity_core.utils.path import extract_handler_path
 from entity_handlers.conformance import (
     DISPATCH_OUTBOUND_HANDLER_PATTERN,
     ECHO_HANDLER_PATTERN,
 )
+
+#: The operation the F63 discriminator sub-dispatches to prove the
+#: narrow-grant refusal. It is deliberately **outside** the
+#: `dispatch-outbound` handler's declared grant (which is `echo` only), while
+#: the presented credential **does** cover it — so the handler's own grant is
+#: the only thing that can refuse. Matches `entity-core-go`'s
+#: `reentryOutOfScopeOp` so a shared oracle drives both seats identically.
+REENTRY_OUT_OF_SCOPE_OP = "reentry-oos-probe"
 
 
 class RawValidator:
@@ -60,6 +74,9 @@ class RawValidator:
         self.chain = conn.capability_chain
         self.active_format = conn.active_hash_format
         self.target_peer_id = conn.session.remote_peer_id
+        # The second signer of the E3 K-of-2 root. A distinct identity, so the
+        # root is a genuine multi-granter rather than V wearing two hats.
+        self._cosigner = Keypair.generate()
 
     @classmethod
     async def connect(cls, host: str, port: int, keypair: Keypair) -> "RawValidator":
@@ -111,18 +128,24 @@ class RawValidator:
         assert env.root.get("data", {}).get("request_id") == req_id
         return ExecuteResponse.from_entity(env.root)
 
-    def _mint_reentry_cap(self, target_peer_kp: Keypair):
+    def _mint_reentry_cap(
+        self, target_peer_kp: Keypair, operations: list[str] | None = None,
+    ):
         """Mint a V-rooted cap granting P the right to call V's echo back.
 
-        granter = V, grantee = P. Scope = system/validate/echo:echo. The
-        substrate does not verify this cap on the reentry leg (V's echo just
-        matches URI+op), but a well-formed, properly-rooted cap mirrors the
-        validator's MintReentryCapability exactly.
+        granter = V, grantee = P. Scope = system/validate/echo over
+        ``operations`` (default ``["echo"]``). A well-formed, properly-rooted
+        cap mirroring the validator's ``mintReentryCapForOps`` exactly.
+
+        ``operations`` is a parameter because the F63 discriminator needs ONE
+        credential covering **both** the in-scope and the out-of-scope
+        operation — that is what makes the handler's narrow grant the only
+        variable between the two arms.
         """
         p_identity = create_identity_entity(target_peer_kp)
         grant = Grant(
             handlers=CapabilityScope(include=[ECHO_HANDLER_PATTERN]),
-            operations=CapabilityScope(include=["echo"]),
+            operations=CapabilityScope(include=operations or ["echo"]),
             resources=CapabilityScope(
                 include=[f"/{self.peer_id}/{ECHO_HANDLER_PATTERN}"],
             ),
@@ -132,17 +155,98 @@ class RawValidator:
             algorithm=self.active_format,
         )
 
-    async def dispatch_outbound(self, payload, target_peer_kp: Keypair):
-        """Send dispatch-outbound; serve the reentry echo; return (resp, hits)."""
-        cap_ent, granter_ent, sig_ent = self._mint_reentry_cap(target_peer_kp)
+    def _mint_multisig_reentry_cap(self, target_peer_kp: Keypair):
+        """Mint a K-of-2 **multi-signature-rooted** reentry cap (E3).
+
+        Byte-parallel with :meth:`_mint_reentry_cap` — same grants, same
+        handler/operation/resource scope, same grantee, same expiry window —
+        with **the granter form as the only variable**. That is what makes the
+        single-sig arm a true control for the E3 refusal, per §7a.1's second
+        ⛔ block and GUIDE-CONFORMANCE §2.4b.
+
+        Signer set is ``[V, cosigner]``, threshold 2 — so the validator (the
+        sub-dispatch target) is *among* the signers but is not itself the
+        multi-granter. That is precisely the shape 0.8.2.19's §1.4 rule
+        refuses: *a root whose signer set merely includes the target does
+        not* satisfy the root-granter check.
+
+        Returns ``(cap_dict, [granter_dicts], [signature_dicts])``.
+        """
+        p_identity = create_identity_entity(target_peer_kp)
+        grant = Grant(
+            handlers=CapabilityScope(include=[ECHO_HANDLER_PATTERN]),
+            operations=CapabilityScope(include=["echo"]),
+            resources=CapabilityScope(
+                include=[f"/{self.peer_id}/{ECHO_HANDLER_PATTERN}"],
+            ),
+        )
+        v_identity = create_identity_entity(self.kp)
+        co_identity = create_identity_entity(self._cosigner)
+        signer_hashes = [
+            v_identity.compute_hash(), co_identity.compute_hash(),
+        ]
+        now_ms = int(time.time() * 1000)
+        token = CapabilityToken(
+            grants=[grant],
+            granter=MultiGranter(signers=signer_hashes, threshold=2),
+            grantee=p_identity.compute_hash(),
+            created_at=now_ms,
+            expires_at=now_ms + 300_000,
+        )
+        cap_dict = token.to_entity()
+        cap_hash = compute_ecf_hash(
+            {"type": cap_dict["type"], "data": cap_dict["data"]}
+        )
+        cap_dict = dict(cap_dict)
+        cap_dict["content_hash"] = cap_hash
+        sigs = [
+            create_signature_entity(kp, cap_hash, ih).to_dict(include_hash=True)
+            for kp, ih in (
+                (self.kp, signer_hashes[0]),
+                (self._cosigner, signer_hashes[1]),
+            )
+        ]
+        granters = [
+            v_identity.to_dict(include_hash=True),
+            co_identity.to_dict(include_hash=True),
+        ]
+        return cap_dict, granters, sigs
+
+    async def dispatch_outbound(
+        self,
+        payload,
+        target_peer_kp: Keypair,
+        *,
+        operation: str = "echo",
+        cap_operations: list[str] | None = None,
+        multisig: bool = False,
+    ):
+        """Send dispatch-outbound; serve the reentry echo; return (resp, hits).
+
+        ``operation`` is what P is asked to sub-dispatch; ``cap_operations``
+        is what the presented credential covers. They are separate parameters
+        because F63's whole content is driving them apart.
+        """
+        if multisig:
+            cap_d, granter_ds, sig_ds = self._mint_multisig_reentry_cap(
+                target_peer_kp,
+            )
+        else:
+            cap_ent, granter_ent, sig_ent = self._mint_reentry_cap(
+                target_peer_kp, cap_operations,
+            )
+            cap_d = cap_ent.to_dict()
+            granter_ds, sig_ds = [granter_ent.to_dict()], [sig_ent.to_dict()]
         data = {
             # P dispatches back to *us* (the validator) over the inbound wire.
             "target": f"entity://{self.peer_id}/{ECHO_HANDLER_PATTERN}",
-            "operation": "echo",
+            "operation": operation,
             "value": payload,
-            "reentry_capability": cap_ent.to_dict(),
-            "reentry_granter": granter_ent.to_dict(),
-            "reentry_cap_signature": sig_ent.to_dict(),
+            "reentry_capability": cap_d,
+            # §7a.1 plural carriers (0.8.2.19): arrays, single-sig is an
+            # array of one.
+            "reentry_granters": granter_ds,
+            "reentry_cap_signatures": sig_ds,
         }
         params = Entity(type="primitive/any", data=data).to_dict()
         uri = f"entity://{self.target_peer_id}/{DISPATCH_OUTBOUND_HANDLER_PATTERN}"
@@ -160,9 +264,14 @@ class RawValidator:
             mtype = root.get("type", "")
             d = root.get("data", {})
             if mtype == Execute.TYPE:
+                # We answer BOTH `echo` and the out-of-scope probe operation
+                # verbatim. Answering only `echo` would make a bypassing peer's
+                # out-of-scope sub-dispatch fail here, at the validator, rather
+                # than at the gate under test — so the F63 row would go green
+                # against a peer with no gate at all.
                 if (
                     extract_handler_path(d.get("uri", "")) == ECHO_HANDLER_PATTERN
-                    and d.get("operation") == "echo"
+                    and d.get("operation") in ("echo", REENTRY_OUT_OF_SCOPE_OP)
                 ):
                     hits += 1
                     # Verbatim echo back over the same connection.
@@ -306,22 +415,70 @@ async def test_dispatch_outbound_ambient_at_a_foreign_peer_is_refused(target_pee
         await v.close()
 
 
-async def test_dispatch_outbound_rejects_a_partial_credential(target_peer):
-    """Some of the three fields and not others is still a malformed request.
+@pytest.mark.parametrize(
+    "drop",
+    ["reentry_capability", "reentry_granters", "reentry_cap_signatures"],
+)
+async def test_dispatch_outbound_rejects_a_partial_credential(target_peer, drop):
+    """Some of the three carriers and not others is a malformed request.
 
     The set is optional; the members are not individually optional. Without
     this row, a probe that drops one field by accident silently gets the
     ambient arm and reads its refusal as the negative arm passing.
+
+    **Parametrized over which carrier is missing**, because the check is a
+    three-term conjunction and a peer that reads `present` off the capability
+    alone passes the `reentry_capability`-dropped row while silently
+    discarding a caller's granters. One row per term or the conjunction is
+    only tested on one of its arms — which is the arm the fixture author
+    happens to type.
     """
     peer, p_kp, host, port = target_peer
     v = await RawValidator.connect(host, port, Keypair.generate())
     try:
-        cap_ent, _granter_ent, _sig_ent = v._mint_reentry_cap(p_kp)
+        cap_ent, granter_ent, sig_ent = v._mint_reentry_cap(p_kp)
         data = {
             "target": f"entity://{v.peer_id}/{ECHO_HANDLER_PATTERN}",
             "operation": "echo",
             "value": "partial",
             "reentry_capability": cap_ent.to_dict(),
+            "reentry_granters": [granter_ent.to_dict()],
+            "reentry_cap_signatures": [sig_ent.to_dict()],
+        }
+        del data[drop]
+        params = Entity(type="primitive/any", data=data).to_dict()
+        uri = f"entity://{v.target_peer_id}/{DISPATCH_OUTBOUND_HANDLER_PATTERN}"
+        resp = await v.execute_raw(uri, "dispatch", params)
+
+        assert resp.status == 400, (
+            f"dropping {drop} was not treated as malformed (status "
+            f"{resp.status}) — a partial credential is not ambient (§7a.1)"
+        )
+        assert resp.result["data"]["code"] == "invalid_params"
+    finally:
+        await v.close()
+
+
+async def test_dispatch_outbound_accepts_an_empty_array_as_absent(target_peer):
+    """An empty plural carrier is the *partial* case, not the ambient one.
+
+    `reentry_capability` present with `reentry_granters: []` is a caller who
+    meant to present authority and supplied none. Reading an empty array as
+    "omitted" would route it to the ambient arm, where its `403` is
+    indistinguishable from Dimension 4 refusing — the attribution trap the
+    ambient arm was widened to avoid in the first place.
+    """
+    peer, p_kp, host, port = target_peer
+    v = await RawValidator.connect(host, port, Keypair.generate())
+    try:
+        cap_ent, _g, sig_ent = v._mint_reentry_cap(p_kp)
+        data = {
+            "target": f"entity://{v.peer_id}/{ECHO_HANDLER_PATTERN}",
+            "operation": "echo",
+            "value": "empty-array",
+            "reentry_capability": cap_ent.to_dict(),
+            "reentry_granters": [],
+            "reentry_cap_signatures": [sig_ent.to_dict()],
         }
         params = Entity(type="primitive/any", data=data).to_dict()
         uri = f"entity://{v.target_peer_id}/{DISPATCH_OUTBOUND_HANDLER_PATTERN}"
@@ -331,6 +488,227 @@ async def test_dispatch_outbound_rejects_a_partial_credential(target_peer):
         assert resp.result["data"]["code"] == "invalid_params"
     finally:
         await v.close()
+
+
+class TestTheNarrowGrantDiscriminator:
+    """F63 — the compose-vs-bypass vector, on the wire.
+
+    §1.4's outbound gate composes two authorities: the executing handler's
+    grant (Dimensions 1-3) and a target-minted credential (Dimension 4). The
+    two vectors everyone writes — *both agree → allow* and *neither → refuse*
+    — are precisely the two that **cannot** tell a compose from a bypass.
+    `test_dispatch_outbound_reentry` and
+    `test_dispatch_outbound_ambient_at_a_foreign_peer_is_refused` above are
+    those two, and they were green through the entire life of the F67 bypass.
+
+    The discriminator is the input that belongs to **both** arms at once: a
+    valid credential covering the request, presented to a handler whose own
+    grant does not cover it. It is unconstructible against a wide grant, which
+    is why §7a.1's ⛔ narrow grant is a scaffold requirement rather than
+    hardening — see `dispatch_outbound_narrow_grant`.
+    """
+
+    async def test_in_scope_and_out_of_scope_differ_on_one_credential(
+        self, target_peer,
+    ):
+        """Both arms, one credential covering both operations.
+
+        The credential is minted over ``[echo, reentry-oos-probe]``, so it
+        authorizes **both** sub-dispatches on its own four dimensions. The
+        only thing that differs between the arms is whether the
+        *dispatch-outbound handler's own grant* covers the operation.
+
+        The in-scope arm is the antecedent (§2.4b): if it does not return 200
+        with exactly one reentry, the credential family is not valid+covering
+        at this seat and the refusal below would measure nothing. Asserting
+        the refusal alone is the deny-only shape that goes green cohort-wide
+        having measured nothing at all.
+        """
+        peer, p_kp, host, port = target_peer
+        v = await RawValidator.connect(host, port, Keypair.generate())
+        try:
+            both = ["echo", REENTRY_OUT_OF_SCOPE_OP]
+
+            # ANTECEDENT — in-scope: the narrow grant covers `echo`, the
+            # credential relaxes Dimension 4, the sub-dispatch lands.
+            resp_in, hits_in = await v.dispatch_outbound(
+                "f63-in-scope", p_kp, operation="echo", cap_operations=both,
+            )
+            assert resp_in.status == 200, (
+                f"the in-scope control failed (status {resp_in.status}: "
+                f"{resp_in.result}) — the credential is not valid+covering "
+                "at this seat, so the out-of-scope refusal below is "
+                "unattributable and this row measures nothing"
+            )
+            assert hits_in == 1, (
+                f"in-scope control reached the sub-dispatched handler "
+                f"{hits_in} times, expected exactly 1"
+            )
+            assert resp_in.result["data"]["status"] == 200
+
+            # DISCRIMINATOR — out-of-scope: the SAME credential covers this
+            # operation, and the handler's own grant does not. MUST refuse,
+            # and MUST NOT reach the sub-dispatched handler.
+            resp_oos, hits_oos = await v.dispatch_outbound(
+                "f63-out-of-scope", p_kp,
+                operation=REENTRY_OUT_OF_SCOPE_OP, cap_operations=both,
+            )
+            assert resp_oos.status != 200, (
+                "BYPASS: a target-minted credential authorized an operation "
+                "outside the dispatch-outbound handler's own grant. §1.4 "
+                "0.8.2.19: the target answers WHERE, the handler's grant "
+                "answers WHAT (§6.8) — a credential is not a grant."
+            )
+            # §7a.1a — and it is refused as an AUTHORIZATION verdict, not as a
+            # transport fault. This arm answered `502 reentry_dispatch_failed`
+            # until 2026-09-10: the ambient arm forty lines up in the same
+            # handler already relayed `403 capability_denied` **and carried
+            # the argument for it**, so one function was disagreeing with
+            # itself about what one gate decided. A scaffold that wraps every
+            # unsuccessful sub-dispatch in one generic failure launders an
+            # authorization verdict into a transport fault, and the negative
+            # arm becomes unattributable a second time — §2.4b's
+            # unattributability one layer over: the property holds perfectly
+            # and the wire cannot say so.
+            assert resp_oos.status == 403, (
+                f"the out-of-scope refusal surfaced status "
+                f"{resp_oos.status}, not 403. §3.3 normalizes an "
+                "authorization refusal's code regardless of which pipeline "
+                "layer detected it, precisely so a caller cannot read a "
+                "peer's internal layering off its error codes"
+            )
+            assert resp_oos.result["data"]["code"] == "capability_denied", (
+                f"the out-of-scope refusal surfaced code "
+                f"{resp_oos.result['data'].get('code')!r}. A §1.4 outbound "
+                "refusal is an authorization DENY whichever dimension raised "
+                "it (§7a.1a)"
+            )
+            assert hits_oos == 0, (
+                f"BYPASS: the out-of-scope sub-dispatch REACHED the "
+                f"sub-dispatched handler ({hits_oos} hits). A refusal that "
+                "arrives after the request landed is not a refusal."
+            )
+        finally:
+            await v.close()
+
+    async def test_the_handler_grant_really_is_narrow(self, target_peer):
+        """The enabler, asserted structurally rather than inferred.
+
+        If this peer ever registers `dispatch-outbound` under §6.2's wide
+        default self-grant again, the row above goes green **for the wrong
+        reason** — a wide grant makes compose and bypass agree on every input,
+        so there is nothing left to discriminate. That failure is silent at
+        the behavioural rows, so it is pinned here at the grant itself.
+        """
+        peer, p_kp, host, port = target_peer
+        grant = peer._get_handler_grant(DISPATCH_OUTBOUND_HANDLER_PATTERN)
+        assert grant is not None, (
+            "dispatch-outbound has no handler grant at all; §1.4's "
+            "Dimensions 1-3 have nothing to gate on"
+        )
+        entries = grant["grants"]
+        assert entries, "the narrow grant is empty"
+        for entry in entries:
+            assert entry["operations"]["include"] == ["echo"], (
+                f"dispatch-outbound's grant covers {entry['operations']} — "
+                "§7a.1's ⛔ requires a fixed, declared operation set. A wide "
+                "grant makes the F63 discriminator unconstructible."
+            )
+            assert entry["handlers"]["include"] == [ECHO_HANDLER_PATTERN]
+            # `peers` OMITTED: Dimension 4 for the reentry direction comes
+            # from the caller-minted credential, never from this grant.
+            assert "peers" not in entry, (
+                "the scaffold grant carries a `peers` scope — that re-opens "
+                "on Dimension 4 what the narrow handler/operation scope "
+                "closes on 1-2"
+            )
+
+
+class TestTheMultiSigRootIsRefusedOnTheWire:
+    """E3 — §1.4's multi-signature-root rule, driven over the wire.
+
+    *A K-of-N root satisfies the root-granter check only when the target
+    peer's identity is the multi-granter itself; a root whose signer set
+    merely includes the target does not.*
+
+    This vector is **the reason the carriers went plural**: a K-of-2 root
+    needs two granter identities and two signatures, and a singular carrier
+    cannot express the input. Every seat drove this rule in-process only —
+    where a mutation proves your own gate and says nothing about the cohort's.
+
+    .. rubric:: ⚠ At THIS seat the row passes fail-closed-by-absence, and the
+       wire vector cannot tell that apart from the rule
+
+    Measured: neutering the §1.4 root-granter rule
+    (``is_multi_granter(root_granter) and peer_of(root_granter) != target_peer``
+    in ``_presented_credential_relaxes_peers``) leaves this class **13/13
+    green**. The reason is documented in
+    ``test_outbound_sub_dispatch_authorization_pd2.py``'s
+    ``TestTheMultiGranterRootIsFailClosed``: the outbound gate calls
+    ``verify_capability_chain`` with **no** ``find_signature_by_signer``, so
+    the walk refuses *every* multi-signature root one layer earlier —
+    including one where the target genuinely IS the multi-granter. The rule is
+    correct and currently **unreachable**.
+
+    So the spec property holds here and this row measures it honestly, but the
+    **mechanism** is broader than the rule, and a refusal is a refusal on the
+    wire. `entity-core-go`'s portable oracle will therefore score this seat
+    PASS on ``dispatch_outbound_multisig_root_refused`` **for a reason that is
+    not the rule it names** — the standing *"a detector is only
+    mutation-verified on the peer you mutated"* law, with go's oracle as the
+    detector and us as the seat it reports green. Stated here rather than left
+    for the three-way to imply.
+
+    The row that *does* isolate the rule is
+    ``test_a_k_of_n_root_whose_signers_include_the_target_relaxes_nothing``
+    (chain verification forced to succeed), and the reachability row beside it
+    goes red the day a by-signer finder is wired in.
+    """
+
+    async def test_multisig_root_does_not_relax_dimension_4(self, target_peer):
+        """Deny, **with its single-signature antecedent** (§2.4b).
+
+        A credential invalid for any unrelated reason — a malformed
+        multi-granter, a signature over the wrong bytes, a grantee mismatch, a
+        resource that does not cover — is refused by every conformant peer for
+        that reason, and a deny-only row goes green having measured nothing.
+        The single-sig arm below is byte-parallel with the multi-sig one
+        except the granter form, so it establishes that the credential family
+        is valid and covering at this seat.
+        """
+        peer, p_kp, host, port = target_peer
+        v = await RawValidator.connect(host, port, Keypair.generate())
+        try:
+            # ANTECEDENT — single-signature, target-minted, covering.
+            resp_single, hits_single = await v.dispatch_outbound(
+                "e3-single-sig", p_kp, operation="echo",
+            )
+            assert resp_single.status == 200, (
+                f"the single-sig control failed (status "
+                f"{resp_single.status}: {resp_single.result}) — the "
+                "credential family is not valid+covering at this seat, so "
+                "the multi-sig refusal below would measure nothing"
+            )
+            assert hits_single == 1
+
+            # THE RULE — K-of-2 root over the identical request. The target
+            # is among the signers but is not the multi-granter.
+            resp_multi, hits_multi = await v.dispatch_outbound(
+                "e3-multi-sig", p_kp, operation="echo", multisig=True,
+            )
+            assert resp_multi.status != 200, (
+                "OVER-ACCEPTANCE: a K-of-2 multi-signature-rooted credential "
+                "relaxed Dimension 4 and the sub-dispatch SUCCEEDED, while "
+                "the single-sig control over the identical request also "
+                "succeeded — the granter form is the only variable, so the "
+                "multi-sig root wrongly authorized (§1.4, 0.8.2.19)"
+            )
+            assert hits_multi == 0, (
+                f"the multi-sig sub-dispatch REACHED the sub-dispatched "
+                f"handler ({hits_multi} hits)"
+            )
+        finally:
+            await v.close()
 
 
 async def test_presence_probe_paths(target_peer):

@@ -4582,6 +4582,7 @@ class Peer:
         from entity_core.capability.checking import (
             check_handler_scope,
             check_resource_scope,
+            effective_resource_targets,
             granter_frame_peer_id,
         )
 
@@ -4675,6 +4676,43 @@ class Peer:
                     )
                     await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
                     return
+
+            # F68 — the handler is handed the EFFECTIVE set, never the raw one.
+            #
+            # §5.2's check SKIPS a target the caller's own `exclude` covers
+            # ("redundant but valid") and ALLOWs when every target is skipped.
+            # A handler reading the raw list then acts on a path that was never
+            # checked against the grant: name it in `targets`, name it in
+            # `exclude`, and the resources dimension is neutralized — F67's
+            # shape one dimension over, ceiling the handler's own grant.
+            #
+            # The reduction is HERE and not in the handler-tier helper, which
+            # is where the routed remedy put it. Two reasons, and the second is
+            # the load-bearing one:
+            #   * `HandlerContext` carries no `resource_exclude` and must not
+            #     gain one — the defect IS two derivations of one set, so
+            #     plumbing the field downstream re-creates it with an
+            #     authorization decision on one side;
+            #   * ~20 sites across 8 modules read `ctx.resource_targets`
+            #     directly rather than through the helper — `tree.py` first
+            #     among them, the most-dispatched handler in the peer. A
+            #     helper-only fix closes the sites already censused and leaves
+            #     the rest, and every handler written after it re-opens the
+            #     class.
+            #
+            # Narrowing at the gate makes §3.3's effective-set table fall out
+            # of the EXISTING arity checks unchanged: effective 0 is literally
+            # `targets == []` (-> `path_required`) and effective >1 is
+            # `len(targets) != 1` (-> `ambiguous_resource`). No handler edit.
+            #
+            # The dispatcher does NOT refuse an emptied request. §5.2 called
+            # the exclusion valid one layer down, so a 403 here would
+            # contradict it; the 400 belongs to the operations whose own spec
+            # requires a resource, and they now raise it by seeing nothing.
+            if resource_targets:
+                resource_targets = effective_resource_targets(
+                    resource_targets, resource_exclude, self.peer_id,
+                )
 
         # V7.8: Extract and validate deliver_to/deliver_token for async delivery
         from entity_core.protocol.delivery import DeliverySpec
@@ -4808,7 +4846,10 @@ class Peer:
             chain_id=chain_id,
             parent_chain_id=parent_chain_id,
             request_id=request_id,  # CONTINUATION v1.14: marker step_index source
-            resource_targets=resource_targets,  # V7: pass to handler
+            # F68: the EFFECTIVE set (caller excludes already removed above),
+            # never the raw one. A handler must not see a target the
+            # authorizer skipped.
+            resource_targets=resource_targets,
             handler_pattern=handler_pattern,
             caller_capability_hash=capability_hash,
             caller_capability_granter_peer_id=granter_frame,  # V7 §PR-8

@@ -898,6 +898,15 @@ class PeerBuilder:
         SECURITY: ``dispatch-outbound`` originates outbound EXECUTEs from
         caller-supplied params. Do NOT enable in production.
 
+        ⛔ **`dispatch-outbound` is registered with a NARROW ``max_scope``**
+        (`echo` on ``system/validate/echo``), per GUIDE-CONFORMANCE §7a.1's
+        scaffold-contract requirement — see
+        :func:`entity_handlers.conformance.dispatch_outbound_narrow_grant` for
+        why it is a requirement rather than hardening. Registering it without
+        ``max_scope`` hands it §6.2's wide default self-grant, under which
+        §1.4's compose-vs-bypass discriminator is **unconstructible** and the
+        cohort's F63 wire vector cannot fire at this seat.
+
         Returns:
             Self for method chaining.
         """
@@ -906,6 +915,7 @@ class PeerBuilder:
             DispatchOutboundHandler,
             ECHO_HANDLER_PATTERN,
             DISPATCH_OUTBOUND_HANDLER_PATTERN,
+            dispatch_outbound_narrow_grant,
         )
 
         patterns = {h.pattern for h in self._state.handlers}
@@ -918,6 +928,7 @@ class PeerBuilder:
             self.with_handler(
                 DISPATCH_OUTBOUND_HANDLER_PATTERN, DispatchOutboundHandler(),
                 priority=111, name="validate/dispatch-outbound",
+                max_scope=dispatch_outbound_narrow_grant(),
             )
         return self
 

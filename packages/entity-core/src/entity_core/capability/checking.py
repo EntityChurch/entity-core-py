@@ -447,6 +447,59 @@ def check_handler_scope(
     return False
 
 
+def effective_resource_targets(
+    resource_targets: list[str],
+    resource_exclude: list[str] | None,
+    local_peer_id: str,
+) -> list[str]:
+    """The §5.2 **effective** resource set: targets minus the caller's excludes.
+
+    .. rubric:: F68 — this is the only derivation of the set, by construction
+
+    ``check_resource_scope`` skips a target the caller's own ``exclude``
+    covers (§5.2 calls such a target *"redundant but valid"*) and returns
+    ALLOW when every target is skipped. A consumer that then reads the **raw**
+    ``targets`` acts on a path the authorizer never checked against the grant:
+    put the path you want in ``targets``, put it in ``exclude`` as well, and
+    the resources dimension is neutralized. Ceiling is the executing handler's
+    own grant — ``F67``'s shape one dimension over.
+
+    The transferable rule (arch ``ROUTING-2026-09-10-d`` §2): *a handler MUST
+    NOT act on a target the authorization check SKIPPED; where an authorizer
+    and a consumer read the same request field they MUST derive the same set
+    from it.* **A gate that narrows an input and a consumer that re-widens it
+    is a bypass however correct each half is alone.**
+
+    So this function exists to be the *single* derivation. The dispatcher calls
+    it once and installs the result as the handler's ``resource_targets``;
+    ``check_resource_scope`` calls it for its own loop. Nothing downstream is
+    given the caller's ``exclude`` at all, which is what stops a second
+    derivation appearing — see
+    ``tests/integration/test_effective_resource_target_set_f68.py``.
+
+    Args:
+        resource_targets: ``execute.resource.targets`` as sent.
+        resource_exclude: ``execute.resource.exclude`` as sent, if any.
+        local_peer_id: The verifier's frame — **request**-side paths
+            canonicalize against the local peer (§PR-8), both halves of this
+            reduction being caller-authored.
+
+    Returns:
+        The targets that survive the caller's own exclusions, order preserved.
+    """
+    if not resource_exclude:
+        return list(resource_targets)
+
+    canonical_excludes = [canonicalize(e, local_peer_id) for e in resource_exclude]
+    survivors: list[str] = []
+    for target in resource_targets:
+        canonical_target = canonicalize(target, local_peer_id)
+        if any(matches_pattern(e, canonical_target) for e in canonical_excludes):
+            continue
+        survivors.append(target)
+    return survivors
+
+
 def check_resource_scope(
     capability_data: dict[str, Any],
     handler_pattern: str,
@@ -500,20 +553,14 @@ def check_resource_scope(
     if not temporal_validity(capability_data, now)[0]:
         return False
 
-    # Each resource target must be covered by some grant that also matches handler and operation
-    for target in resource_targets:
-        # Skip targets that are in caller's exclude list
-        if resource_exclude:
-            excluded = False
-            for excl in resource_exclude:
-                canonical_excl = canonicalize(excl, local_peer_id)
-                canonical_target = canonicalize(target, local_peer_id)
-                if matches_pattern(canonical_excl, canonical_target):
-                    excluded = True
-                    break
-            if excluded:
-                continue
-
+    # Each resource target must be covered by some grant that also matches
+    # handler and operation. The caller's own excludes come off first — via
+    # `effective_resource_targets`, which is the SAME derivation the dispatcher
+    # installs on the handler context. Skipping inline here is what let the two
+    # halves disagree (F68); there is now one function and both callers use it.
+    for target in effective_resource_targets(
+        resource_targets, resource_exclude, local_peer_id
+    ):
         # Find a grant that covers this target AND matches handler/operation
         target_covered = False
         canonical_target = canonicalize(target, local_peer_id)

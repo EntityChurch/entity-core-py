@@ -40,7 +40,7 @@ from entity_handlers._common import (
     now_ms as _now_ms,
     ok_response as _ok,
     params_data as _params_data,
-    resource_target as _resource_target,
+    require_single_resource_target as _require_single_resource_target,
 )
 
 
@@ -673,12 +673,11 @@ async def _handle_create(
     not_before = data.get("not_before")
     expires_at = data.get("expires_at")
 
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/attestation:create requires a resource target (V7 §3.2)",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/attestation:create requires a resource target (V7 §3.2)",
+    )
+    if _err is not None:
+        return _err
 
     err = _structurally_validate(
         ctx,

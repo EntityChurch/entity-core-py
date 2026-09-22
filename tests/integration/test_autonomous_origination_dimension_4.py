@@ -40,15 +40,31 @@ token's rooting looks conformant here. Same wire symptom — Dimension 4
 unenforced on autonomous delivery — reached from the opposite end. Three
 seats, three mechanisms, one class.
 
-.. rubric:: Why it is not fixed in the same pass
+.. rubric:: Why it is still not fixed — RE-POINTED 2026-09-10, and the reason
+   changed
 
-`extension_execute` is **one pathway serving four extensions** (subscription
-delivery, continuation advance, timer poke, network retry re-arm), so §1.4's
-*"the handler's grant"* is four different grants and the pathway holds none of
-them. Choosing them unilaterally, while two sibling seats are about to answer
-the same question, is how a divergence gets manufactured out of a ruling
-everyone agrees with. **What is not in doubt:** the wildcard is wrong under
-every candidate answer.
+The original reason was that *"which grant does a delivery engine spend"* was
+unanswered and picking unilaterally manufactures a divergence. **That question
+is now ruled** (arch `ROUTING-2026-09-10-b` §3, from 0.8.2.19 §1.4): Dimensions
+1-3 on the subscription handler's own grant, Dimension 4 relaxed by the
+recipient-minted token. So that reason is retired.
+
+The new reason is **sequencing, and it is measured rather than argued.** The
+ruling's two halves are one change: `extension_execute` passes no
+`dispatch_capability_entity`, so nothing on this path can supply Dimension 4.
+Narrowing the grant without presenting the `deliver_token` refuses every
+cross-peer delivery — measured, with `extension_execute` on a peers-omitted
+grant the cross-peer subscription suite fails `403 … §5.2 Dimension 4 (peers)`.
+**Presenting is arch's Phase 2**, which opens only once all three seats mint
+conformantly; py's mint landed at `b3bcff7`.
+
+Arch's per-seat table files py's half under **Phase 1**, headed *"Phase 1 is
+independently correct and breaks nothing."* At this seat it is a Phase 2
+change, and that is routed as a finding about the table's sequencing — not as
+a request for relief. See SA-PY-46's 2026-09-10 update.
+
+**What is not in doubt:** the wildcard is wrong under every candidate answer,
+and it is ours.
 """
 
 from __future__ import annotations

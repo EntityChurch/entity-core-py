@@ -49,13 +49,31 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1637 · 1619 P · 15 W · 2 F · 1 S @ core-go `bef708b`` (2026-09-09)**,
-and **both F are the withdrawn `system/*` rule, not this peer.** `0.8.2.13` withdrew V7 §6.2's
+**The citable number is `1638 · 1621 P · 16 W · 0 F · 1 S @ core-go `b320c1e`` (2026-09-10)** —
+all seven `validate-complete.sh` passes exit 0, image built from `614a9d8`. **The 2 F are
+gone**: go re-based the two `system/*` checks onto `0.8.2.13`'s withdrawal, which is what the
+entry below said was theirs to do. The one skip is **declared**, not unmeasured —
+`connectivity.handler_not_found_on_unregistered_path` under §3.3's total-handler exception
+(0.8.2.8, cf SA-PY-36): this peer registers a catch-all `*`, so the 404 row is not drivable
+against its posture. Check count `1637 -> 1638`; warns `15 -> 16`, the delta being
+`t1_1_concurrent_demux`, the documented timing warn that flips run to run (it was absent from
+the 2026-09-09 first sample and present in the second).
+
+**The four F63/E3 origination rows PASS** (`dispatch_outbound_{reentry,ambient_refused,
+narrow_grant_refuses_out_of_scope,multisig_root_refused}`), which is go's sharpened §7a.1a
+WARN retiring against this tree — it now discriminates on `capability_denied` and py surfaces
+it. And `multisig.valid_2of3_peer_signed_accepted` PASSes on the wire, which is the
+measurement SA-PY-49 rests on: py's `E3` blindness is one call site without a by-signer
+finder, not an inability to verify a multi-signature root.
+
+*(Prior sample, 2026-09-09: `1637 · 1619 P · 15 W · 2 F · 1 S @ bef708b`,*
+and **both F were the withdrawn `system/*` rule, not this peer.** `0.8.2.13` withdrew V7 §6.2's
 *"user-installed handlers MUST NOT register at `system/*`"*; we landed the withdrawal, and go's
 `core_register_reserved_refused` / `_publishes_nothing` still assert `403 forbidden_pattern` for
 it. Arch already ruled that disposition to go and the re-base is theirs. **The seat that
 implements a withdrawal first is the seat that goes red on the gate that has not caught up** —
-there is no ambiguity to resolve here, only a sequencing cost that lands on whoever moves first.
+there is no ambiguity to resolve here, only a sequencing cost that lands on whoever moves
+first. **Discharged: both rows are green at `b320c1e`.**)
 
 Second sample the same day: `1618 P · 16 W`, the one-check delta being `t1_1_concurrent_demux`,
 the documented non-violation timing warn that flips run to run. The check count moved

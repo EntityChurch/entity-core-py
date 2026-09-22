@@ -37,6 +37,7 @@ from entity_core.capability.checking import (
     check_handler_scope,
     check_path_permission,
     check_resource_scope,
+    effective_resource_targets,
 )
 from entity_core.peer.extensions import Extension
 from entity_core.protocol.entity import Entity
@@ -1300,6 +1301,27 @@ def _eval_apply_handler(
                     "compute/apply resource.exclude must be a list of strings",
                 )
             resource_exclude = list(exclude_v)
+
+        # F68 — reduce to the EFFECTIVE set here, at the only site that holds
+        # both halves, and carry nothing else forward.
+        #
+        # `check_resource_scope` skips a caller-excluded target and ALLOWs when
+        # every target is skipped, and `sync_dispatch` forwards the RAW targets
+        # (it has always dropped `exclude`). So `resource: {targets:[X],
+        # exclude:[X]}` made the F2 handler-grant ceiling check vacuous while
+        # the sub-dispatch still carried X — and the downstream in-process
+        # re-check only re-tests X against the PROVIDED capability, never
+        # against `ctx.capability`. A caller holding a broad provided cap could
+        # therefore dispatch past the executing handler's own ceiling, which is
+        # the exact escape F2/F5 exist to close.
+        #
+        # Reducing before both checks makes the two halves agree by
+        # construction: the checks see what the dispatch will carry.
+        if resource_exclude:
+            resource_targets = effective_resource_targets(
+                resource_targets, resource_exclude, ctx.local_peer_id,
+            )
+            resource_exclude = None
 
     # F2/F5 — dual-check at full resolution when `capability` is present.
     # The handler-grant ceiling (ctx.capability) MUST also cover the

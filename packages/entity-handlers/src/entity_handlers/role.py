@@ -116,7 +116,7 @@ from entity_handlers._common import (
     now_ms as _now_ms,
     ok_response as _ok,
     params_data as _params_data,
-    resource_target as _resource_target,
+    require_single_resource_target as _require_single_resource_target,
 )
 
 
@@ -1196,13 +1196,11 @@ async def _handle_define(
     receives a freshly-issued role-derived token before its prior token
     is revoked.
     """
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:define requires a resource target (the role "
-            "definition path).",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:define requires a resource target (the role definition path)",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_role_definition_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(
@@ -1293,12 +1291,11 @@ async def _handle_define(
 async def _handle_assign(
     ctx: HandlerContext, params: dict[str, Any],
 ) -> dict[str, Any]:
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:assign requires a resource target (the assignment path).",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:assign requires a resource target (the assignment path)",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_assignment_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(
@@ -1548,12 +1545,11 @@ async def _handle_unassign(
     iterates the per-peer subtree and runs the per-role flow once per
     role found.
     """
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:unassign requires a resource target.",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:unassign requires a resource target",
+    )
+    if _err is not None:
+        return _err
 
     emit_ctx = EmitContext.from_handler_grant(ctx, _OP_UNASSIGN)
 
@@ -1632,12 +1628,11 @@ async def _handle_unassign(
 async def _handle_exclude(
     ctx: HandlerContext, params: dict[str, Any],
 ) -> dict[str, Any]:
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:exclude requires a resource target.",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:exclude requires a resource target",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_exclusion_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(
@@ -1689,12 +1684,11 @@ async def _handle_exclude(
 async def _handle_unexclude(
     ctx: HandlerContext, params: dict[str, Any],
 ) -> dict[str, Any]:
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:unexclude requires a resource target.",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:unexclude requires a resource target",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_exclusion_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(
@@ -1730,13 +1724,11 @@ async def _handle_re_derive(
     `params.role`, when present, MUST agree with the trailing role-name
     segment.
     """
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:re-derive requires a resource target (the "
-            "role-definition path).",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:re-derive requires a resource target (the role-definition path)",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_role_definition_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(
@@ -1854,13 +1846,11 @@ async def _handle_delegate(
     # signed by the target peer's keypair but transmitted over an existing
     # admin connection; Rust + Go both accept this, surfaced by Go's
     # `acme_14_1_delegate_under_controller_cap` cross-impl fixture).
-    target_path = _resource_target(ctx)
-    if target_path is None:
-        return _error(
-            400, "path_required",
-            "system/role:delegate requires a resource target (the "
-            "delegator's assignment path).",
-        )
+    target_path, _err = _require_single_resource_target(
+        ctx, "system/role:delegate requires a resource target (the delegator's assignment path)",
+    )
+    if _err is not None:
+        return _err
     decomposed = parse_assignment_path(target_path, ctx.local_peer_id)
     if decomposed is None:
         return _error(

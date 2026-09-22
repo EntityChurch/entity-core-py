@@ -1676,6 +1676,138 @@ fails the gates rather than slipping past them.
   spellings under §3a; a later reader of the 501 sweep must not infer the 500 slot was missed).
   Six mutations, six correct predictions after the two corrections above.
 
+- **A REMEDY names a layer, and the layer is the claim to check — a fix at the consumer can be
+  correct at every site it reaches and still leave the class open.** ***RATIFIED 2026-09-10*** *—
+  second instance of the "a routed report's claims about our repo are hearsay" law on its **remedy**
+  axis (the first was `FM-1d`'s `bad_request` precedent), and the first where the remedy was not
+  merely wrong about a call site but **not implementable at the layer it named**. F68.*
+  Arch read the resources-dimension bypass at three trees and prescribed: *"the `_common.py` helper
+  counts `len(targets)`; add the caller-`exclude` reduction **in the helper**, which is why the
+  helper exists."* Correct about the defect, correct about the site it names, and **the helper takes
+  a `HandlerContext`, which carries no `resource_exclude` at all** — the field is read into a local
+  in `_handle_execute`, handed to `check_resource_scope`, and dropped. Applying the remedy as
+  written means plumbing it into every handler, i.e. **two derivations of one set with an
+  authorization decision on one side**, which is the defect restated.
+  **And the count was the tell nobody was looking at.** The helper covers 13 sites; **~20 sites
+  across 8 modules read `ctx.resource_targets` directly** — `tree.py` first among them, the
+  most-dispatched handler in the peer, unnamed in the census. A helper-only fix passes the routed
+  vector, greens the suite, and leaves the largest consumer open.
+  **The two checks, in order:**
+  1. **When a relay names the layer to fix at, open the function and confirm it can see the value.**
+     A remedy is a claim about *your* call graph, and the routing seat cannot see it. One read.
+  2. **When a rule says two parties must derive the same set, the enforcement is ONE derivation, not
+     two agreeing ones.** Narrow at the gate and install the narrowed value; then the consumer
+     cannot re-widen it, the rule becomes structural rather than a per-site obligation, and the next
+     handler inherits it without knowing it exists. Measured: zero handler edits, and the routed
+     `path_required`/`ambiguous_resource` table fell out of the **existing** arity checks.
+  **Corollary — a census keyed on the wrong operation misses a whole kind of site.** The class was
+  censused by *indexes `targets[0]`* and the second py site is a **forwarder**: `compute/apply`'s
+  `sync_dispatch` accepted and dropped `resource_exclude` and passed the raw targets on, so the
+  handler-grant ceiling check was vacuous while the dispatch still carried the target. **The unit is
+  *reads the field or forwards the field*, and an index-keyed grep cannot see a forwarder.**
+  Enforcement point: `effective_resource_targets` (one function, both callers) plus
+  `tests/integration/test_effective_resource_target_set_f68.py::
+  TestTheReductionIsAtTheAuthorizerAndNotInEachConsumer`, whose first assertion pins that
+  `HandlerContext` never gains the field — because the tempting "improvement" is to hand consumers
+  the exclude so they can be careful with it.
+
+- **A prescribed VECTOR is a claim that it discriminates, and the two vectors a row's author writes
+  are the two on which the readings agree.** ***RATIFIED 2026-09-10*** *— third instance of the
+  compose-discriminator law (`F67`'s confused deputy, the `EXTENSION-TREE` Appendix A row ordering),
+  and the first where the non-discriminating pair was prescribed by **arch** as a check-set
+  requirement.* F68's ruling asks every seat for two vectors: **two targets** → `ambiguous_resource`,
+  and **a lone self-excluded target** → `path_required`. Both correct. **Both passed by a peer that
+  still ships the bypass**, because the composition has two authorities — *arity* and *identity* —
+  and each vector exercises only the first. The discriminator is the **ordered mixed** input,
+  `targets=[victim, authorized]` / `exclude=[victim]`: effective arity is 1 under every
+  implementation, so a peer that reduces the set to decide the count and then indexes the **raw**
+  list answers both prescribed vectors correctly and acts on the target the authorizer skipped.
+  **What makes this instance worth the entry rather than a repeat:** the same input is also the row
+  **`entity-core-go` currently fails in the opposite direction** — go authorizes every raw target
+  (`core/capability/check.go:204`), so it *refuses* a request the ruling makes valid. One input,
+  three seats, three different answers, and **no vector in the set reaches it**. A ruling that
+  licenses one seat's divergence as *"stricter, safe direction"* is describing the refusal arm and
+  not the accept arm; strictness on an accept path is non-conformance.
+  **The check:** when a ruling hands you its vectors, ask *what does each one hold constant?* — and
+  if every vector holds the same dimension constant, the set cannot see a fix that only moves that
+  dimension. Then assert the **identity** of the surviving value, not only its count.
+  Enforcement point: `test_effective_resource_target_set_f68.py` row **F-2**, beside
+  `TestArchsTwoVectorsCannotDiscriminateAlone` — the arity row kept and **labelled as the
+  non-discriminator**, because four rows in a class read as four rows of coverage unless one of them
+  says otherwise. Four mutations, four correct predictions; the precise one (drop the rebind, keep
+  the import) is what showed the structural row was grepping for an identifier the import line
+  already satisfies.
+
+- **A ROW can have more than one INPUT, and censusing one of them is what makes the row read as
+  done.** ***RATIFIED 2026-09-10*** *— second instance of AP-21's own refinement (*a code SLOT is
+  the unit for auditing a CODE; the row's INPUT is the unit for auditing a ROW*), in the shape
+  that law could not warn about: the unit was right and there were **two** of it.*
+  §3.3's 400 row is a **pair**: *an operation that requires a resource answers ABSENT with
+  `path_required` and MORE THAN ONE with `ambiguous_resource`.* This repo censused that row
+  **twice** — 0.8.2.18 (four sites) and 0.8.2.17 before it — each time by the row's input, each
+  time correctly, and **both times only the absent half**. Measured on the third pass:
+  **thirteen** operations (all seven `system/role`, `system/quorum:create`,
+  `system/attestation:create`, `system/content:{get,ingest}`) refused the absent case and refused
+  more-than-one **nowhere** — they read the value through `_common.resource_target`, which
+  returns `targets[0]`, so a three-target request was served as if it named one.
+  **Why two input-censuses in a row missed it, and this is the entry.** The absent arm is the one
+  the *sentence* leads with and the one an implementer hits, so a census that finds and fixes
+  real defects on it **feels complete and produces a green suite** — the forcing function fires,
+  the work lands, and nothing is left pointing at the second half. The missed arm is then
+  invisible three ways at once: a **token grep** cannot see it (`role.py`, `quorum.py`,
+  `attestation.py` held **zero** occurrences of `ambiguous_resource`, so they read as unrelated
+  to the code entirely); the **absent-arm rows** cannot see it (every one passes on a peer with
+  the defect, because they send zero targets); and **no probe sends two** — nobody supplies two
+  resource targets by accident, so it is unreachable by fuzzing, by a conformance client, and by
+  ordinary use. It is reachable only by asking.
+  **The check, and it is one sentence of re-reading:** when a spec row names a code, **count the
+  inputs in the row's own sentence** before censusing, and parametrize the class over all of
+  them. A row joined by *"and"* is two rows; a row saying *"the two are different inputs with
+  different remedies"* is telling you the count outright. Then assert the arms are **different**
+  — a class that checks each code separately still passes a peer answering one code to both,
+  which is the collapse the row exists to forbid.
+  **And the fix goes where the value is READ, not where the check is written.** Nine of the
+  thirteen had inlined the absent check at the call site and delegated the value to a lenient
+  shared getter — so the class had re-opened nine times independently, each time by an author who
+  wrote a correct-looking guard. Enforcement point:
+  `_common.require_single_resource_target` (both arms, one site) plus
+  `test_path_required_is_raised_by_the_handler.py::TestTheClassClosesAtOneSite`, which asserts no
+  resource-requiring handler reads through the lenient getter — because the behavioural rows only
+  cover the operations already in the census set, never the next one somebody adds.
+  *The gate corrected its author on its first run again (fifth instance): the new arm was written
+  for role/quorum/attestation and immediately reddened `system/content:{get,ingest}`, which
+  answered `missing_input` — falling through to a params check with two targets in hand.*
+
+- **A ruling with two halves can arrive split across a sequencing plan's phases, and the seat
+  holding the first half is the only one who can find out.** *Candidate, 2026-09-10 — arch's
+  Subscription Phase 1/Phase 2, and the standing hearsay law with a **schedule** as the subject
+  rather than our code, coverage, version, behaviour, filing record, remedy or build state.*
+  §1.4 rules autonomous delivery in two clauses that are one behaviour: *Dimensions 1-3 on the
+  handler's own grant* **and** *Dimension 4 relaxed by the recipient-minted token.* Arch's
+  sequencing splits the work into **Phase 1** (*every seat MINTS a conformant `deliver_token`; no
+  seat gates*) and **Phase 2** (*present-and-gate, only after all three mint*), and files py's
+  half — *"stop minting `peers:["*"]`"* — in the **Phase 1** column, under the heading *"Phase 1
+  is independently correct and breaks nothing."*
+  **Measured here, it is a Phase 2 change.** `extension_execute` passes no
+  `dispatch_capability_entity`, so nothing on that path can supply the second clause; switching
+  it to a peers-omitted grant fails the cross-peer subscription suite with `403 … §5.2
+  Dimension 4 (peers)`. Narrowing the grant and presenting the token are **one** change, and
+  presenting is what Phase 2 *is*.
+  **Why a schedule is a worse carrier than a claim.** Every other axis of the hearsay law fails
+  the moment you open your tree — the tree disagrees. A phase assignment makes no claim your tree
+  can contradict; it asserts that a piece of work is *independent*, and independence is a property
+  of **your** call graph, which the scheduling seat cannot see. The heading even supplies the
+  reassurance (*breaks nothing*), so the branch that terminates in *"just do it, it's mechanical"*
+  is the one the packet argues for.
+  **The check:** when a routed plan assigns your half of a two-clause ruling to a phase, **drive
+  the change and run the suite before accepting the phase** — the question is not *"is this small?"*
+  but *"does my code contain the other clause yet?"*. Then route the sequencing finding rather
+  than absorbing it: a seat that quietly defers reads as behind, and a seat that complies breaks
+  its own wire. Enforcement point: SA-PY-46's 2026-09-10 update and
+  `test_autonomous_origination_dimension_4.py`, whose rubric was **re-pointed** rather than
+  deleted — the hold is still right and its *reason* changed, which is the thing a later reader
+  would otherwise re-derive wrong.
+
 - **A sweep justified by "nothing defines a better code" is a NEGATIVE claim about the corpus,
   and your own tests will agree with you because you moved them.** ***RATIFIED 2026-09-03***
   *— SA-PY-37, and it is AP-21's own shape arriving inside AP-21's own remedy.* §9.1 (0.8.2.7)

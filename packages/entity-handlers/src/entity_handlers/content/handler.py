@@ -38,7 +38,11 @@ from entity_core.protocol.entity import Entity
 from entity_core.protocol.framing import MAX_MESSAGE_SIZE
 from entity_core.utils.ecf import Hash, ecf_encode
 
-from entity_handlers._common import error_response, normalize_hash, resource_target
+from entity_handlers._common import (
+    error_response,
+    normalize_hash,
+    require_single_resource_target,
+)
 from entity_handlers.content.chunking import MIN_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
@@ -177,13 +181,11 @@ async def _handle_get(
     handler's ``get`` because it's idempotent w/r/t correctness and
     saves a downstream EXECUTE for the dominant small-content case.
     """
-    target_path = resource_target(ctx)
-    if target_path is None:
-        return error_response(
-            400,
-            "path_required",
-            "system/content:get requires a resource target (v3.5 §6.2 / V7 §3.2)",
-        )
+    target_path, _err = require_single_resource_target(
+        ctx, "system/content:get requires a resource target (v3.5 §6.2 / V7 §3.2)",
+    )
+    if _err is not None:
+        return _err
 
     # Dispatch-level check_permission has already verified the handler-
     # scope + resource-scope grant covers this EXECUTE (V7 §5.2). Per
@@ -380,13 +382,11 @@ async def _handle_ingest(
     *which writers can land bytes in which namespace partition* — the
     hashes are operation payload, the path is the cap-scope resource.
     """
-    target_path = resource_target(ctx)
-    if target_path is None:
-        return error_response(
-            400,
-            "path_required",
-            "system/content:ingest requires a resource target (v3.5 §6.3 / V7 §3.2)",
-        )
+    target_path, _err = require_single_resource_target(
+        ctx, "system/content:ingest requires a resource target (v3.5 §6.3 / V7 §3.2)",
+    )
+    if _err is not None:
+        return _err
 
     # See _handle_get for the rationale on skipping the redundant
     # path-scope defense-in-depth check.

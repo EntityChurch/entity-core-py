@@ -106,7 +106,21 @@ REQUIRES_RESOURCE = [
     ("system/compute", "eval", {}, "COMPUTE §3.2"),
     ("system/compute", "install", {}, "COMPUTE §3.3"),
     ("system/compute", "uninstall", {}, "COMPUTE §3.4"),
+    # --- added 2026-09-10: ROLE, the spec arch's 0.8.2.19 sweep named and
+    #     this census never walked. See TestTheAmbiguousArm below. ---
+    ("system/role", "define", {}, "ROLE §2.2"),
+    ("system/role", "assign", {}, "ROLE §2.2"),
+    ("system/role", "unassign", {}, "ROLE §2.2"),
+    ("system/role", "exclude", {}, "ROLE §2.2"),
+    ("system/role", "unexclude", {}, "ROLE §2.2"),
+    ("system/role", "re-derive", {}, "ROLE §2.2"),
+    ("system/role", "delegate", {}, "ROLE §2.2"),
+    ("system/attestation", "create", {}, "ATTESTATION §6"),
 ]
+
+#: Two well-formed resource targets. Which two does not matter — the fault
+#: under test is the COUNT, and it is refused before any path is parsed.
+TWO_TARGETS = ["system/probe/one", "system/probe/two"]
 
 
 @pytest.fixture
@@ -157,6 +171,176 @@ class TestEveryOperationWhoseSpecRequiresOne:
             "§3.3's `path_required` input — and a code that names a different "
             "remedy sends the caller to fix the wrong thing"
         )
+
+
+class TestTheAmbiguousArm:
+    """§3.3's **other** input, which this file had never censused.
+
+    The row is a pair — *"an operation that requires a resource answers ABSENT
+    with `path_required` and MORE THAN ONE with `ambiguous_resource`"* — and
+    every census above enumerated only the absent half. The class above is the
+    set of operations that require a resource; **the same set owes both arms**,
+    and that is not a new ruling, it is the second sentence of the row nobody
+    read as a task.
+
+    .. rubric:: How ten operations accepted an ambiguous request silently
+
+    Nine of these sites shared one helper, `_common.resource_target`, which
+    returns `targets[0]`. Absent was refused at each call site; more-than-one
+    was **not refused anywhere** — a three-target request was served as if it
+    named one, picking the first and discarding the rest without a word.
+
+    That arm is invisible three ways over, which is why it survived two
+    censuses of this exact row:
+
+    1. **A token grep cannot see it.** Grepping `ambiguous_resource` finds the
+       sites that already answer it. `role.py`, `quorum.py` and
+       `attestation.py` contained **zero** occurrences — they read as having
+       nothing to do with this code.
+    2. **The absent-arm census cannot see it.** Every row above passes on a
+       peer that has this defect, because they send zero targets.
+    3. **No probe sends two.** Nobody supplies two resource targets by
+       accident, so it is not reachable by fuzzing or by ordinary use — only
+       by asking the question.
+
+    The finding that reaches it is the one this file's own docstring already
+    prescribed and did not perform: enumerate by the row's **input**, and the
+    code's own `path_required` is the admission that the input applies.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,operation,data,authority",
+        REQUIRES_RESOURCE,
+        ids=[f"{h}:{o}" for h, o, _d, _a in REQUIRES_RESOURCE],
+    )
+    async def test_answers_ambiguous_resource_when_given_more_than_one(
+        self, peer, handler, operation, data, authority,
+    ):
+        result = await _dispatch(
+            peer, handler, operation, data, resource_targets=TWO_TARGETS,
+        )
+
+        assert result.status == 400, (
+            f"{handler}:{operation} with TWO resource targets -> "
+            f"{result.status}. {authority} requires a resource, so §3.3's "
+            "more-than-one input applies and the request is ambiguous: a "
+            f"peer that serves it has silently picked one. {result.result}"
+        )
+        assert _code(result) == "ambiguous_resource", (
+            f"{handler}:{operation} with two resource targets answered "
+            f"{_code(result)!r}. `path_required` here would be the mirror of "
+            "the 0.8.2.18 defect — *disambiguate the one you sent* is not "
+            "*supply a resource*"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,operation,data,authority",
+        REQUIRES_RESOURCE,
+        ids=[f"{h}:{o}" for h, o, _d, _a in REQUIRES_RESOURCE],
+    )
+    async def test_the_two_arms_do_not_collapse(
+        self, peer, handler, operation, data, authority,
+    ):
+        """The control, and it is the whole point of the pair.
+
+        A peer answering one code to both inputs satisfies neither arm's
+        *spirit* while passing whichever arm you happen to check first. §3.3:
+        *"a handler specification that collapses them into one code is
+        non-conformant on the absent case."* Asserting both codes separately
+        still permits a peer that answers `ambiguous_resource` to everything
+        if only that row exists — so the codes are asserted **different**.
+        """
+        absent = await _dispatch(peer, handler, operation, data)
+        ambiguous = await _dispatch(
+            peer, handler, operation, data, resource_targets=TWO_TARGETS,
+        )
+        assert _code(absent) != _code(ambiguous), (
+            f"{handler}:{operation} answers {_code(absent)!r} to both zero "
+            "targets and two — one gate, not two. The two inputs have "
+            "different remedies and §3.3 says selecting the remedy is what "
+            "the code is for"
+        )
+
+
+class TestLocalFilesIsNotInTheSetAndThisIsWhy:
+    """SA-PY-47 — the one resource-requiring surface the census reached and
+    deliberately did not converge.
+
+    `DOMAIN-LOCAL-FILES` v1.2 requires a resource at all four operations
+    (`tree_path = ctx.resource.targets[0]`, §4.1-§4.4) and defines **no error
+    table**, so under §3.3's escape clause the defaults ought to bind. Both
+    `entity-core-py` and `entity-core-go` emit `400 invalid_resource` instead —
+    a spelling in no §3.3 code set — and neither refuses the more-than-one
+    case.
+
+    **Matching go here is a choice, and it is recorded as one.** Converging
+    unilaterally would refuse where a sibling accepts and manufacture a
+    cross-impl divergence out of a corpus gap. This is two seats not making the
+    surface worse while a ruling is pending — cohort-consistent, not
+    conformant. The row pins today's answer so a later seat "finishing the
+    census" has to change it on purpose.
+    """
+
+    def test_the_absent_arm_still_answers_the_undefined_spelling(self):
+        import inspect
+
+        from entity_handlers.local_files import operations
+
+        src = inspect.getsource(operations)
+        assert src.count('"invalid_resource"') == 4, (
+            "the local/files resource-absent spelling moved. If SA-PY-47 has "
+            "been ruled, update this row and sweep all four operations "
+            "together; if it has not, a unilateral change here refuses where "
+            "entity-core-go accepts"
+        )
+        assert "require_single_resource_target" not in src, (
+            "local/files was migrated to the strict helper — that is the "
+            "SA-PY-47 convergence, and it is only correct once the ruling "
+            "says a domain spec with no error table inherits §3.3's defaults"
+        )
+
+
+class TestTheClassClosesAtOneSite:
+    """The structural row: the more-than-one arm lives in ONE helper.
+
+    Nine of the ten sites re-opened this defect independently because each
+    inlined its own absent check and called a lenient shared getter for the
+    value. Re-inlining `resource_target(ctx)` at a resource-requiring site
+    silently restores the gap for that operation alone, and the behavioural
+    rows above only catch it for operations already in `REQUIRES_RESOURCE` —
+    i.e. not for the next one somebody adds.
+    """
+
+    def test_no_resource_requiring_handler_uses_the_lenient_getter(self):
+        import inspect
+
+        from entity_handlers import attestation, quorum, role
+
+        for module in (role, quorum, attestation):
+            src = inspect.getsource(module)
+            # `require_single_resource_target` contains the substring, so
+            # neutralize it before asking about the lenient one.
+            probe = src.replace("require_single_resource_target", "OK")
+            assert "resource_target(ctx)" not in probe, (
+                f"{module.__name__} reads the resource target through the "
+                "lenient getter, which returns targets[0] and never refuses "
+                "an ambiguous request. Use require_single_resource_target — "
+                "§3.3's more-than-one arm is not optional for an operation "
+                "whose spec requires a resource"
+            )
+
+    def test_the_helper_answers_both_arms(self):
+        """A helper that answered one arm would let every call site read as
+        migrated while half the row stayed unimplemented."""
+        import inspect
+
+        from entity_handlers._common import require_single_resource_target
+
+        src = inspect.getsource(require_single_resource_target)
+        assert "path_required" in src
+        assert "ambiguous_resource" in src
 
 
 class TestTheHandlerIsTheRaisingSite:

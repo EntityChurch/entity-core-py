@@ -63,6 +63,7 @@ from entity_handlers.conformance import (
     DispatchOutboundHandler,
     ECHO_HANDLER_PATTERN,
     DISPATCH_OUTBOUND_HANDLER_PATTERN,
+    dispatch_outbound_narrow_grant,
 )
 from entity_handlers.query import (
     QueryExtension,
@@ -273,6 +274,7 @@ __all__ = [
     "DispatchOutboundHandler",
     "ECHO_HANDLER_PATTERN",
     "DISPATCH_OUTBOUND_HANDLER_PATTERN",
+    "dispatch_outbound_narrow_grant",
     # Query handler (EXTENSION-QUERY v1.0)
     "QueryExtension",
     "QUERY_HANDLER_PATTERN",

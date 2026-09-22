@@ -401,9 +401,13 @@ def create_inbox_token(
 ) -> tuple[Entity, Entity, Entity]:
     """Create a capability token authorizing inbox delivery.
 
-    Creates a token that grants the grantee permission to deliver results
-    to a specific inbox URI. The token is restricted to the inbox
-    handler and the receive operation.
+    **This is `EXTENSION-SUBSCRIPTION` §1.2's row-2 shape** — granter = the
+    inbox owner, grantee = the peer that will deliver — so it is the same
+    object as :func:`entity_core.capability.grant.mint_deliver_token`, which
+    is where the implementation lives and where the two Phase 1 properties are
+    stated and enforced. This name is kept because it is the exported one;
+    it delegates rather than carrying a second copy of the construction,
+    because one concept with two implementations is how the two drift.
 
     Args:
         granter_keypair: The granter's keypair (inbox receiver).
@@ -425,41 +429,12 @@ def create_inbox_token(
             ttl_ms=60000,  # 1 minute
         )
     """
-    # Parse the resource path from inbox_uri
-    from entity_core.utils.path import extract_handler_path
-    resource_path = extract_handler_path(inbox_uri)
+    from entity_core.capability.grant import mint_deliver_token
 
-    # Create grant for inbox handler with restricted scope
-    grants = [
-        Grant.create(
-            handlers=["system/inbox/*"],
-            resources=[resource_path],
-            operations=[inbox_operation],
-        ),
-    ]
-
-    # Use standard token creation
-    capability_entity, granter_identity, signature_entity = create_capability_token(
+    return mint_deliver_token(
         granter_keypair,
         grantee_identity,
-        grants,
-        expires_in_ms=ttl_ms,
+        inbox_uri,
+        inbox_operation,
+        ttl_ms,
     )
-
-    # Add no_delegation caveat to the capability
-    from entity_core.protocol.auth import create_signature_entity
-
-    cap_data = capability_entity.data.copy()
-    cap_data["delegation_caveats"] = DelegationCaveats(no_delegation=True).to_dict()
-
-    capability_entity = Entity(
-        type="system/capability/token",
-        data=cap_data,
-    )
-
-    # Re-sign with updated data
-    granter_hash = granter_identity.compute_hash()
-    cap_hash = capability_entity.compute_hash()
-    signature_entity = create_signature_entity(granter_keypair, cap_hash, granter_hash)
-
-    return capability_entity, granter_identity, signature_entity

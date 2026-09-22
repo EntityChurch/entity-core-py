@@ -301,3 +301,108 @@ def create_connect_grants() -> list[Grant]:
             operations=["request"],
         ),
     ]
+
+
+def mint_deliver_token(
+    inbox_owner_keypair: Keypair,
+    delivering_engine_identity: Entity,
+    inbox_uri: str,
+    inbox_operation: str = "receive",
+    ttl_ms: int | None = None,
+) -> tuple[Entity, Entity, Entity]:
+    """Mint an `EXTENSION-SUBSCRIPTION` §1.2 **subscription deliver_token**.
+
+    This is the row-2 capability of §1.2's three-slot table — *"future async
+    dispatch from the subscription engine to the subscriber's inbox"* — and it
+    is a different object from the two rows either side of it. Getting the
+    slot wrong is the failure §1.2 opens by naming: *"confusing them is a
+    common source of design and review confusion."*
+
+    .. rubric:: The two properties, together (arch's Subscription Phase 1)
+
+    1. **A-rooted** — issued by *"the authority of the peer that owns the
+       target inbox"* (§1.2). Here that is ``inbox_owner_keypair``: for A
+       subscribing to B's data, **A** signs, because A is authorizing B's
+       engine to reach A's inbox. A B-rooted token is B authorizing itself.
+    2. **`grantee` = the delivering engine** — ``delivering_engine_identity``,
+       i.e. **B**, the peer whose subscription engine will originate the
+       delivery. §1.2's §7 pseudocode states the pair outright: *"the deliver
+       token (granter = subscriber, grantee = server)."*
+
+    **A self-grant (granter == grantee == the subscriber) satisfies neither
+    half in substance** and is the shape that quietly does nothing: §1.4's
+    outbound gate relaxes Dimension 4 only for a credential whose leaf
+    ``grantee`` is the peer about to spend it, so a token granted back to the
+    subscriber relaxes **nothing** for B's engine. It looks like authority and
+    is inert — which is why it is refused here rather than left to fail
+    silently at delivery time, two peers and one async hop away from the mint.
+
+    .. rubric:: Phase 1 mints; it does not gate
+
+    Nothing in this repo *presents* this token on the outbound delivery path
+    yet — that is Phase 2, and per arch's sequencing no seat presents before
+    all three mint. See ``docs/SPEC-AMBIGUITIES.md`` SA-PY-46 for the measured
+    consequence of landing the gating half early.
+
+    Args:
+        inbox_owner_keypair: The subscriber's keypair (A) — the peer that owns
+            the target inbox. This is the **root** of the token's authority.
+        delivering_engine_identity: The identity entity of the peer whose
+            subscription engine will deliver (B). Becomes the ``grantee``.
+        inbox_uri: The inbox URI to authorize, e.g.
+            ``entity://{A}/system/inbox/{name}``.
+        inbox_operation: The operation to authorize (``receive``).
+        ttl_ms: Optional time-to-live in milliseconds.
+
+    Returns:
+        ``(capability_entity, granter_identity, signature_entity)`` — the
+        three entities the subscribe request must carry in ``included``.
+
+    Raises:
+        ValueError: if the grantee is the inbox owner itself (the inert
+            self-grant above).
+    """
+    from entity_core.capability.token import DelegationCaveats
+    from entity_core.utils.path import extract_handler_path
+
+    owner_identity = create_identity_entity(inbox_owner_keypair)
+    if owner_identity.compute_hash() == delivering_engine_identity.compute_hash():
+        raise ValueError(
+            "a subscription deliver_token granted back to the inbox owner is "
+            "a self-grant and relaxes nothing: §1.4 relaxes Dimension 4 only "
+            "for a credential whose leaf grantee is the peer spending it, so "
+            "the delivering engine gets no authority from this token. "
+            "EXTENSION-SUBSCRIPTION §1.2: granter = subscriber, "
+            "grantee = server"
+        )
+
+    resource_path = extract_handler_path(inbox_uri)
+    grants = [
+        Grant.create(
+            handlers=["system/inbox/*"],
+            resources=[resource_path],
+            operations=[inbox_operation],
+        ),
+    ]
+
+    capability_entity, granter_identity, _signature_entity = (
+        create_capability_token(
+            inbox_owner_keypair,
+            delivering_engine_identity,
+            grants,
+            expires_in_ms=ttl_ms,
+        )
+    )
+
+    # A deliver_token is spent by one named engine at one named inbox; there
+    # is no onward party for it to be delegated to, so the caveat is part of
+    # the shape rather than a hardening option.
+    cap_data = capability_entity.data.copy()
+    cap_data["delegation_caveats"] = DelegationCaveats(no_delegation=True).to_dict()
+    capability_entity = Entity(type="system/capability/token", data=cap_data)
+
+    granter_hash = granter_identity.compute_hash()
+    signature_entity = create_signature_entity(
+        inbox_owner_keypair, capability_entity.compute_hash(), granter_hash,
+    )
+    return capability_entity, granter_identity, signature_entity

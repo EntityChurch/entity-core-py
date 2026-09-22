@@ -65,11 +65,72 @@ def params_data(params: Any) -> dict[str, Any]:
 
 
 def resource_target(ctx: HandlerContext) -> str | None:
-    """First resource-target path from the dispatch context, if any."""
+    """First resource-target path from the dispatch context, if any.
+
+    **Lenient by design, and therefore wrong for an operation that REQUIRES a
+    resource** — it answers the same thing for one target and for three. Use
+    :func:`require_single_resource_target` at any site whose own specification
+    requires a resource; this one is for the genuinely optional case.
+    """
     targets = getattr(ctx, "resource_targets", None) or []
     if targets and isinstance(targets[0], str):
         return targets[0]
     return None
+
+
+def require_single_resource_target(
+    ctx: HandlerContext, what: str,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """The §3.3 400-row split for an operation whose spec requires a resource.
+
+    Returns ``(path, None)`` or ``(None, error_response)``.
+
+    .. rubric:: Two inputs, two remedies, two codes
+
+    ENTITY-CORE-PROTOCOL §3.3's 400 row (0.8.2.18, scope generalized at
+    0.8.2.19): *"an operation that requires a resource answers ABSENT with
+    `path_required` and MORE THAN ONE with `ambiguous_resource` — the two are
+    different inputs with different remedies… a handler specification that
+    collapses them into one code is non-conformant on the absent case."*
+    *Supply a resource* is not *disambiguate the one you sent*.
+
+    .. rubric:: Why this helper exists rather than the check being inlined
+
+    The absent arm was inlined at ten sites and the **more-than-one arm at
+    none of them** — every one called :func:`resource_target`, which silently
+    returns ``targets[0]``. So ten resource-requiring operations *declared*
+    the resource required (they refuse the absent case) and then accepted a
+    three-target request as if it named one.
+
+    That arm is invisible to a census keyed on emissions: grepping
+    `ambiguous_resource` finds the sites that already answer it and can never
+    find the sites that should. It is equally invisible to a probe, because
+    nobody sends two resource targets by accident. Only a census keyed on the
+    **row's input** — *is this an operation whose own spec requires a
+    resource?* — reaches it, and the code's own `path_required` is that
+    admission. One helper, so the class cannot re-open one call site at a
+    time.
+
+    Args:
+        ctx: The dispatch context.
+        what: Human-readable description of the required target, used in both
+            messages (e.g. ``"system/role:assign requires a resource target
+            (the assignment path)"``).
+    """
+    targets = getattr(ctx, "resource_targets", None) or []
+    if not targets:
+        return None, error_response(400, "path_required", f"{what}.")
+    if len(targets) != 1:
+        return None, error_response(
+            400, "ambiguous_resource",
+            f"{what}, and exactly one — {len(targets)} were supplied "
+            "(§3.3: absent and more-than-one are different inputs with "
+            "different remedies).",
+        )
+    first = targets[0]
+    if not isinstance(first, str):
+        return None, error_response(400, "malformed_resource", f"{what}.")
+    return first, None
 
 
 def now_ms() -> int:
