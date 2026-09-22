@@ -1120,6 +1120,109 @@ class TestPull:
         assert follower_tree.get(follower_tree.normalize_uri("data/a.txt")) is not None
         assert follower_tree.get(follower_tree.normalize_uri("data/b.txt")) is not None
 
+    @pytest.mark.asyncio
+    async def test_pull_from_an_empty_remote_is_200_remote_empty(self, tree_registry):
+        """`[MUST]` EXTENSION-REVISION v3.13 §4.4.8 — an empty remote is a RESULT.
+
+        This site answered `500 remote_empty` from the day `pull` was written, and
+        **nothing in ~90 revision tests drove it** — the whole class exercised remotes
+        that had committed. `entity-core-go` found it by censusing 500 spellings, not
+        by a probe, because the 500 row is explicitly *not drivable by a conformance
+        client* (§3.3 satisfaction mode, 0.8.2.8): a conformant peer cannot be made to
+        fail internally on demand, so the row is satisfied by source audit. **A status
+        that only a source audit can reach is one no cross-impl run will ever report** —
+        which is exactly how a 500 sat on a non-failure for the life of the operation.
+
+        The ruling's criterion is the one `EXTENSION-TYPE` Appendix A applies to the
+        lookup miss — ***can the declared result type carry the outcome?*** — and it
+        answers the opposite way here, because `merge-result.status` is precisely the
+        field for it. Same rule, two directions, in one session.
+        """
+        remote_cs = ContentStore()
+        remote_tree = EntityTree("empty-remote")
+        remote_emit = EmitPathway(remote_cs, remote_tree)
+        remote_registry = TreeRegistry(remote_tree, remote_cs)
+        permissive = {"grants": [{"handlers": {"include": ["*"]},
+                                  "resources": {"include": ["*"]},
+                                  "operations": {"include": ["*"]}}]}
+        remote_ctx = HandlerContext(
+            local_peer_id="empty-remote", remote_peer_id="follower",
+            handler_grant=permissive, caller_capability=permissive,
+            emit_pathway=remote_emit, tree_registry=remote_registry,
+            handler_pattern="system/revision",
+        )
+        # Deliberately no commit: the remote has no versions at the prefix.
+
+        follower_cs = ContentStore()
+        follower_tree = EntityTree("follower")
+        follower_emit = EmitPathway(follower_cs, follower_tree)
+        follower_ctx = HandlerContext(
+            local_peer_id="follower", remote_peer_id="empty-remote",
+            handler_grant=permissive, caller_capability=permissive,
+            emit_pathway=follower_emit, tree_registry=tree_registry,
+            handler_pattern="system/revision",
+        )
+
+        async def dispatcher(uri, op, params, cap, bounds, cid, rt=None, **kw):
+            resp = await revision_handler("system/revision", op, params, remote_ctx)
+            return ExecuteResult(status=resp["status"], result=resp.get("result"))
+
+        follower_ctx._execute_dispatcher = dispatcher
+
+        result = await revision_handler(
+            "system/revision", "pull",
+            {"data": {"prefix": "", "remote": "empty-remote"}}, follower_ctx,
+        )
+
+        assert result["status"] == 200, (
+            "v3.13: a peer that answers `500 remote_empty` tells a caller its own "
+            f"machinery broke when the remote simply has nothing to send; got {result}"
+        )
+        assert result["result"]["type"] == "system/revision/merge-result"
+        data = result["result"]["data"]
+        assert data["status"] == "remote_empty"
+        assert "version" not in data, (
+            "the spec's own note beside the enum: the outcomes that produce no merge "
+            "carry no version, and a caller branching on `version` presence must not "
+            "see one here"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_empty_remote_and_the_error_paths_do_not_collapse(
+        self, tree_registry
+    ):
+        """Teeth. A peer that answered `200 remote_empty` to *everything* passes the
+        row above, and so does one that stopped distinguishing an empty remote from an
+        unreachable one — which is the substantive half of the ruling, since `502
+        remote_fetch_failed` is still an error and still means something different.
+        """
+        permissive = {"grants": [{"handlers": {"include": ["*"]},
+                                  "resources": {"include": ["*"]},
+                                  "operations": {"include": ["*"]}}]}
+        follower_cs = ContentStore()
+        follower_tree = EntityTree("follower")
+        follower_ctx = HandlerContext(
+            local_peer_id="follower", remote_peer_id="unreachable",
+            handler_grant=permissive, caller_capability=permissive,
+            emit_pathway=EmitPathway(follower_cs, follower_tree),
+            tree_registry=tree_registry, handler_pattern="system/revision",
+        )
+
+        async def failing_dispatcher(uri, op, params, cap, bounds, cid, rt=None, **kw):
+            raise ConnectionError("no route to peer")
+
+        follower_ctx._execute_dispatcher = failing_dispatcher
+
+        result = await revision_handler(
+            "system/revision", "pull",
+            {"data": {"prefix": "", "remote": "unreachable"}}, follower_ctx,
+        )
+        assert result["status"] == 502, (
+            "an unreachable remote is still an error — the v3.13 ruling moves the "
+            "no-versions case only"
+        )
+        assert result["result"]["data"]["code"] == "remote_fetch_failed"
+
 
 class TestCollectMissingPullHashes:
     """Unit tests for the pull trie-walk missing-hash collector."""

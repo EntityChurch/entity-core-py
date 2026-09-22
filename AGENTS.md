@@ -1614,6 +1614,61 @@ fails the gates rather than slipping past them.
   its reasoning and filed as SA-PY-35, because a later reader "completing" Q2 from the summary
   would serve a keepalive to a peer that has proved nothing.
 
+- **When the spec assigns a row to SOURCE AUDIT, nothing will ever fail on it — so the census is
+  the only detector, and it has to be scheduled rather than triggered.** *Candidate, 2026-09-04 —
+  `remote_empty`, which shipped wrong from the day `pull` was written and was found by
+  `entity-core-go` censusing 500 spellings, not by any probe.* §3.3's satisfaction mode (0.8.2.8)
+  says the 500 row is **not drivable by a conformance client**: *"a conformant peer cannot be made
+  to fail internally on demand over the wire, so this row is satisfied by a source audit of the
+  implementation's emit sites at a named commit."* That is correct, and it has a consequence the
+  paragraph does not state: **a status class excluded from wire testing is a status class in which
+  a wrong answer is structurally undetectable.**
+  **And the shape that made this one worse than a mis-spelled code.** The defect was not a wrong
+  *code* at a real failure — it was a `500` on something that **is not a failure at all**. A
+  remote with no versions is a normal outcome, so the wrong status was reachable by ordinary use
+  and *still* invisible: no probe drives it (500 is exempt), no local test drove it (~90 revision
+  tests and every one used a remote that had committed), and the emit site reads perfectly
+  sensible in isolation. The census caught it because a census enumerates **emit sites** rather
+  than failures, and an emit site on a success path is exactly what a failure-driven method
+  cannot reach.
+  **The check, and it is a calendar item rather than a rule:** for every row the corpus hands to
+  source audit, put the census on the same schedule as the validator run — and census by **emit
+  site**, then ask of each *"is the condition that reaches this line actually a failure?"*. That
+  second question is the one that finds this class; *"is this code defined?"* would have passed
+  `remote_empty` right up until the moment REVISION defined it as a 200.
+  Enforcement point: `tests/integration/test_undeclared_500_code_census.py` (the standing census,
+  monotone in both directions) plus
+  `test_revision_extension.py::test_pull_from_an_empty_remote_is_200_remote_empty` and its
+  unreachable-remote teeth control, because the substantive half of the ruling is that `502
+  remote_fetch_failed` still means something different.
+
+- **A fold answers some questions by OMISSION, and an omission from a table nobody had before is
+  a ruling that arrives with nothing to prompt it.** *Candidate, 2026-09-04 — filed as SA-PY-40,
+  found walking `EXTENSION-TYPE` v1.3 Appendix A after the fold rather than only the rows a
+  sibling's gate drives.* This is the *"a ruling you already satisfy produces no diff"* law's
+  sibling and it is worse in one specific way: there the normal forcing function (a behaviour
+  change) is absent; here **there is no notification at all**, because the ruling is a row that
+  is not present.
+  **The mechanism.** A code minted where its extension had no error table is merely *undeclared*.
+  The moment a table lands, §3.3's *"an undefined spelling is non-conformant"* binds it — so **a
+  table landing retroactively converts every undeclared code in that handler's surface into a
+  defect**, without touching a line of anyone's code. Measured: `entity-core-go` implemented three
+  of the fold's four type-surface rulings in one clean cycle and reported the seat conformant and
+  gate-green; the fourth (`decode_error` ×8 / `encode_error` ×3 / `invalid_entity` /
+  `invalid_strategy` → the Appendix A defaults, which the proposal's §6a.4 had *already* routed as
+  *"go aligns; nothing new is minted"*) had no row to implement **against**, so nothing surfaced
+  it. Their own type gate drives neither a decode failure nor a bad strategy, which is the
+  under-scoped-gate law they ratified in the same session, applied to the gate they wrote.
+  **And the mirror was here**, disclosed in the same filing rather than after: py emits `400
+  invalid_strategy` at two sites (`revision:merge`, `tree:merge`) whose owning tables define no
+  such row — the code is real, it is just defined for a *different operation*. **"Defined in the
+  corpus" is not the test; "defined for the operation" is**, and a grep that answers the first
+  question reads like it answered the second.
+  **The check:** when a table lands for a surface you implement — *especially* one you helped
+  argue for — census that surface's whole code slot against the new table in the same session, in
+  both directions. And do not route the sibling's half without walking your own first: the
+  finding is the class, and the class is never one-sided.
+
 - **A cross-impl probe that reads one field of a result says nothing about the others — and
   two implementations agreeing is not a majority verdict.** *Candidate, 2026-08-17 — found
   by building the `entity_sdk.revision` wrapper against §4.5.* `checkout` must answer
@@ -1688,8 +1743,28 @@ fails the gates rather than slipping past them.
   pinning both boundaries to one set. Four mutations, four correct predictions.
 
 - **A DRAFT ruling is a thing to build, not a thing to wait on — the fold ratifies what the
-  seats built.** *Candidate, 2026-09-01. Cost: one pass of held work and a packet arguing for
-  the hold.* Arch ruled §4.7 row 10 in `PROPOSAL-CONNECT-SURFACE-RECONCILIATION` (FM-2), whose
+  seats built.** ***RATIFIED 2026-09-04*** *— second instance, a different shape, a different
+  seat, and the same source sentence, which is what makes it structural rather than a habit.*
+  `entity-core-go` classified a whole board of items as *"prepare-then-land, gated on an arch
+  spec-fold"*, traced the idea to `AGENTS-STANDARD`'s *"implement against the landed spec, not
+  in-flight proposals"* — **the same line we cited when we held** — and had the operator strike
+  it. Two seats, three days apart, reached the identical wrong posture from one sentence in the
+  file that is injected into every repo. **A leak in the shared standard does not present as a
+  shared mistake; it presents as two independent seats each being cautious**, and neither one
+  can see the other's reasoning to notice the common cause.
+  **The half that is still open here, and it is a real hazard rather than a footnote.** go fixed
+  the sentence **in their working copy**. `AGENTS-STANDARD.md` opens with *"This file is
+  identical in every entity-core repo… Do not edit it in your repo"* — so their copy and ours
+  now differ, and **nothing anywhere checks that the identical-everywhere file is identical**.
+  This repo's copy still reads *"implement against the landed spec, not in-flight proposals"*,
+  which by that file's own precedence rule (*"this file wins on ecosystem conventions"*)
+  outranks the entry you are reading. Our behaviour is right because this charter is what a
+  session actually reads first; that is luck, not a mechanism. **Until the meta sync lands,
+  treat this entry as the operative rule and expect the shared file to disagree with it** — and
+  do not fix it here, because a second local edit to an injected file is how "identical" becomes
+  unrecoverable rather than merely stale.
+  *(Original entry, 2026-09-01 — the first instance:)* Arch ruled §4.7 row 10 in
+  `PROPOSAL-CONNECT-SURFACE-RECONCILIATION` (FM-2), whose
   §7 reads *"No seat implements ahead of the fold."* We held on that sentence plus
   `AGENTS-STANDARD`'s *"implement against the landed spec, not in-flight proposals"*, and
   reported the resulting gate FAIL red. **go and rust had both already built it.** The cohort's
@@ -1829,9 +1904,71 @@ fails the gates rather than slipping past them.
   later, so it had been disagreeing with **itself** the whole time. *A cross-impl divergence
   that is also an internal one was never a spec question.*
 
+- **A mutation that reddens NOTHING is a finding about the code, not a shortfall in the test —
+  and the usual culprit is a defensive arm that already answers the same thing.** *Candidate,
+  2026-09-04, landing the type-op alignment.* The new `404 type_not_found` gate went onto five
+  operations and each got a mutation. `converge`'s unarming reddened the two predicted rows;
+  `adopt`'s reddened **nothing — 33/33 green with the gate deleted**. The reason is not a weak
+  assertion: `op_adopt` raises `ValueError` for exactly one cause, the `except ValueError` arm
+  routed it to the same `_type_not_found`, so **two independent paths produced one wire answer**
+  and no single mutation could distinguish them.
+  **Why the standing laws do not already cover it.** The mutation discipline says *a mutation
+  nobody runs is a claim* — this one ran. The prediction rule says *when a mutation is caught by
+  a test you did not predict, the prediction is the finding* — nothing caught it, which is the
+  case that rule has no arm for, and the tempting reading is *"my row is too weak, strengthen
+  it."* **That reading is wrong here and it is wrong in the expensive direction**: it sends you
+  to write a sharper assertion for a gate that is not doing any work, and leaves the duplicate
+  path in place, where the *next* seat deletes the arm that was actually load-bearing.
+  **What it is a shape of:** the two-representations law with **control-flow paths** as the two
+  representations. It is invisible to review for the ordinary reason — both paths are correct,
+  and a reviewer checking that each produces the right code finds nothing wrong at either. It
+  is invisible to the *mutation run* for the interesting reason: the run's whole method is
+  single-point disablement, and redundancy is precisely what that method cannot see.
+  **The check:** when a mutation fires on nothing, ask *what else answers this?* before touching
+  the test. If the answer is a `try`/`except` or a fallback the new gate now precedes, the arm
+  is dead by construction — delete it, and let the gate be the only path. Keep a fallback only
+  where it answers a **different** status for a **different** cause, which is exactly why
+  `converge`/`reconcile` keep theirs and why their mutation fires.
+  Enforcement point: `_op_adopt_dispatch` has no `except` arm at all, with the measured 33/33
+  green recorded at the call site so a later reader restoring it "for safety" is told what it
+  costs; the row that now discriminates is
+  `test_an_unresolvable_type_is_404_type_not_found[adopt]`, re-verified RED.
+
 - **A cohort-consistency argument is only as good as the census behind it — and the generated
-  family is the one a ground-up seat forgets it is in a cohort with.** *Candidate, 2026-09-02 —
-  SA-PY-31 ruled against the arm we shipped.* §4.5 left the absent/empty `protocols` arm
+  family is the one a ground-up seat forgets it is in a cohort with.** ***RATIFIED 2026-09-04***
+  *— second instance, and the missing seat was a **ground-up** one, which retires the comforting
+  reading that the first instance was about keystone being invisible.*
+  `entity-core-go`'s item-D ledger routes two 500 tokens to arch as cohort-consistency
+  arguments: **bless** `storage_error` (*"a consistent, deliberate 14× convention"* for a
+  durable tree-bind failure) and **keep** `backend_error`. The census behind both polled go and
+  rust. Running the identical census here **splits the two recommendations apart**:
+  `backend_error` and `remote_empty` are corroborated — one site each, in the subsystems go
+  names, reached independently — while `storage_error` is ×1 here, and the same failure is
+  spelled `io_error` ×7 in `local_files`, *the exact subsystem go spells `storage_error` ×4*,
+  plus `bind_failed` in `identity`. **The token is not a cohort convention; it is a go
+  convention**, and go's own warning (*"do NOT converge 2 of 14 — that manufactures the
+  divergence"*) is measuring the wrong scope: the cross-**seat** divergence already exists, and
+  nothing reports it because no probe reads a 500 code.
+  **The reusable half, and it is what makes this different from a duplicate of the first
+  instance:** a census of *your own tree* answers *"is this consistent here"*, and a
+  consistency argument is a claim that it is consistent **everywhere**. Those are different
+  sentences and one grep separates them. So when you recommend a **bless** — the branch where
+  the spec ratifies what implementations already do — the evidence has to come from the seats
+  that would be ratified, and *"14 sites"* is a count of one seat however large it gets.
+  **And say which branch the recommendation actually is.** Blessing `storage_error` is a
+  **convergence instruction to this seat**, not the ratification of a shared practice. That is a
+  perfectly good outcome; it is just the opposite of what the word *bless* implies, and the
+  routing packet is where the difference has to be visible.
+  Enforcement point: `tests/integration/test_undeclared_500_code_census.py` — a ledger of every
+  undefined 500 spelling with its count, monotone in both directions, plus
+  `TestTheTreeBindFamilyIsTheFindingGoCouldNotMake`, which fails if the family collapses so the
+  packet's premise cannot go stale silently. *The gate corrected its author on its first run
+  again (fourth instance): the `grep -E` census in the routing draft reported 36 sites and the
+  AST walk found **40** — `invalid_blob` ×2 is split across lines. **A regex census of code
+  emissions is a count of the token**, which is AP-21's own subject arriving inside the remedy
+  for AP-21, exactly as SA-PY-37 did.*
+
+  *(First instance, 2026-09-02 — SA-PY-31 ruled against the arm we shipped:)* §4.5 left the absent/empty `protocols` arm
   undefined; we picked reading 1 (unconstrained), **matching `entity-core-go` byte for byte**,
   and filed rather than settling — on the stated ground that *"a responder that refuses where
   its sibling accepts partitions the cohort, and inventing that out of a gap is the error this

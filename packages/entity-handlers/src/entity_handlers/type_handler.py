@@ -133,10 +133,41 @@ async def type_handler(
 # ---------------------------------------------------------------------------
 
 
+# `PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §6a.3, adopting `entity-core-go`'s
+# spelling. Cited to the **proposal**, deliberately, and not to its target
+# `EXTENSION-TYPE` §8.5 — that anchor is already occupied by
+# `### 8.5 system/type/violation` (verified in the arch tree), so a reader sent
+# to §8.5 today gets the violation type rather than this rule. The fold owes a
+# renumber; the behaviour does not wait on it.
+#
+# Bare `not_found` — which this seat emitted — is ambiguous with the
+# entity-level 404 that `0.8.2.7`'s 404 row carves out, and says nothing about
+# *which* lookup missed. Under `0.8.2.7` a more-specific code is permitted only
+# where defined for the operation in a spec code set, and `EXTENSION-TYPE`
+# declares none: this proposal is `COHORT-OPEN-ITEMS` OP-3's first worked
+# instance, so the row's home is owed rather than existing.
+_TYPE_NOT_FOUND = "type_not_found"
+
+
+def _type_not_found(missing: list[str]) -> dict[str, Any]:
+    """The one refusal, so the five operations cannot drift apart.
+
+    `converge`/`adopt`/`reconcile` each reached this answer through their own
+    `except ValueError` arm, spelled three ways at two statuses. One spelling
+    with five call sites is the remedy the *two hand-rolled copies of one
+    traversal* entry prescribes.
+    """
+    return _error(
+        404,
+        _TYPE_NOT_FOUND,
+        "type not present in the type system: " + ", ".join(sorted(missing)),
+    )
+
+
 def _unresolvable(
     ctx: "HandlerContext", *names: str,
 ) -> dict[str, Any] | None:
-    """`404 not_found` when any named type does not resolve, else None.
+    """`404 type_not_found` when any named type does not resolve, else None.
 
     ``PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY`` row 4, on the criterion arch
     adopted from ``entity-core-rust`` and which replaced its own flat `404`:
@@ -177,11 +208,7 @@ def _unresolvable(
     ]
     if not missing:
         return None
-    return _error(
-        404,
-        "not_found",
-        "type not present in the type system: " + ", ".join(sorted(missing)),
-    )
+    return _type_not_found(missing)
 
 
 def _op_compare_dispatch(
@@ -243,12 +270,22 @@ def _op_converge_dispatch(
             "invalid_request",
             "system/type:converge requires `type_paths` (>= 2 entries)",
         )
-    try:
-        result = op_converge(
-            [p for p in paths if isinstance(p, str)],
-            resolve=lambda n: _resolve_type(n, ctx),
+    if not all(isinstance(p, str) for p in paths):
+        # Was silently filtered, which made `[1, 2]` answer *"requires >= 2
+        # entries"* — a message about a defect the request does not have, and
+        # the filtered list is also what let the length check inside
+        # `op_converge` stay reachable behind a guard that had already passed.
+        return _error(
+            400,
+            "invalid_request",
+            "system/type:converge `type_paths` entries must be strings",
         )
-    except ValueError as exc:
+    missing = _unresolvable(ctx, *paths)
+    if missing is not None:
+        return missing
+    try:
+        result = op_converge(paths, resolve=lambda n: _resolve_type(n, ctx))
+    except ValueError as exc:  # pragma: no cover — both arms guarded above
         return _error(400, "invalid_request", str(exc))
     return {"status": 200, "result": result}
 
@@ -271,15 +308,25 @@ def _op_adopt_dispatch(
     # cross-peer adopt is a wire/connection concern handled by the
     # peer's outbound dispatch elsewhere; the op itself just needs a
     # resolver for each side.
-    try:
-        result = op_adopt(
-            source_path=source_path,
-            local_name=local_name,
-            resolve_remote=lambda n: _resolve_type(n, ctx),
-            resolve_local=lambda n: _resolve_type(n, ctx),
-        )
-    except ValueError as exc:
-        return _error(404, "not_found", str(exc))
+    missing = _unresolvable(ctx, source_path)
+    if missing is not None:
+        return missing
+    # No `except ValueError` arm, and its absence is load-bearing. `op_adopt`
+    # raises for exactly one reason — the source did not resolve — which the
+    # gate above now decides. Keeping the arm as "defence" left two independent
+    # paths producing one wire answer, so **unarming the gate changed nothing
+    # observable and no mutation could redden the row**: measured, 33/33 green
+    # with the gate deleted. A dead arm that silently substitutes for a gate is
+    # the same defect as two spellings of one refusal, wearing safety as a
+    # costume. `converge`/`reconcile` keep theirs because theirs answers a
+    # *different* status for *different* causes, which is why their mutation
+    # fires.
+    result = op_adopt(
+        source_path=source_path,
+        local_name=local_name,
+        resolve_remote=lambda n: _resolve_type(n, ctx),
+        resolve_local=lambda n: _resolve_type(n, ctx),
+    )
     return {"status": 200, "result": result}
 
 
@@ -295,18 +342,34 @@ def _op_reconcile_dispatch(
             "invalid_request",
             "system/type:reconcile requires `type_paths` (>= 2 entries)",
         )
-    if not isinstance(strategy, str):
+    if not all(isinstance(p, str) for p in paths):
+        return _error(
+            400,
+            "invalid_request",
+            "system/type:reconcile `type_paths` entries must be strings",
+        )
+    # Hoisted out of `op_reconcile`, and the hoist is the point rather than
+    # tidiness: the new lookup gate below would otherwise sit *ahead* of the
+    # enum check, so a request that is wrong in both dimensions would answer
+    # `404` for a `strategy` the operation cannot perform under at all. A
+    # structural defect of the request is decided before a lookup miss — the
+    # order `compare`/`compatible` already had, made explicit here instead of
+    # inherited from which check happened to be written first.
+    if strategy not in {"intersect", "union", "prefer"}:
         return _error(
             400, "invalid_request",
             "system/type:reconcile requires `strategy` (intersect|union|prefer)",
         )
+    missing = _unresolvable(ctx, *paths)
+    if missing is not None:
+        return missing
     try:
         result = op_reconcile(
-            [p for p in paths if isinstance(p, str)],
+            paths,
             strategy=strategy,
             resolve=lambda n: _resolve_type(n, ctx),
         )
-    except ValueError as exc:
+    except ValueError as exc:  # pragma: no cover — all three arms guarded above
         return _error(400, "invalid_request", str(exc))
     return {"status": 200, "result": {"type": RECONCILE_RESULT_TYPE, "data": result}}
 

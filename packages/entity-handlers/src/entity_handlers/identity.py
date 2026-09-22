@@ -2207,7 +2207,15 @@ async def handle_publish_attestation(
     except Exception as e:
         # bind(new_path) failed: old path remains bound. No orphan; no
         # tombstone needed. Surface the error.
-        return _error(500, "bind_failed", str(e))
+        #
+        # `storage_error`, not the minted `bind_failed`. §3.3's 500 row
+        # (0.8.2.8) defines it — *"a content-store or tree bind/read failed …
+        # a store failure anywhere is `storage_error`"* — and `emit()` is a
+        # tree bind. This site is what `entity-core-go` was looking for when
+        # they asked whether any of py's local-files `io_error`s were tree
+        # binds: none are (all seven are the enumerated OS syscalls), and the
+        # tree bind wearing a minted name was here instead.
+        return _error(500, "storage_error", str(e))
 
     # Unbind old, with a single retry, per PI-3 SHOULD-retry.
     if old_path is not None and old_path != new_path:

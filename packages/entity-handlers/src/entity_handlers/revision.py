@@ -3135,8 +3135,11 @@ async def _handle_pull(
     - 400 invalid_params       — prefix or remote missing/undecodable
     - 403 capability_denied    — caller lacks pull cap on prefix
     - 502 remote_fetch_failed  — outbound fetch/fetch-entities errored
-    - 500 remote_empty         — remote has no head at the prefix
     - 500 internal_error       — version entity missing after ingest
+
+    A remote with no head at the prefix is **not** in that list: it is a
+    `200` with `merge-result.status = "remote_empty"` and `version` absent
+    (`[MUST]`, v3.13 §4.4.8).
     """
     # `prefix` is required, but "" is the valid universal-tree prefix —
     # only a missing (None) prefix is invalid.
@@ -3198,10 +3201,27 @@ async def _handle_pull(
     fetch_result = (env_data.get("root") or {}).get("data", {})
     head = fetch_result.get("head")
     if not head:
-        return _error_response(
-            500, "remote_empty",
-            f"remote {remote} has no versions at prefix {prefix}",
-        )
+        # `[MUST]` EXTENSION-REVISION v3.13 §4.4.8. An empty remote is a
+        # RESULT, not an error: nothing failed internally, and a peer that
+        # answers `500 remote_empty` tells a caller its own machinery broke
+        # when the honest answer is that the remote has nothing to send.
+        #
+        # Same criterion `EXTENSION-TYPE` Appendix A applies to the lookup
+        # miss — ***can the declared result type carry the outcome?*** — and
+        # here it can: `merge-result.status` is the field for it. That is why
+        # this one goes the opposite way from the type-op 404s, which move
+        # from 200 to a refusal because `compatibility-report` has no such
+        # field. One rule, two directions.
+        #
+        # `version` is absent, per the spec's own note beside the enum: the
+        # outcomes that produce no merge carry no version.
+        return {
+            "status": 200,
+            "result": {
+                "type": "system/revision/merge-result",
+                "data": {"prefix": prefix, "status": "remote_empty"},
+            },
+        }
 
     # 3. Walk the remote's trie locally; iteratively fetch-entities until
     #    the head's closure is complete (or the remote stops supplying).
@@ -3750,8 +3770,19 @@ async def _handle_merge_config(
 
     write_result = pathway.emit(write_path, merge_entity, emit_ctx)
     if write_result.status not in (200, 207):
+        # `internal_error`, not `config_write_failed`. §4.4.17's two write
+        # codes (`config/config-write-failed`, `config/tracking-config-write-
+        # failed`) are defined for **set-config**; §4.4.18 `merge-config`
+        # declares no error table, so under §3.3 an undefined 500 spelling
+        # falls to the default. `entity-core-go` answers `internal_error` at
+        # the same site (`ext/revision/merge_config.go:123`), so this is the
+        # cohort's answer and not a local choice.
+        #
+        # The tell was internal, not cross-impl: this file spells the *defined*
+        # code correctly twice at :3535/:3542 and minted an underscored variant
+        # of it here — one concept, two spellings, one file.
         return _error_response(
-            500, "config_write_failed",
+            500, "internal_error",
             f"merge-config write refused (status {write_result.status})",
         )
 
