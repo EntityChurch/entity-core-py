@@ -2355,19 +2355,64 @@ def _effective_dispatch_targets(
     dispatcher makes (F68) and the same one `compute/apply` makes: the set is
     derived once, and what travels is the answer.
 
-    An empty result is **None**, not ``[]``: §3.3 gives an empty effective
-    list and an absent resource the same answer, and a `resource` field naming
-    nothing is a different frame on the wire from no `resource` field at all.
+    .. rubric:: ⛔ An empty result is ``[]``, NOT ``None`` (§3.3, 0.8.2.25)
+
+    This function returned ``effective or None`` and argued it: *"§3.3 gives
+    an empty effective list and an absent resource the same answer."* That
+    sentence was true of §3.3 **before 0.8.2.24** and is now false — and the
+    clause the old docstring put immediately after it is the rule that
+    replaced it: *"a `resource` field naming nothing is a different frame on
+    the wire from no `resource` field at all."* The reasoning was carrying its
+    own refutation.
+
+    0.8.2.24 made the two empties distinct for a resource-optional operation.
+    0.8.2.25 then made the *preservation* an obligation on every narrowing
+    seam, because the distinction is not decidable downstream if the seam
+    erased it:
+
+        *"Where an implementation projects `resource.targets` onto the
+        effective set ahead of the handler (§5.4, §6.5), that projection MUST
+        NOT be lossy about its own emptiness: narrow when narrowing leaves
+        something, and **retain the raw pair when narrowing would empty it**.
+        … **Every seam that narrows is exempted alike**, inbound-wire and
+        in-process sub-dispatch, or one request receives two different answers
+        according to which door it arrived through."*
+
+    py's inbound-wire seam already preserved it — the dispatcher sets the
+    attribute to ``None`` for an absent `resource` and to a list when one is
+    present, and narrowing a present list to nothing leaves ``[]``. **This
+    seam was the one that did not**, so a continuation whose stored `resource`
+    is self-excluded was advanced as though it had named no resource at all:
+    the target handler's absent-case behaviour, which for `tree:snapshot` is
+    the whole tree and for `tree:extract` is every bound entity under it.
+
+    ``[]`` reaching the child `HandlerContext` is what makes
+    `refuse_an_emptied_resource` fire at the target handler's entry, which is
+    where §2.2a wants the refusal.
+
+    .. rubric:: ⚠ py preserves the DISCRIMINATOR, not the raw pair — SA-PY-63
+
+    §3.3 states the remedy as a mechanism (*"retain the raw pair"*) and the
+    invariant one sentence later (*"what survives is the discriminator"*).
+    This seat satisfies the invariant with ``[]`` vs ``None`` rather than by
+    carrying `targets` and `exclude` forward unnarrowed, which is the shape
+    F68 exists to hold: the reduction has ONE derivation, and handing a
+    consumer the raw pair invites a second. Routed, because a seat reading the
+    mechanism as the requirement would be told to restructure a conformant
+    implementation.
     """
     if not isinstance(resource, dict):
         return None
     targets = resource.get("targets")
     if not targets:
+        # Genuinely absent (or a `resource` with no `targets` at all) — the
+        # operation's own absent-case behaviour applies and there is nothing
+        # to preserve.
         return None
-    effective = effective_resource_targets(
+    # PRESENT. From here the answer is a list, possibly empty, never None.
+    return effective_resource_targets(
         list(targets), resource.get("exclude"), ctx.local_peer_id,
     )
-    return effective or None
 
 
 def _remote_peer_of(ctx: HandlerContext, target: Any) -> str | None:

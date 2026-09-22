@@ -33,9 +33,104 @@ logger = logging.getLogger(__name__)
 
 
 class FramingError(Exception):
-    """Error during message framing/deframing."""
+    """Error during message framing/deframing.
 
-    pass
+    .. rubric:: A pre-admission refusal carries its own code AND its own
+       stream disposition (§4.11, 0.8.2.25)
+
+    §4.11 makes the coded frame an obligation of the **class** and the code an
+    obligation of the **cause**, so this exception carries the pair rather
+    than letting the serve loop re-derive it from the message text. Three
+    causes reach this boundary and the corpus gives them three answers:
+
+    * **oversize** (§4.10(a)) → **413** ``payload_too_large``
+    * **un-parseable CBOR** (§4.7, §4.11) → **400** ``invalid_request``
+    * **a truncated payload** (§4.7, §4.11) → **400** ``invalid_request``
+
+    .. rubric:: ``stream_synchronized`` — the axis §4.11 does not name, and
+       the one that decides whether arm (f) is satisfiable
+
+    §4.11 says *"whether the peer closes the connection afterwards is its own
+    choice"*, and §9's ``CORE-PREADMISSION-REFUSAL-1`` arm **(f)** requires
+    that a pre-admission refusal on a **multiplexed** connection not cost an
+    admitted in-flight request its response (§4.9(c)). Those two can only both
+    hold where the refusal leaves the stream **synchronized** — i.e. where a
+    whole length-prefixed frame was consumed and the next read starts on a
+    frame boundary:
+
+    * **un-parseable CBOR with a complete payload** — the frame was consumed
+      whole, so the next boundary is known. The connection CAN survive, and
+      arm (f) says it must. ``stream_synchronized = True``.
+    * **a truncated payload** — the sender promised ``length`` bytes and sent
+      fewer. There is no way to find the next boundary, so a peer that kept
+      reading would interpret the *next* frame's bytes as the tail of this
+      one. The close is forced, not chosen. ``stream_synchronized = False``.
+    * **oversize** — detected at the length prefix with ``length`` bytes still
+      in the socket. Draining them to resynchronize is exactly the unbounded
+      read §4.10(a) exists to refuse, so the close is forced here too.
+      ``stream_synchronized = False``.
+
+    **This is routed (SA-PY-62).** §4.11 presents the class as uniform on the
+    close and then asks arm (f) of the one arm — *"(a) a truncated /
+    un-parseable CBOR frame"* — that spans both dispositions. The truncated
+    half of arm (a) cannot satisfy arm (f) at any conformant peer.
+    """
+
+    #: HTTP-style status for the coded frame this refusal owes.
+    status: int = 400
+    #: §3.3 ``code`` naming the cause, so the caller's remedy is selectable.
+    code: str = "invalid_request"
+    #: Whether the next read starts on a frame boundary. See the rubric.
+    stream_synchronized: bool = True
+
+
+class PayloadTooLargeError(FramingError):
+    """The declared frame length exceeds the configured maximum (§4.10(a)).
+
+    **413** ``payload_too_large``, and the close is forced: the length prefix
+    has been consumed and ``length`` bytes remain unread, so the stream cannot
+    be resynchronized without performing the very read that was refused.
+
+    *(0.8.2.25 — §4.10(a)'s emission was `SHOULD` + `MAY close` and is now a
+    `[MUST]` governed by §4.11. This peer previously answered this arm with
+    `400 invalid_request`, because the oversize check raised a bare
+    ``FramingError`` and the serve loop had one code for every one of them.)*
+    """
+
+    status = 413
+    code = "payload_too_large"
+    stream_synchronized = False
+
+
+class FrameTruncatedError(FramingError):
+    """The sender declared ``length`` bytes and the stream ended early.
+
+    **400** ``invalid_request`` (§4.7, §4.11), and the close is forced — see
+    :class:`FramingError`'s ``stream_synchronized`` rubric.
+
+    .. rubric:: This is NOT an ordinary disconnect, and conflating the two is
+       how the coded frame went missing
+
+    Both a truncated frame and a peer hanging up cleanly surface as
+    ``asyncio.IncompleteReadError`` from ``readexactly``. They are different
+    events with opposite obligations:
+
+    * **nothing consumed at a frame boundary** — the peer closed between
+      frames. No frame was ever offered, so there is nothing to refuse and
+      §4.11 does not reach it. Silence is correct.
+    * **a length prefix consumed, then a short payload** — the peer offered a
+      frame and the frame is malformed. That is arm (a), and it owes
+      ``400 invalid_request``.
+
+    The serve loop caught ``IncompleteReadError`` first and logged *"peer hung
+    up cleanly"* for both, so every truncated frame was answered with a **bare
+    close** — the failure §4.11 names as indistinguishable from a network
+    fault. Raising a distinct type is what lets the loop tell them apart.
+    """
+
+    status = 400
+    code = "invalid_request"
+    stream_synchronized = False
 
 
 class HashValidationError(Exception):
@@ -387,20 +482,49 @@ async def recv_envelope(
         The received Envelope.
 
     Raises:
-        FramingError: If the message is malformed or too large.
+        PayloadTooLargeError: Declared length over the maximum (413, §4.10(a)).
+        FrameTruncatedError: A frame was offered and the stream ended early.
+        FramingError: The payload is whole and does not decode (400).
         HashValidationError: If any entity's content_hash doesn't match.
-        asyncio.IncompleteReadError: If connection closed during read.
+        asyncio.IncompleteReadError: Clean EOF **at a frame boundary** — the
+            peer hung up between frames. No frame was offered, so §4.11 does
+            not reach it and the caller should treat it as an ordinary
+            disconnect. Every *other* short read raises
+            :class:`FrameTruncatedError` instead.
     """
-    length_bytes = await reader.readexactly(4)
+    # §4.11 (0.8.2.25) — a clean EOF here is an ordinary disconnect and owes
+    # nothing; a PARTIAL length prefix is a frame the sender began and did not
+    # finish, which is arm (a) and owes a coded frame. `readexactly` reports
+    # both as IncompleteReadError, so the discriminator is `e.partial`.
+    try:
+        length_bytes = await reader.readexactly(4)
+    except asyncio.IncompleteReadError as e:
+        if not e.partial:
+            raise
+        raise FrameTruncatedError(
+            f"length prefix truncated: got {len(e.partial)} of 4 bytes",
+        ) from e
     length = struct.unpack(">I", length_bytes)[0]
 
     if length > MAX_MESSAGE_SIZE:
-        raise FramingError(f"Message too large: {length} bytes (max {MAX_MESSAGE_SIZE})")
+        # §4.10(a)/§4.11 — 413, not the generic 400. `length` bytes are still
+        # in the socket and draining them is the read we are refusing, so
+        # `stream_synchronized` is False and the caller closes.
+        raise PayloadTooLargeError(
+            f"Message too large: {length} bytes (max {MAX_MESSAGE_SIZE})",
+        )
 
     if length == 0:
         raise FramingError("Empty message")
 
-    payload = await reader.readexactly(length)
+    # A short payload is a truncated FRAME, never a clean hangup: the sender
+    # has already told us how many bytes to expect.
+    try:
+        payload = await reader.readexactly(length)
+    except asyncio.IncompleteReadError as e:
+        raise FrameTruncatedError(
+            f"payload truncated: got {len(e.partial)} of {length} bytes",
+        ) from e
 
     try:
         data = ecf_decode(payload)
@@ -408,6 +532,33 @@ async def recv_envelope(
         logger.error("[wire] <- recv CBOR decode error: %s (payload %d bytes: %s...)",
                      e, len(payload), payload.hex()[:64])
         raise FramingError(f"Invalid CBOR payload: {e}") from e
+
+    # §4.11 — "NEVER BECOMES AN ENVELOPE" IS WIDER THAN "DOES NOT DECODE".
+    #
+    # A payload can decode perfectly and still not be an envelope: `\xf6` is
+    # a valid CBOR null, `\xff` decodes to a break marker, `42` is an integer.
+    # None of them is a map, so none of them has a `root`.
+    #
+    # ⛔ This check was absent, and its absence was invisible because the
+    # NEXT line is `data.get("root")` — so a non-map payload raised a bare
+    # `AttributeError: 'BreakMarkerType' object has no attribute 'get'` out of
+    # the framing layer. It still reached the serve loop's catch-all and still
+    # produced a coded 400, which is why no row noticed; what it did not carry
+    # was `stream_synchronized`, so the peer closed a connection it could have
+    # kept — §9 arm (f) — and the refusal's code came from a fallback rather
+    # than from the cause.
+    #
+    # It also means the pre-existing N4 row named
+    # `test_undecodable_cbor_still_gets_a_coded_frame` was driving an
+    # AttributeError on a payload that DOES decode, not un-parseable CBOR:
+    # `b"\xff\xff\xff\xff not cbor"` is a break marker followed by bytes the
+    # decoder never reaches. The standing law — *your fixture is not the
+    # discriminating configuration* — with the decoder as the filter.
+    if not isinstance(data, dict):
+        raise FramingError(
+            "frame decoded but is not an envelope map: "
+            f"{type(data).__name__}",
+        )
 
     # Debug logging similar to Go/Rust peers
     if logger.isEnabledFor(logging.DEBUG):

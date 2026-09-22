@@ -268,6 +268,87 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A sibling's "you already do this" is scoped to the MEMBER they measured, and they will
+  write it about the CLASS.** ***RATIFIED 2026-09-15*** *— twelfth axis of the "a routed
+  report's claims about our repo are hearsay" law, and the first where the claim is that we
+  are **already conformant**. The tenth axis (a citation scoped by a surface they have) and
+  the sixth (a wrong remedy) both fail when you look; this one is TRUE, about one of three
+  members, and terminates in no work.* `ROUTING-2026-09-15-b` closed the §4.11 framing split
+  with *"go was the bare-close seat (not rust, which silent-drops, and **not py, which
+  already emits a coded frame**)."* Measured here before any edit, across §4.11's five
+  causes: **un-parseable-but-whole CBOR** did emit a coded frame (SA-PY-61, ruled in our
+  shape the same day, so the flattering half was genuinely earned); **truncated payload**
+  was a bare close; **oversize** answered `400 invalid_request` where §4.10(a) has always
+  said `413 payload_too_large`, with `payload_too_large` at **zero occurrences** in the
+  tree; and **arm (f)**, multiplex survival, failed on every cause because we emitted the
+  frame and then closed.
+  **The mechanism is that a sibling measures the arm THEY just fixed.** go's edit sits at
+  their decode-error branch, so *"does py emit a coded frame here"* is a question about one
+  input, and the answer generalizes in the writing rather than in the measuring — *"emits a
+  coded frame"* is a sentence about a peer, and what was measured was a frame. Nothing in
+  the packet is wrong; the scope quietly widened from an input to a class.
+  **Why it is the expensive direction:** a claim that you are *broken* sends you to the
+  tree, which corrects it. A claim that you are *already fine* produces **no task**, and it
+  arrives attached to a ruling you were about to absorb — so the absorption reads as
+  "nothing owed here" and the two members nobody measured ship. Same terminates-in-no-work
+  shape as a premise saying you already comply, with a **sibling's measurement** as the
+  premise instead of arch's prose.
+  **The check, and §4.11 hands it to you:** when a ruling states its class as a **table of
+  causes**, walk the table and drive **one input per row** before accepting any seat's
+  summary — including the row a sibling says you pass. One row per cause is the same read
+  either way, and it is the row-walk law (*walk every row when N are reported*) with
+  **causes** as the rows and a **compliment** as the trigger. Enforcement point:
+  `tests/integration/test_preadmission_refusal_4_11.py::TestTheTeeth::
+  test_the_three_causes_do_not_collapse_to_one_answer`, which asserts three causes give
+  three distinct `(status, code)` pairs — a peer with one code for the class passes every
+  individual row that only asserts *"a frame arrived"*.
+
+- **A STDLIB exception shared by two causes with opposite obligations is a ruling you did
+  not make — and the discriminator is usually already on the object, unread.** *Candidate,
+  2026-09-15 — fourth construct of the "a wire value with no call site to review it" law,
+  after the `=` default, the status-named constructor and the `getattr` fallback.*
+  `asyncio.readexactly` raises `IncompleteReadError` for **a peer hanging up cleanly between
+  frames** and for **a frame whose declared payload never arrived**. §4.11 gives those
+  opposite answers — silence is correct for the first (no frame was ever offered) and
+  `400 invalid_request` is owed for the second. py caught the exception **one arm above** the
+  refusal path and logged `reason=incomplete_read (peer hung up cleanly)` for both, so every
+  truncated frame got a bare close.
+  **What makes this construct worse than the other three.** You own a default argument and
+  you own a constructor, so the fix is where the bug is. You do **not** own
+  `IncompleteReadError`, so there is no place to attach the distinction and nothing to grep
+  for — and the handler reads as correct, because *"the peer hung up"* is a true description
+  of one of its two causes. The discriminator was already present and free: **`e.partial`** —
+  empty means nothing was consumed at a frame boundary, non-empty means a frame was begun.
+  One attribute, never read.
+  **The check:** for every `except <StdlibError>` on a protocol boundary, enumerate the
+  **causes** that raise it, not the situations you had in mind — and if two causes owe
+  different answers, re-raise as your own type at the point where you still know which one
+  it was. Doing it at the raise site is what makes the disposition a property of the frame
+  rather than a guess at the catch site. Enforcement point: `FrameTruncatedError` /
+  `PayloadTooLargeError` carrying `(status, code, stream_synchronized)`, plus
+  `test_a_clean_EOF_AT_A_FRAME_BOUNDARY_is_still_silent` — the control a fix to the
+  truncated arm breaks, which is how you learn you have started answering ordinary
+  disconnects.
+
+- **Your own DECODER is a filter between your probe and the defect — the receive-side mirror
+  of "your own serializer cannot express the attack."** *Candidate, 2026-09-15.* The N4 row
+  named `test_undecodable_cbor_still_gets_a_coded_frame` drives
+  `b"\xff\xff\xff\xff not cbor"`. **That payload decodes.** `\xff` is the CBOR break
+  marker, so `ecf_decode` returns a `BreakMarkerType` and never reaches its error path; the
+  refusal came from `data.get("root")` raising a bare `AttributeError` one line later. The
+  row passed, and it was measuring an `AttributeError` rather than un-parseable CBOR for the
+  life of the file.
+  **And the thing it was hiding is a rule of arch's own.** §4.7's widened scope is *"a frame
+  that never becomes an **Envelope**"* — which is broader than *"does not decode"*, and this
+  peer had no check for the gap between them: CBOR `null`, an integer, a break marker all
+  decode cleanly and none has a `root`. Found only because the arm (f) survival row demanded
+  a stream disposition, and an `AttributeError` carries none.
+  **The check:** when a probe's input is meant to be rejected by a **parser you own**, assert
+  that it was rejected **by that parser** — not merely that the request failed. A payload
+  that survives your decoder is testing whatever happens next, and the two are
+  indistinguishable from the outside because both answer 400. Cheapest form: drive the input
+  at the decoder directly in one row, and keep the wire row for the behaviour.
+
 - **A RETRACTION round's cost table is the one nobody checks, because a withdrawal reads as
   free — and the seat that BUILT the withdrawn rule is the only one it costs.** ***RATIFIED
   2026-09-14*** *— eleventh axis of the "a routed report's claims about our repo are hearsay"

@@ -766,11 +766,34 @@ class TestContinuationResourceTargets:
         """The boundary of the row above, and the arm that decides what
         "nothing survived" means.
 
-        `None` rather than `[]`: §3.3 gives an empty effective list and an
-        absent resource the same answer, so forwarding an empty list would ask
-        the receiving peer to distinguish two inputs the spec calls the same —
-        and `resource: {targets: []}` on the wire is a resource field naming
-        nothing, which is a different frame from no resource field.
+        .. rubric:: ⭐ INVERTED at 0.8.2.25 — this row asserted ``is None``
+
+        Its original reasoning is kept here because the rule moved under it
+        and a later reader needs to see that rather than re-derive it:
+
+            *"`None` rather than `[]`: §3.3 gives an empty effective list and
+            an absent resource the same answer, so forwarding an empty list
+            would ask the receiving peer to distinguish two inputs the spec
+            calls the same — and `resource: {targets: []}` on the wire is a
+            resource field naming nothing, which is a different frame from no
+            resource field."*
+
+        The first clause was true of §3.3 until **0.8.2.24**, which made the
+        two empties distinct for a resource-optional operation. The last
+        clause is the rule that replaced it — the old docstring was already
+        carrying its own refutation, one sentence later.
+
+        **0.8.2.25** then made preservation a ``[MUST]`` on the seam itself:
+        *"that projection MUST NOT be lossy about its own emptiness … Every
+        seam that narrows is exempted alike, inbound-wire and in-process
+        sub-dispatch, or one request receives two different answers according
+        to which door it arrived through."*
+
+        py's inbound-wire seam always preserved it (``None`` absent, ``[]``
+        emptied). This forwarder did not, so a continuation whose stored
+        `resource` is self-excluded was advanced as though it had named no
+        resource — and at `tree:snapshot` / `tree:extract` the absent case is
+        the whole tree.
         """
         emit_pathway, ctx, keypair = setup_context
 
@@ -793,7 +816,23 @@ class TestContinuationResourceTargets:
             ctx,
         )
 
-        assert ctx._dispatched_calls[0]["resource_targets"] is None
+        forwarded = ctx._dispatched_calls[0]["resource_targets"]
+        assert forwarded == [], (
+            f"the advance forwarded {forwarded!r}. §3.3 (0.8.2.25): a "
+            "narrowing seam MUST NOT be lossy about its own emptiness. "
+            "`None` is the ABSENT signal, and handing it to the target "
+            "hands over that operation's absent-case behaviour — the whole "
+            "tree at `snapshot`, every bound entity under it at `extract` — "
+            "which is precisely what a caller who excluded their only target "
+            "did not ask for."
+        )
+        assert forwarded is not None, (
+            "`[]` and `None` are the two empties (§3.3, 0.8.2.24) and this "
+            "is the one the caller SENT. The absent arm is covered by "
+            "`test_forward_omits_resource_targets_when_no_resource_field`, "
+            "which still asserts `None` — that row is the control that keeps "
+            "this distinction a distinction."
+        )
 
     @pytest.mark.asyncio
     async def test_join_uses_resource_targets_from_resource_field(

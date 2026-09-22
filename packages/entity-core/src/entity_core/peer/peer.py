@@ -618,9 +618,12 @@ class ReentryChannel:
         from entity_core.protocol.auth import create_authenticated_request
         from entity_core.protocol.messages import ResourceTarget
 
+        # §3.3 (0.8.2.25) — `is not None`, not truthiness: an explicitly empty
+        # target list is a `resource` the caller sent, and dropping the field
+        # re-spells it as an absent one. See `_remote_execute`.
         resource_target = (
             ResourceTarget.from_dict({"targets": resource_targets})
-            if resource_targets else None
+            if resource_targets is not None else None
         )
         execute = Execute.create(
             uri, operation, params, resource=resource_target, bounds=bounds,
@@ -1872,9 +1875,18 @@ class Peer:
         else:
             peer_id = uri.split("/", 1)[0]
 
-        # Build resource dict for wire format if targets provided
+        # Build resource dict for wire format if targets provided.
+        #
+        # §3.3 (0.8.2.25) — `is not None`, NOT truthiness. An empty list here
+        # is a `resource` the caller SENT whose effective set is empty, and
+        # omitting the field converts it into an absent resource for the
+        # receiving peer — the one narrowing seam that would give a cross-peer
+        # dispatch a different answer from the in-process one, which §3.3
+        # forbids by name: *"Every seam that narrows is exempted alike,
+        # inbound-wire and in-process sub-dispatch, or one request receives
+        # two different answers according to which door it arrived through."*
         resource = None
-        if resource_targets:
+        if resource_targets is not None:
             resource = {"targets": resource_targets}
 
         # PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1 / §5 gate — see
@@ -2403,15 +2415,45 @@ class Peer:
                     #   frame with no response and no close is non-conformant,
                     #   and SO IS CLOSING WITH NO CODED FRAME."*
                     #
-                    # This `break` was the whole handler until now: a bare
+                    # This `break` was the whole handler until 0.8.2.24: a bare
                     # socket close, which §4.6 says is indistinguishable from a
                     # network fault. §4.9(c)'s deliver-or-signal rule does not
                     # reach here — it is scoped to *"every request the peer
                     # ADMITS"*, and a frame refused at decode was never
-                    # admitted. That narrow seam is what N4 exists to close,
-                    # and closing afterwards remains our own choice: framing
-                    # can no longer be trusted, so we still close.
+                    # admitted. §4.11 (0.8.2.25) is the normative home for
+                    # that narrow seam and states the obligation for the whole
+                    # pre-admission class.
                     await self._emit_decode_refusal(writer, conn_state, e)
+
+                    # §4.11 + §9 arm (f), 0.8.2.25 — AND WHETHER WE MAY STAY
+                    # IS NOT A PREFERENCE, IT IS A PROPERTY OF THE FRAME.
+                    #
+                    # §4.11 says the close is *"its own choice"*; arm (f) says
+                    # a pre-admission refusal on a MULTIPLEXED connection MUST
+                    # NOT cost an admitted in-flight request its response.
+                    # Both hold only where the refusal left the stream on a
+                    # frame boundary. `stream_synchronized` is that property,
+                    # decided where the frame was read (see `FramingError`):
+                    #
+                    # * whole payload, bad CBOR -> synchronized, so we STAY.
+                    #   Closing here would destroy every admitted request on a
+                    #   multiplexed connection to punish one bad frame.
+                    # * truncated payload / oversize -> NOT synchronized. The
+                    #   next byte is not a length prefix, so a peer that kept
+                    #   reading would parse the following frame's head as this
+                    #   frame's tail. The close is forced, not chosen.
+                    #
+                    # ⚠ This peer closed on ALL of them, so the coded frame
+                    # landed and the connection died anyway — arm (f) fails on
+                    # a peer that emits the frame and closes, which is why the
+                    # arm exists separately from (a).
+                    if getattr(e, "stream_synchronized", False):
+                        logger.info(
+                            "[conn-rx] peer=%s refused an undecodable frame "
+                            "and STAYED (stream is on a frame boundary; "
+                            "§4.11 arm (f))", who,
+                        )
+                        continue
                     break
 
                 # Per-request processing. A single bad request — malformed
@@ -2738,8 +2780,9 @@ class Peer:
         to *try* before closing, and a peer that raised out of its own refusal
         path would turn a coded refusal back into a bare close.
         """
-        from entity_core.protocol.framing import HashValidationError
+        from entity_core.protocol.framing import FramingError, HashValidationError
 
+        status = 400
         if isinstance(exc, HashValidationError):
             code = "hash_mismatch"
             # None when the ROOT is what failed — §4.10(a)'s "otherwise MUST
@@ -2749,21 +2792,40 @@ class Peer:
                 "entity hash binding is false at the decode boundary "
                 f"(§5.2a, 0.8.2.24): {exc}"
             )
+        elif isinstance(exc, FramingError):
+            # §4.11 (0.8.2.25) — THE FRAME OBLIGATION BELONGS TO THE CLASS;
+            # THE CODE BELONGS TO THE CAUSE. The pair travels on the
+            # exception, so a fourth cause added to `recv_envelope` cannot
+            # inherit a third cause's remedy by falling through to an `else`.
+            #
+            # ⛔ This branch used to be that `else`, and it answered `400
+            # invalid_request` for EVERY FramingError — including the oversize
+            # check, which §4.10(a) has always given `413
+            # payload_too_large`. One code for three causes is the defect
+            # §4.11 was written to state generally: *"a code that is merely in
+            # the right family is still wrong."*
+            status = exc.status
+            code = exc.code
+            request_id = ""
+            message = f"frame did not decode (§4.11): {exc}"
         else:
+            status = 400
             code = "invalid_request"
             request_id = ""
-            message = f"frame did not decode (§3.3): {exc}"
+            message = f"frame did not decode (§4.11): {exc}"
 
         try:
-            response = ExecuteResponse.bad_request(
-                request_id=request_id, message=message, code=code,
+            response = ExecuteResponse(
+                request_id=request_id,
+                status=Uint(status),
+                result={"code": code, "message": message},
             )
             await self._send_locked(
                 writer, conn_state, Envelope(root=response.to_entity()),
             )
             logger.debug(
-                "[decode-refusal] -> response status=400 code=%s request_id=%s",
-                code, request_id or "<none>",
+                "[decode-refusal] -> response status=%d code=%s request_id=%s",
+                status, code, request_id or "<none>",
             )
         except Exception as write_error:  # pragma: no cover - best effort
             logger.info(
