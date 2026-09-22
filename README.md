@@ -1,10 +1,26 @@
 # Entity Core Python
 
-Python implementation of the Entity Core Protocol for interoperability testing with the Rust implementation.
+**A clean-room Python implementation of the Entity Core Protocol, built to test whether the
+specification is good enough to build a peer from.**
 
 ## Overview
 
-Entity Core is a distributed peer-to-peer protocol based on content-addressed entities. This Python implementation serves as both a reference implementation and a validation tool to ensure the protocol specification is clear and complete enough for interoperable implementations.
+Entity Core is a peer-to-peer protocol built on content-addressed entities. This
+implementation is one of **three independent, ground-up peers** — alongside a Go and a Rust
+one — and its purpose is not merely to exist: it is written from the specification text
+alone, so that **every place the text is unclear shows up as a bug here first**. When that
+happens the gap is logged and routed upstream rather than patched over locally.
+
+If you want to see the output of that, read
+[`docs/SPEC-AMBIGUITIES.md`](docs/SPEC-AMBIGUITIES.md) — sixty-seven gaps and contradictions
+found while implementing, each with what we did in the meantime and how it was ruled.
+
+It implements the wire protocol end to end — content-addressed entities, ECF/CBOR encoding,
+Ed25519 identity, capability delegation, the handler/peer runtime — plus an SDK and a CLI.
+
+**Status: v0.9.0, a research preview.** 4,816 tests, cross-implementation converged. Not a
+1.0 API commitment. The release version is deliberately *not* the protocol version — see the
+top of [`CHANGELOG.md`](CHANGELOG.md) for why.
 
 ## Build and test
 
@@ -13,18 +29,25 @@ no `uv`, no other toolchain. A pinned container image carries the exact Python
 and `uv` versions, so a fresh clone builds identically anywhere:
 
 ```bash
-make build      # build the runtime image (entity-core CLI)
+make build      # build the runtime image (the entity-core CLI)
 make test       # run the full test suite in the dev image
-make lint        # run ruff in the dev image
+make lint       # run ruff in the dev image (read-only)
+make check      # lint + test — the green gate
+make help       # every target
 ```
 
-This is the supported, reproducible path; see [`CANONICAL-DOCS.toml`](CANONICAL-DOCS.toml)
-and the `Makefile` for details.
+**Measured on a warm image, 2026-09-17: `4758 passed, 58 skipped in 120.96s`** — about 2m09s
+wall. A cold run adds the image build, a few minutes more. **The 58 skips are `tests/interop/`,
+which need a peer from another implementation running**; that is the expected state and the
+one place a skip here is not a failure.
+
+This is the supported, reproducible path. `make test` is what a change has to keep green.
 
 ## Local development (optional)
 
-If you prefer to iterate directly on the host, install Python 3.11–3.13 and
-[uv](https://docs.astral.sh/uv/), then:
+Faster to iterate on, but it needs a toolchain. Install
+[uv](https://docs.astral.sh/uv/) and **Python 3.12** — `.python-version` pins 3.12 and `uv`
+will refuse to run without it:
 
 ```bash
 # Install all workspace packages and dev dependencies (versions pinned by uv.lock)
@@ -36,6 +59,10 @@ uv run pytest
 # List available identities
 uv run entity-core list-identities
 ```
+
+> ⚠ **`No interpreter found for Python 3.12`** means exactly that and is not a repo problem.
+> Either `uv python install 3.12`, or drive an existing venv directly with
+> `.venv/bin/python -m pytest`. `make test` is unaffected — the container carries 3.12.
 
 ### What to watch out for
 
@@ -107,7 +134,8 @@ This file layout is shared with the Rust implementation for cross-peer compatibi
 Identities are currently created using the Rust CLI:
 
 ```bash
-# From the Rust entity-core repo
+# From the Rust implementation, checked out beside this repo
+cd ../entity-core-rust
 cargo run -p entity-cli -- identity create my-new-peer
 ```
 
@@ -149,7 +177,8 @@ entity-core-py/
 ├── tests/
 │   ├── unit/                   # Fast, deterministic unit tests
 │   ├── integration/            # Protocol integration tests
-│   └── interop/                # Cross-implementation tests (require Rust peer)
+│   └── interop/                # Cross-impl tests (need a live Go or Rust peer;
+│                               #   they skip cleanly without one)
 │
 └── examples/                   # Standalone interop test scripts
 ```
@@ -183,17 +212,18 @@ uv run pytest -v
 # Run a specific test file
 uv run pytest tests/unit/test_capability.py
 
-# Run interop tests (requires a Rust peer listening on 127.0.0.1:9000)
+# Run interop tests (need a live sibling peer; see Cross-Implementation Testing)
 uv run pytest tests/interop/
 ```
 
 ## Cross-Implementation Testing
 
-Both Python and Rust implementations validate each other and the protocol specification:
+The three implementations validate each other and the specification. To drive this peer
+against the Rust one:
 
 ```bash
 # Terminal 1: Start Rust peer
-cd ../entity-core  # Rust implementation
+cd ../entity-core-rust
 cargo run -p entity-cli -- peer start test-peer -l 127.0.0.1:9000
 
 # Terminal 2: Start Python peer
@@ -230,6 +260,32 @@ Client                              Server
   ├──── EXECUTE ──────────────────────>│
   │<─────────────── EXECUTE_RESPONSE ──┤
 ```
+
+## Working on this repo
+
+| you want | read |
+|---|---|
+| to make a change, as a person or an agent | [`AGENTS.md`](AGENTS.md) — the orientation file, read first |
+| what the project is doing right now | [`docs/STATUS.md`](docs/STATUS.md) |
+| the CLI and `make` reference | [`docs/CLI.md`](docs/CLI.md) |
+| how handlers, the registry and dispatch fit together | [`docs/HANDLER-ARCHITECTURE.md`](docs/HANDLER-ARCHITECTURE.md) |
+| how this peer is validated against the others | [`docs/VALIDATING.md`](docs/VALIDATING.md) |
+| where the spec is unclear, and how it was ruled | [`docs/SPEC-AMBIGUITIES.md`](docs/SPEC-AMBIGUITIES.md) |
+| what we satisfy in-process rather than at the wire | [`docs/CONFORMANCE-EXCLUSIONS.md`](docs/CONFORMANCE-EXCLUSIONS.md) |
+| everything this project learned the hard way | [`docs/agents/memory/INDEX.md`](docs/agents/memory/INDEX.md) |
+
+**Two things not to touch**, because they are not this repo's to define:
+
+- **The specification.** It lives upstream, in the sibling `entity-core-protocol` and
+  `entity-system-architecture` repos. This repo implements it. A gap goes in
+  `docs/SPEC-AMBIGUITIES.md` and is routed upstream — never settled locally.
+- **`packages/entity-core/src/entity_core/handlers/`** is the registry, context and bootstrap
+  only. Standard handlers belong in `entity-handlers`.
+
+**The real gate for anything protocol-facing is not this repo's test suite** — it is the
+cross-implementation validator, which drives this peer from an independent implementation. A
+local suite checks our constants against our constants; several real defects here were
+invisible to it and obvious to that. See [`docs/VALIDATING.md`](docs/VALIDATING.md).
 
 ## License
 

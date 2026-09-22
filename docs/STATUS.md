@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-16 · public: v0.8.0 (master)_
+_Updated: 2026-09-17 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -36,18 +36,45 @@ dispatching to pattern strings rather than importing them.
 - **entity-cli** — the user-facing CLI (`entity-core start` / `connect` /
   `list-identities`), holding no protocol knowledge of its own.
 
-Maturity: reasonably mature for a research preview. A broad suite — 3,722 test functions
-across 209 files (unit, integration, interop, and conformance directories), 4,165 passing
-with 0 failures — backs it, and `v0.8.0` ("Genesis") is cut as the initial public research-preview release.
+Maturity: reasonably mature for a research preview. A broad suite backs it — **4,816 tests
+collected; `make test` measured 2026-09-17 at `4758 passed, 58 skipped in 120.96s`, 0
+failures.** The 58 skips are `tests/interop/`, which need a live peer from another
+implementation and skip cleanly without one — and `v0.8.0` ("Genesis") is cut as the initial public research-preview release.
 The next release is **0.9.0** — this package set's own version, which since 0.9.0 is deliberately
 **not** the protocol version it implements (0.8.2); at Genesis the two coincided because the
 package version was set to the protocol version of the day, and that was a starting condition
 rather than a scheme. See `CHANGELOG.md` and `AGENTS.md` §Versioning. This is
 **not a 1.0 API commitment.** The canonical build/test path needs only `make` + `podman`
-on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev uses
-Python 3.11–3.13 and `uv`.
+on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev needs
+**Python 3.12** (`.python-version` pins it) and `uv`.
 
 ## Where we left off
+
+> **The 2026-09 doc/memory/routing standard is adopted (2026-09-17).** Docs-only; no
+> Python touched, `make test` unchanged at `4758 passed, 58 skipped`.
+>
+> - **`AGENTS.md`: 309,070 → 29,166 bytes**, inside the 30 KiB tier-0 budget. Nothing was
+>   deleted — **3,262 lines moved verbatim** into `docs/agents/memory/`, nine topic files
+>   behind an `INDEX.md`, all declared. 101 of 102 entries are byte-identical to their
+>   previous text; the one difference is a stale `IMPLEMENTATION-SPEC §1.8` citation
+>   corrected to `ENTITY-CORE-PROTOCOL.md §1.8`.
+> - **The clone test found four confidently-wrong lines**, which is the finding worth
+>   carrying: the spec repo was cited as `../entity-core-architecture` (it is
+>   `../entity-core-protocol/specs/` plus `../entity-system-architecture/specs/extensions/`),
+>   `IMPLEMENTATION-SPEC.md` does not exist anywhere in the fleet, the Rust peer was cited
+>   at `../entity-core` (it is `../entity-core-rust`), and the suite was described as
+>   *"300+ tests, target <1s"* against a measured 4,816. **A wrong instruction is worse
+>   than a missing one**, and all four had been wrong for months in the file every session
+>   reads first.
+> - **`docs/outbox/` created**; 33 sent packets moved out of `docs/status/` and 11
+>   acknowledged ones into `docs/archive/outbox/`. Five `TRACKER-*.md` carry watermarks.
+>   **The first scan immediately surfaced an unread inbound** — `entity-system-conformance`
+>   `ROUTING-2026-09-17-a`, cc'd to us, on the S-1 cross-bless. See
+>   `TRACKER-entity-system-conformance.md`; it is open and it matters, because S-1 item 4
+>   would offer this peer as the second independent codec.
+> - **`CANONICAL-DOCS.toml` now declares `SPEC-AMBIGUITIES.md` and
+>   `CONFORMANCE-EXCLUSIONS.md`**, which were undeclared and would have been **deleted**
+>   from the public tree at the next cut. They are this repo's actual product.
 
 > **`0.8.2.26` is absorbed, and two of its nine `no` columns were work here
 > (2026-09-16).** The round was relayed as *"nothing in either of your trees moves for

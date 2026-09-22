@@ -201,6 +201,7 @@ The authoritative, more detailed references live in the Go repo:
   vs. convergence workflows, how to classify divergences (spec ambiguity vs.
   spec-wrong vs. impl bug vs. impl gap), and worked case studies.
 
-Spec text (the actual source of truth) lives in the
-`entity-core-architecture` repo under
-`docs/architecture/v7.0-core-revision/specs/`.
+Spec text (the actual source of truth) lives in two sibling repos:
+`entity-core-protocol/specs/` for the core protocol, the CBOR encoding and the
+test vectors, and `entity-system-architecture/specs/extensions/` for the
+`EXTENSION-*` documents.

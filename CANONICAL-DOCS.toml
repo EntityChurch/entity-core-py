@@ -41,6 +41,32 @@ title = "Handler architecture"
 blurb = "How handlers, the registry, and dispatch fit together in the Python peer."
 group = "Architecture"
 
+# ── The interop record ────────────────────────────────────────────────────────
+# These two ARE this repo's product. Its stated purpose is validating that the
+# specification is clear and complete enough to build a compatible peer from the
+# text alone; SPEC-AMBIGUITIES is the answer, 67 entries deep, and
+# CONFORMANCE-EXCLUSIONS is the honesty half — what we satisfy in-process rather
+# than at the wire, so no reader mistakes a green category for a green row.
+# Both were undeclared, which at the next cut would have deleted them.
+
+[[doc]]
+path  = "docs/SPEC-AMBIGUITIES.md"
+title = "Spec ambiguities found while implementing"
+blurb = "Every gap and contradiction this clean-room peer hit in the spec, what we did meanwhile, and how upstream ruled."
+group = "Architecture"
+
+[[doc]]
+path  = "docs/CONFORMANCE-EXCLUSIONS.md"
+title = "Declared conformance exclusions"
+blurb = "Vectors satisfied in-process rather than at the wire, each with the reason and the mutation it was verified against."
+group = "Architecture"
+
+[[doc]]
+path  = "docs/architecture/reviews/REVIEW-THE-SDK-AND-APPLICATION-TIER-GAP-2026-08-17.md"
+title = "Review — the SDK and application tier gap"
+blurb = "Why this repo carries the SDK and application tiers in-tree, and the five-package target shape."
+group = "Architecture"
+
 # ── Status ────────────────────────────────────────────────────────────────────
 # The rolling canonical log, moved out of `docs/status/` to `docs/STATUS.md`.
 # [ADR-0031] rules that the DATED snapshots under `docs/status/`
@@ -116,3 +142,125 @@ path  = "CLAUDE.md"
 title = "CLAUDE.md"
 blurb = "A one-line shim to AGENTS.md (ADR-0016)."
 group = "Working here"
+
+# ── Memory ────────────────────────────────────────────────────────────────────
+# What this repo has learned, split out of AGENTS.md (which was 309 KB — ten times
+# the 30 KiB tier-0 budget) into one file per part of the system. These PUBLISH:
+# they are the accumulated interop knowledge of a clean-room implementation, and a
+# reader outside this project building their own peer is exactly who benefits from
+# them. Several entries are security findings a green suite did not see.
+#
+# The index and the files are checked against each other IN BOTH DIRECTIONS, so a
+# file added here without an INDEX.md row fails, and so does the reverse.
+
+[[doc]]
+path  = "docs/agents/memory/INDEX.md"
+title = "Memory — index"
+blurb = "Everything this project has learned, by topic. Start here."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/ROUTED-CLAIMS-ABOUT-US.md"
+title = "Memory — routed claims about this repo"
+blurb = "What another implementation's report can and cannot tell you about our tree."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/FILING-AND-ARGUING-UPSTREAM.md"
+title = "Memory — filing spec ambiguities"
+blurb = "Routing a finding upstream, and the ways an outbound claim has been wrong here."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/SPEC-READING-AND-CENSUS.md"
+title = "Memory — reading the spec, and censusing against it"
+blurb = "How a normative sentence becomes a defect: rows, slots, inputs, and absent arms."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/TESTING-FIXTURES-AND-MUTATION.md"
+title = "Memory — tests, fixtures and mutation"
+blurb = "The mutation discipline, and the several ways a suite is green about the wrong thing."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/AUTHORIZATION-AND-CAPABILITIES.md"
+title = "Memory — authorization and capabilities"
+blurb = "Grant dimensions, scope matching, resource targets, and the delegation paths."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/WIRE-ENCODING-AND-ENTITY-FIDELITY.md"
+title = "Memory — wire encoding and entity fidelity"
+blurb = "ECF/CBOR determinism, the hash preimage, tag policy, and constants that reach the wire."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/SDK-HANDLERS-AND-DISPATCH.md"
+title = "Memory — the SDK tier, handlers and dispatch"
+blurb = "SDK-vs-extension drift, what an SDK absorbs at a MAY, and the two dispatch paths."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/PEERS-PORTS-AND-THE-VALIDATOR.md"
+title = "Memory — running peers, ports and the validator"
+blurb = "Choosing a port, reaping a peer, and reading a multi-pass validator result."
+group = "Memory"
+
+[[doc]]
+path  = "docs/agents/memory/BUILD-TOOLCHAIN-AND-ENVIRONMENT.md"
+title = "Memory — build, toolchain and environment"
+blurb = "The venv, the container cache, the non-cosmetic lint classes, and the shell hazards."
+group = "Memory"
+
+# ── What each directory IS ────────────────────────────────────────────────────
+# Declared so the doc checks are not guessing. Longest path wins.
+
+[[area]]
+path      = "docs/status"
+kind      = "status"       # dated, episodic, ages out to docs/archive/status
+publishes = false
+
+[[area]]
+path      = "docs/archive"
+kind      = "archive"      # dated BY DESIGN; does not age out
+publishes = false
+
+[[area]]
+path      = "docs/outbox"
+kind      = "outbox"       # routing packets we have SENT — never published
+publishes = false
+
+[[area]]
+path      = "docs/archive/outbox"
+kind      = "outbox"       # acknowledged packets — never published
+publishes = false
+
+[[area]]
+path      = "docs/agents/memory"
+kind      = "memory"       # durable, indexed, edited in place
+publishes = true
+
+# Dated by design and NOT episodic: a review is a durable design record, written
+# once and kept because the decision it argues is still load-bearing. The date in
+# the filename is provenance, not a staleness clock — so the dated-doc rule, which
+# is written for HANDOFF/STATUS/CHECKPOINT, is wrong about this directory. These
+# publish: the SDK/application tier split is a reader-facing architecture decision
+# and AGENTS.md cites it.
+[[area]]
+path      = "docs/architecture/reviews"
+kind      = "archive"
+publishes = true
+
+# ── Living documents ──────────────────────────────────────────────────────────
+# Durable and rewritten in place, so they are NOT dated snapshots and must not be
+# aged out. The trackers additionally must never publish: they name counterparts,
+# unacknowledged packets and internal obligations. `internal = true` is the only
+# honest answer for them — declaring them canonical would ship them.
+
+[[living]]
+glob     = "docs/status/TRACKER-*.md"
+internal = true
+
+[[living]]
+path = "docs/STATUS.md"
