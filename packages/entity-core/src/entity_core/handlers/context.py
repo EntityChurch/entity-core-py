@@ -86,7 +86,9 @@ class HandlerContext:
         local_peer_id: This peer's ID.
         remote_peer_id: The requesting peer's ID.
         handler_grant: The handler's own capability grant (for internal operations).
-        caller_capability: The caller's capability (for optional defense-in-depth checks).
+        caller_capability: The caller's capability. The handler-level path
+            check it feeds is NOT optional and NOT secondary — §6.7 (0.8.2.20);
+            see :meth:`check_caller_permission`.
         emit_pathway: Storage access for the tree handler.
         bounds: Resource bounds for this request.
         chain_id: Request chain identifier for tracing.
@@ -419,8 +421,35 @@ class HandlerContext:
     ) -> bool:
         """Check if caller's capability grants permission for operation on path.
 
-        Defense-in-depth check. Handlers can use this to verify the caller
-        authorized access to a specific path, beyond the dispatch-level check.
+        .. rubric:: Not a secondary check `[MUST]` — §6.7 / §6.3 (0.8.2.20)
+
+        This docstring read *"defense-in-depth check. Handlers **can** use
+        this… beyond the dispatch-level check"*, which is the characterization
+        0.8.2.20 **withdraws** at §6.3, §6.7, §9.1 and the §8 layer table. It
+        rested on a premise the spec now states is false:
+
+            *"The dispatch-level ``check_permission`` authorizes the request
+            the caller MADE; the handler-level check authorizes the path the
+            handler is ABOUT TO TOUCH. These differ whenever any part of the
+            subject is derived after dispatch — a caller exclusion
+            (``effective_targets``), a path resolved at handler time, a
+            listing expanded per entry, a merge resolving snapshot content
+            into individual writes. Where the dispatch-level check can be made
+            vacuous by caller-controlled input it is not a primary check, and
+            the handler-level check is the enforcement."*
+
+        `F68` is the case where the premise is false: a caller supplying an
+        ``exclude`` covering its own target reaches ALLOW having had nothing
+        checked. And §6.8's *"caller-specified paths"* rule went **act-neutral**
+        in the same revision — it was scoped to writes, and the measured harm
+        was a ``get``, so *"reads or writes"*: the failure mode is disclosure
+        rather than mutation and the cause is identical.
+
+        A handler that derives every subject from ``effective_targets`` is
+        conformant with one site; this is what makes the guarantee hold for a
+        subject derived any other way, and the corpus does not mandate two.
+        **Neither is made redundant by the other**, and "optional" was never
+        the word for either of them.
 
         Args:
             operation: The operation to check (get, put, etc.).

@@ -95,6 +95,7 @@ from entity_core.protocol.bounds import (
     TTL_EXHAUSTED_CODE,
     TTL_EXHAUSTED_MESSAGE,
 )
+from entity_core.capability.checking import effective_resource_targets
 from entity_core.capability.delegation import (
     ChainCollectStatus,
     check_creator_authority,
@@ -106,6 +107,7 @@ from entity_core.protocol.delivery import DeliverySpec
 from entity_core.storage.emit import EmitContext
 from entity_core.utils.ecf import Hash, is_hash_ref
 from entity_core.utils.path import invariant_signature_path, sanitize_path_segment
+from entity_handlers._common import require_single_resource_target
 from entity_handlers.manifest import error_response as _error_response
 
 logger = logging.getLogger(__name__)
@@ -438,27 +440,17 @@ async def _handle_install(
        local content store.
     """
     # Step 1: install path comes from resource (P-CONTINUATION-1).
-    targets = ctx.resource_targets or []
-    # §3.3's 400 row (0.8.2.18): an operation that requires a resource answers
-    # ABSENT with `path_required` and MORE THAN ONE with `ambiguous_resource`.
-    # The two are different inputs with different remedies — *supply a
-    # resource* is a different instruction from *name only one* — and the row
-    # exists because the code selects the remedy. Collapsing them into
-    # `len(targets) != 1` is *"non-conformant on the absent case"*, which is
-    # what this site did.
-    if not targets:
-        return _error_response(
-            400,
-            "path_required",
-            "install requires a resource target (the suspended continuation path)",
-        )
-    if len(targets) != 1:
-        return _error_response(
-            400,
-            "ambiguous_resource",
-            "install requires exactly one resource target (the suspended continuation path)",
-        )
-    install_path = targets[0]
+    # §3.3's 400 row, all THREE arms (0.8.2.20). This site carried its own
+    # copy of the first two and 0.8.2.20's `malformed_resource` arm reached
+    # none of the four sites that did — the row is one rule and it now lives
+    # in one helper.
+    install_path, resource_error = require_single_resource_target(
+        ctx,
+        "install requires a resource target (the suspended continuation path)",
+    )
+    if resource_error is not None:
+        return resource_error
+    assert install_path is not None
 
     # Step 2: validate the entity-shaped params and discriminate by type.
     if params_type not in (CONTINUATION_TYPE, CONTINUATION_JOIN_TYPE):
@@ -1168,11 +1160,11 @@ async def _advance_forward(
     # Per EXTENSION-CONTINUATION §3: `target` is the handler URI;
     # `resource.targets` identifies the resource to operate on — distinct
     # fields, dispatched separately.
-    dispatch_resource_targets = (
-        eff_resource.get("targets")
-        if isinstance(eff_resource, dict) and eff_resource.get("targets")
-        else None
-    )
+    # F68 / §5.2 — the EFFECTIVE set, never the raw `targets`. See
+    # `_effective_dispatch_targets`: a forwarder that drops the caller's
+    # `exclude` is the go defect one hop earlier, and the subject rule is
+    # violated whether or not an authorization gap follows.
+    dispatch_resource_targets = _effective_dispatch_targets(ctx, eff_resource)
 
     # §4.2 case 3: when the target is a remote peer, the dispatched EXECUTE
     # is authorized by the scoped dispatch_capability (NOT the connection
@@ -1635,10 +1627,9 @@ async def _fire_partial_round(
         payload[JOIN_INCOMPLETE_FIELD] = {"missing": missing, "expected": expected}
 
         resource_data = cont_data.get("resource")
-        dispatch_resource_targets = (
-            resource_data.get("targets")
-            if isinstance(resource_data, dict) and resource_data.get("targets")
-            else None
+        # F68 / §5.2 — the EFFECTIVE set (see `_effective_dispatch_targets`).
+        dispatch_resource_targets = _effective_dispatch_targets(
+            ctx, resource_data,
         )
         cross_peer_kwargs: dict[str, Any] = {}
         if _remote_peer_of(ctx, target) is not None:
@@ -1876,10 +1867,9 @@ async def _advance_join(
         # Per EXTENSION-CONTINUATION v1.9 §3: `resource.targets` carries
         # the dispatch resource path, not `target`.
         resource_data = cont_data.get("resource")
-        dispatch_resource_targets = (
-            resource_data.get("targets")
-            if isinstance(resource_data, dict) and resource_data.get("targets")
-            else None
+        # F68 / §5.2 — the EFFECTIVE set (see `_effective_dispatch_targets`).
+        dispatch_resource_targets = _effective_dispatch_targets(
+            ctx, resource_data,
         )
 
         # §4.2 case 3 cross-peer: scoped dispatch_capability + full chain on
@@ -2320,6 +2310,53 @@ def _resolve_or_default_resource(
     if isinstance(extracted, dict) and extracted.get("targets") is not None:
         return extracted
     return default
+
+
+def _effective_dispatch_targets(
+    ctx: HandlerContext, resource: Any,
+) -> list[str] | None:
+    """The §5.2 **effective** targets of a stored continuation's `resource`.
+
+    .. rubric:: A forwarder that drops `exclude` defeats `effective_targets`
+
+    `entity-core-go` landed `effective_targets` unit-green and it was **inert
+    on the wire**, because their dispatch-time normalizer rebuilt the resource
+    struct with only its targets and dropped the caller's `exclude`. They
+    routed the shape rather than the bug: *"any place that COPIES or REBUILDS
+    the resource struct between the wire decode and the handler must preserve
+    the caller's exclude."*
+
+    This is that place in this tree, three times over. A continuation's
+    `resource` is authored at **install** time and replayed at advance time,
+    so the two halves are separated by a suspension — and all three advance
+    sites read `resource.targets` and never looked at `resource.exclude`. The
+    dispatched EXECUTE therefore carried a target the install-time authorizer
+    had skipped, which is F68's composition with the exclusion stored rather
+    than sent.
+
+    It is **not** the go defect: nothing here rebuilds a struct the authorizer
+    later reads, so the downstream check re-tests every forwarded target
+    against the grant and the escalation is bounded. What it does produce is a
+    **subject** that is not in `effective_targets` — §5.2's `[MUST]`, and the
+    half that does not need an authorization gap to be wrong.
+
+    Reducing here rather than forwarding `exclude` is the same choice the
+    dispatcher makes (F68) and the same one `compute/apply` makes: the set is
+    derived once, and what travels is the answer.
+
+    An empty result is **None**, not ``[]``: §3.3 gives an empty effective
+    list and an absent resource the same answer, and a `resource` field naming
+    nothing is a different frame on the wire from no `resource` field at all.
+    """
+    if not isinstance(resource, dict):
+        return None
+    targets = resource.get("targets")
+    if not targets:
+        return None
+    effective = effective_resource_targets(
+        list(targets), resource.get("exclude"), ctx.local_peer_id,
+    )
+    return effective or None
 
 
 def _remote_peer_of(ctx: HandlerContext, target: Any) -> str | None:

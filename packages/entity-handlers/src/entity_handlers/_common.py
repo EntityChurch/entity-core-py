@@ -15,6 +15,8 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
+from entity_core.capability.checking import NEVER_MATCH, canonicalize, is_pattern
+
 if TYPE_CHECKING:
     from entity_core.handlers.context import HandlerContext
 
@@ -79,7 +81,7 @@ def resource_target(ctx: HandlerContext) -> str | None:
 
 
 def require_single_resource_target(
-    ctx: HandlerContext, what: str,
+    ctx: HandlerContext, what: str, *, result_type: str | None = None,
 ) -> tuple[str | None, dict[str, Any] | None]:
     """The §3.3 400-row split for an operation whose spec requires a resource.
 
@@ -111,26 +113,103 @@ def require_single_resource_target(
     admission. One helper, so the class cannot re-open one call site at a
     time.
 
+    .. rubric:: Three inputs, three codes — and the list is the EFFECTIVE one
+
+    0.8.2.20 adds the third arm and moves the count: *"an operation that
+    requires a resource resolves it through ``effective_targets`` (§5.2) and
+    answers from THAT list, never from ``resource.targets`` ``[MUST]``"* —
+    empty → ``path_required``, more than one → ``ambiguous_resource``, and
+    **a single PATTERN target → ``malformed_resource``**, because *"a
+    resource-requiring operation takes a CONCRETE path."* Pattern targets stay
+    valid for an operation whose spec defines a set-valued subject; no such
+    operation exists in the corpus today.
+
+    ``ctx.resource_targets`` **is** the effective list — the dispatcher
+    narrows it once, at the authorizer, and hands the result over (F68). So
+    this helper counts and indexes the same list, which is the whole point:
+    *"a handler that counts the effective list and then indexes
+    ``resource.targets[0]`` has implemented the arithmetic completely and is
+    still reading a path no authorization covered."* The reason this helper
+    cannot get that wrong is that it is never given the raw list.
+
     Args:
         ctx: The dispatch context.
-        what: Human-readable description of the required target, used in both
+        what: Human-readable description of the required target, used in the
             messages (e.g. ``"system/role:assign requires a resource target
             (the assignment path)"``).
+        result_type: The error entity's ``type``, for the handlers whose own
+            specification gives them one — ``compute/error``. **This exists so
+            that a differing result TYPE cannot be a reason to re-inline the
+            rule**: four operations (`compute:eval`/`install`/`uninstall`,
+            `continuation:install`) had their own copy of the two-arm check
+            for exactly that reason, and 0.8.2.20's third arm reached none of
+            them. The arms are the row; the envelope is the handler's.
     """
+    def _refuse(code: str, message: str) -> dict[str, Any]:
+        built = error_response(400, code, message)
+        if result_type is not None:
+            built["result"]["type"] = result_type
+        return built
+
     targets = getattr(ctx, "resource_targets", None) or []
     if not targets:
-        return None, error_response(400, "path_required", f"{what}.")
+        # §3.3: *"an EMPTY effective list IS the absent case — a request
+        # naming one target and excluding it asks for nothing."* No separate
+        # null check is needed and none should be added: an absent `resource`
+        # and a fully self-excluded one are the same answer to the same
+        # question, and giving them different codes is how a caller learns
+        # which of its targets the authorizer skipped.
+        return None, _refuse("path_required", f"{what}.")
     if len(targets) != 1:
-        return None, error_response(
-            400, "ambiguous_resource",
+        return None, _refuse(
+            "ambiguous_resource",
             f"{what}, and exactly one — {len(targets)} were supplied "
             "(§3.3: absent and more-than-one are different inputs with "
             "different remedies).",
         )
     first = targets[0]
     if not isinstance(first, str):
-        return None, error_response(400, "malformed_resource", f"{what}.")
+        return None, _refuse("malformed_resource", f"{what}.")
+    if is_pattern(first):
+        return None, _refuse(
+            "malformed_resource",
+            f"{what}, and a CONCRETE path — {first!r} is a pattern "
+            "(§3.3, 0.8.2.20). `malformed_resource` rather than "
+            "`invalid_path`: the target is structurally fine and is simply "
+            "not usable as *this* operation's subject.",
+        )
     return first, None
+
+
+def unresolvable_tree_path(
+    path: str, local_peer_id: str,
+) -> dict[str, Any] | None:
+    """§5.4's **third** ruled consumer of the ``NEVER_MATCH`` sentinel.
+
+    *"A path that canonicalizes to ``NEVER_MATCH`` MUST NOT be stored, used as
+    a storage key, or resolved against the tree"* (0.8.2.20). The other two
+    consumers answer in their own vocabulary — the matcher returns False, the
+    validator returns an error — and this one is the reason those are not
+    enough on their own: a handler that takes its path from ``params`` rather
+    than from ``resource.targets`` never passes the dispatch-boundary
+    validator at all.
+
+    Returned as a **structural 400 ahead of the authorization check**, on
+    R-27 clause 4's reasoning rather than on tidiness: a refusal that runs
+    after authorization tells a caller with no authority *that its path was
+    unresolvable*, and a refusal that runs before tells it nothing it did not
+    supply itself.
+
+    Returns None when the path is resolvable.
+    """
+    if canonicalize(path, local_peer_id) == NEVER_MATCH:
+        return error_response(
+            400, "invalid_path",
+            f"path cannot be canonicalized: {path!r} (§1.4 reserves a "
+            "leading `./` and `../`; a bare `*/` is ambiguous without a "
+            "leading slash — use `/*/rest`)",
+        )
+    return None
 
 
 def now_ms() -> int:

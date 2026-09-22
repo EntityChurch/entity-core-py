@@ -1421,7 +1421,7 @@ async def _handle_commit(
         return _error_response(400, "invalid_prefix", "Non-empty prefix must end with /")
 
     if not ctx.check_caller_permission("commit", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant commit on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant commit on: {prefix}")
 
     # Get current bindings, exclude-filtered per §2.4 ("Exclude applies to
     # trie building" — a MUST this repo applied nowhere until 2026-08-18).
@@ -1748,7 +1748,7 @@ async def _handle_merge(
         return _error_response(400, "invalid_strategy", f"Strategy must be one of: {valid_strategies}")
 
     if not ctx.check_caller_permission("merge", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant merge on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant merge on: {prefix}")
 
     # Resolve source
     source_hash = _resolve_ref(ctx, ph,source_ref)
@@ -2078,7 +2078,7 @@ async def _handle_resolve(
         return _error_response(400, "invalid_params", "path required")
 
     if not ctx.check_caller_permission("resolve", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant resolve on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant resolve on: {prefix}")
 
     content_store = ctx.emit_pathway.content_store
     if resolved is not None:
@@ -2268,7 +2268,7 @@ async def _handle_checkout(
     version_param = params.get("version")
 
     if not ctx.check_caller_permission("checkout", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant checkout on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant checkout on: {prefix}")
 
     active_branch = None
     if branch_name:
@@ -2488,7 +2488,7 @@ async def _handle_cherry_pick(
         return _error_response(400, "invalid_params", "version required")
 
     if not ctx.check_caller_permission("cherry-pick", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant cherry-pick on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant cherry-pick on: {prefix}")
 
     version_hash = _resolve_ref(ctx, ph,version_ref)
     if version_hash is None:
@@ -2638,7 +2638,7 @@ async def _handle_revert(
         return _error_response(400, "invalid_params", "version required")
 
     if not ctx.check_caller_permission("revert", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant revert on: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant revert on: {prefix}")
 
     version_hash = _resolve_ref(ctx, ph,version_ref)
     if version_hash is None:

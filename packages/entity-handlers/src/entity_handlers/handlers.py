@@ -19,6 +19,7 @@ from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
 from entity_core.types.registry import _normalize_pattern
 from entity_handlers._common import error_response as _error
+from entity_handlers._common import require_single_resource_target
 
 
 HANDLERS_HANDLER_PATTERN = "system/handler"
@@ -111,28 +112,26 @@ async def _handle_register(
     manifest.pattern policy: absent → derive; present + matches → use;
     present + disagrees → reject 400 manifest_pattern_mismatch.
     """
-    targets = getattr(ctx, "resource_targets", None) or []
-    if not targets:
-        # 0.8.2.17: `path_required` is the code when an operation **whose own
-        # specification requires a `resource`** is invoked without one, and
-        # §6.2 is that specification here — *"Both `register` and
-        # `unregister` derive the pattern from `EXECUTE.resource.targets[0]`
-        # … the handler MUST require exactly one resource target."*
-        #
-        # This site answered `ambiguous_resource` for the absent case until
-        # the §3.3 slot was censused **by the row's input** rather than by the
-        # token: grepping for `path_required` finds where we already emit it
-        # and can never find where we should. Zero targets and two targets are
-        # different inputs with different remedies — *supply a resource* is not
-        # *disambiguate the one you sent* — and §3.3 says selecting the remedy
-        # is what the code is for.
-        return _error(400, "path_required",
-                      "register requires a resource target "
-                      "(system/handler/{pattern}) — §6.2, §3.2 path-as-resource")
-    if len(targets) != 1:
-        return _error(400, "ambiguous_resource",
-                      "register requires exactly one resource target (system/handler/{pattern})")
-    handler_path = targets[0]
+    # §6.13 (0.8.2.20): *"Both `register` and `unregister` derive the pattern
+    # from **`effective_targets(EXECUTE.resource, local_peer_id)[0]`** — never
+    # from `EXECUTE.resource.targets[0]` [MUST]"*, with all three §3.3 arms
+    # named for this operation by name: more than one -> `ambiguous_resource`,
+    # zero (absent, empty, **or one target the caller excluded**) ->
+    # `path_required`, a single pattern -> `malformed_resource`.
+    #
+    # These two sites inlined the first two arms and were correct on both --
+    # which is exactly what made them the sites nobody would revisit when
+    # 0.8.2.20 added the third. `ctx.resource_targets` is already the
+    # effective list (the dispatcher narrows once, at the authorizer), so the
+    # only thing the inline form still bought was a third place for the row to
+    # drift. One helper, three arms, both verbs.
+    handler_path, resource_error = require_single_resource_target(
+        ctx, "register requires a resource target (system/handler/{pattern}) "
+             "— §6.2, §6.13, §3.2 path-as-resource",
+    )
+    if resource_error is not None:
+        return resource_error
+    assert handler_path is not None
     if not handler_path.startswith("system/handler/"):
         return _error(400, "malformed_resource",
                       "register resource must be system/handler/{pattern}")
@@ -312,28 +311,26 @@ async def _handle_unregister(
     from ctx.resource.targets[0]; the unregister-request wrapper is
     eliminated and params is empty primitive/any.
     """
-    targets = getattr(ctx, "resource_targets", None) or []
-    if not targets:
-        # 0.8.2.17: `path_required` is the code when an operation **whose own
-        # specification requires a `resource`** is invoked without one, and
-        # §6.2 is that specification here — *"Both `register` and
-        # `unregister` derive the pattern from `EXECUTE.resource.targets[0]`
-        # … the handler MUST require exactly one resource target."*
-        #
-        # This site answered `ambiguous_resource` for the absent case until
-        # the §3.3 slot was censused **by the row's input** rather than by the
-        # token: grepping for `path_required` finds where we already emit it
-        # and can never find where we should. Zero targets and two targets are
-        # different inputs with different remedies — *supply a resource* is not
-        # *disambiguate the one you sent* — and §3.3 says selecting the remedy
-        # is what the code is for.
-        return _error(400, "path_required",
-                      "unregister requires a resource target "
-                      "(system/handler/{pattern}) — §6.2, §3.2 path-as-resource")
-    if len(targets) != 1:
-        return _error(400, "ambiguous_resource",
-                      "unregister requires exactly one resource target (system/handler/{pattern})")
-    handler_path = targets[0]
+    # §6.13 (0.8.2.20): *"Both `register` and `unregister` derive the pattern
+    # from **`effective_targets(EXECUTE.resource, local_peer_id)[0]`** — never
+    # from `EXECUTE.resource.targets[0]` [MUST]"*, with all three §3.3 arms
+    # named for this operation by name: more than one -> `ambiguous_resource`,
+    # zero (absent, empty, **or one target the caller excluded**) ->
+    # `path_required`, a single pattern -> `malformed_resource`.
+    #
+    # These two sites inlined the first two arms and were correct on both --
+    # which is exactly what made them the sites nobody would revisit when
+    # 0.8.2.20 added the third. `ctx.resource_targets` is already the
+    # effective list (the dispatcher narrows once, at the authorizer), so the
+    # only thing the inline form still bought was a third place for the row to
+    # drift. One helper, three arms, both verbs.
+    handler_path, resource_error = require_single_resource_target(
+        ctx, "unregister requires a resource target (system/handler/{pattern}) "
+             "— §6.2, §6.13, §3.2 path-as-resource",
+    )
+    if resource_error is not None:
+        return resource_error
+    assert handler_path is not None
     if not handler_path.startswith("system/handler/"):
         return _error(400, "malformed_resource",
                       "unregister resource must be system/handler/{pattern}")

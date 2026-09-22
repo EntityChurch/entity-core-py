@@ -61,7 +61,14 @@ from entity_handlers.compute import (
     is_error,
 )
 
-PEER_ID = "2KTestBuiltinApplyQ23PeerIdaaaaaaaaaaaaaaaaa"
+# 46 Base58 characters — §5.4's minimum, and the alphabet excludes `0 O I l`,
+# which is why this reads `Bui1tin`/`App1y`/`PeerJd`. It was 44 characters and
+# carried three illegal ones, i.e. a "peer id" no conformant peer could hold,
+# and nothing noticed until 0.8.2.20's G6 rule put `validate_absolute_path` on
+# the authorization path: `app/data/y` qualifies to `/{PEER_ID}/app/data/y`,
+# whose first segment was then not a peer_id, so the handler-grant ceiling
+# check refused a target the wildcard grant covers.
+PEER_ID = "2KTestBui1tinApp1yQ23PeerJdaaaaaaaaaaaaaaaaaaa"
 
 WILDCARD_CAP = {
     "grants": [{

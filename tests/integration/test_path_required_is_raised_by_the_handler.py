@@ -264,6 +264,114 @@ class TestTheAmbiguousArm:
         )
 
 
+class TestThePatternArm:
+    """§3.3's **third** input, added at 0.8.2.20: *"A resource-requiring
+    operation takes a CONCRETE path: where the effective list holds a single
+    entry and that entry ``is_pattern``, the operation answers `400
+    malformed_resource`."*
+
+    .. rubric:: Why it is a third arm and not a variation of the second
+
+    The first two arms are about **how many** targets there are; this one is
+    about **what one target is**. A pattern passes every count check ever
+    written for this row — it is exactly one entry — and then gets indexed and
+    used as a path, so the operation acts at a literal path containing a `*`
+    or, worse, at whatever a downstream normalizer makes of one.
+
+    It is also the arm with no natural forcing function: 0.8.2.20 adds it to a
+    row two prior censuses of this file walked and passed. There was no
+    behaviour change to prompt a test, which is the *"a ruling you already
+    satisfy produces no diff"* trap arriving one clause later — except here we
+    did **not** already satisfy it, and the two existing arms are exactly what
+    made it look like we did.
+
+    .. rubric:: Measured: 7 of these 18 rows discriminate, and the prediction
+       was 18
+
+    Deleting the arm from ``_common.require_single_resource_target`` reddens
+    **seven**: both `content` rows, all three `compute` rows,
+    `continuation:install` and `attestation:create`. The other eleven —
+    `system/handler`'s two verbs and all seven `role` operations — answer
+    ``malformed_resource`` **anyway**, from their own downstream path-shape
+    check (`register` requires the target to start `system/handler/`; a
+    pattern does not), and so score a peer without the rule as conformant.
+
+    They are kept and labelled rather than deleted: they are real conformance
+    rows for those operations, and they are **not** evidence that the shared
+    arm exists. The distinction matters because the eleven are the ones a
+    later reader would cite — they are the operations §6.13 names by name.
+
+    ``test_the_three_arms_do_not_collapse`` reddens on **none** of them, which
+    is the same shape one level up: without the arm the pattern input still
+    produces *some* third code (`404 not_found`, `400 invalid_params`), so
+    three-distinct-codes is satisfied by a peer that has no pattern rule at
+    all. It is a control against collapse, not a check on this arm.
+    """
+
+    #: One well-formed *pattern* target. The distinguishing property is not
+    #: that it is malformed — it is structurally fine — but that it names a
+    #: SET where the operation's own spec names an entity.
+    PATTERN_TARGET = ["system/probe/*"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,operation,data,authority",
+        REQUIRES_RESOURCE,
+        ids=[f"{h}:{o}" for h, o, _d, _a in REQUIRES_RESOURCE],
+    )
+    async def test_answers_malformed_resource_for_a_single_pattern_target(
+        self, peer, handler, operation, data, authority,
+    ):
+        result = await _dispatch(
+            peer, handler, operation, data, resource_targets=self.PATTERN_TARGET,
+        )
+
+        assert result.status == 400, (
+            f"{handler}:{operation} with a single PATTERN target -> "
+            f"{result.status}. {authority} requires *a* resource, and a "
+            f"pattern is a set: {result.result}"
+        )
+        assert _code(result) == "malformed_resource", (
+            f"{handler}:{operation} with a pattern target answered "
+            f"{_code(result)!r}. §3.3 distinguishes this from `invalid_path` "
+            "on purpose — the target is structurally valid and is simply not "
+            "usable as *this* operation's subject, which is a different "
+            "instruction to the caller"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "handler,operation,data,authority",
+        REQUIRES_RESOURCE,
+        ids=[f"{h}:{o}" for h, o, _d, _a in REQUIRES_RESOURCE],
+    )
+    async def test_the_three_arms_do_not_collapse(
+        self, peer, handler, operation, data, authority,
+    ):
+        """The pair control, extended to the triple.
+
+        Asserting each code separately still passes a peer that answers one
+        code to all three inputs if the rows are read one at a time. Three
+        inputs, three remedies — *supply a resource*, *disambiguate the one
+        you sent*, *name an entity rather than a set* — and the code is what
+        selects between them.
+        """
+        codes = {
+            "absent": _code(await _dispatch(peer, handler, operation, data)),
+            "ambiguous": _code(await _dispatch(
+                peer, handler, operation, data, resource_targets=TWO_TARGETS,
+            )),
+            "pattern": _code(await _dispatch(
+                peer, handler, operation, data,
+                resource_targets=self.PATTERN_TARGET,
+            )),
+        }
+        assert len(set(codes.values())) == 3, (
+            f"{handler}:{operation} does not answer three distinct codes to "
+            f"§3.3's three inputs: {codes}"
+        )
+
+
 class TestLocalFilesIsNotInTheSetAndThisIsWhy:
     """SA-PY-47 — the one resource-requiring surface the census reached and
     deliberately did not converge.
@@ -331,9 +439,9 @@ class TestTheClassClosesAtOneSite:
                 "whose spec requires a resource"
             )
 
-    def test_the_helper_answers_both_arms(self):
-        """A helper that answered one arm would let every call site read as
-        migrated while half the row stayed unimplemented."""
+    def test_the_helper_answers_all_three_arms(self):
+        """A helper that answered some arms would let every call site read as
+        migrated while part of the row stayed unimplemented."""
         import inspect
 
         from entity_handlers._common import require_single_resource_target
@@ -341,6 +449,42 @@ class TestTheClassClosesAtOneSite:
         src = inspect.getsource(require_single_resource_target)
         assert "path_required" in src
         assert "ambiguous_resource" in src
+        assert "malformed_resource" in src
+
+    def test_no_resource_requiring_handler_keeps_a_PRIVATE_copy_of_the_row(self):
+        """⭐ The row the two-arm era could not have written, and the one that
+        the pattern arm turned red on its first run.
+
+        `compute:eval`/`install`/`uninstall` and `continuation:install` each
+        held their **own** copy of the absent/more-than-one check — correct on
+        both arms, passing every behavioural row above, and therefore invisible
+        to a class whose members are codes. When 0.8.2.20 added the third arm
+        it reached the shared helper and **none of those four**.
+
+        The reason all four kept a private copy is worth the row: their
+        refusals carry a `compute/error` envelope rather than
+        `system/protocol/error`, so *the shape of the answer* was the reason to
+        re-derive *the rule*. The helper now takes the result type, which
+        removes the reason. This asserts the copies are gone, module by
+        module — a behavioural row cannot, because a private copy that happens
+        to be correct today is indistinguishable from the shared one.
+        """
+        import inspect
+
+        from entity_handlers import compute, continuation, handlers
+
+        for module in (compute, continuation, handlers):
+            src = inspect.getsource(module)
+            assert "ERR_AMBIGUOUS_RESOURCE," not in src.replace(
+                "ERR_AMBIGUOUS_RESOURCE = ", "",
+            ), (
+                f"{module.__name__} still emits the more-than-one arm itself; "
+                "the row lives in `_common.require_single_resource_target` so "
+                "that the next arm added to it reaches every site at once"
+            )
+            assert '"ambiguous_resource"' not in src, (
+                f"{module.__name__} names the code directly — see above"
+            )
 
 
 class TestTheHandlerIsTheRaisingSite:

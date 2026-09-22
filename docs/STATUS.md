@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-09 · public: v0.8.0 (master)_
+_Updated: 2026-09-11 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -49,7 +49,37 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1638 · 1621 P · 16 W · 0 F · 1 S @ core-go `b320c1e`` (2026-09-10)** —
+**The citable number is `1644 · 1628 P · 15 W · 0 F · 1 S @ core-go `c3eaa82`` (2026-09-11)** —
+all seven `validate-complete.sh` passes exit 0 on `80a54e7`. The `+6` over the previous sample
+is go's new **`resource_effective`** category (`CORE-RESOURCE-EFFECTIVE-1`, six arms), and it
+fires **6/6 against a py peer on its first drive**, with no harness change at either end —
+**two seats of the three-way on the resources dimension, which had never been driven
+cross-impl.**
+
+That result is attributable rather than incidental: `resource_effective_pattern_malformed`
+drives `system/content:get` with a single **pattern** target, `content:get` reads its subject
+through the shared three-arm helper, and deleting this session's §3.3 third arm reddens that
+row (measured). The arm would have FAILED against the parent commit.
+
+**`0.8.2.20` is absorbed.** Beyond the relay's *"one item"* (the `effective[0]` selection,
+which landed 2026-09-10 at `254da7b` — **at the authorizer**, not in the helper) the ruling
+carried four more pieces of work, none of them in the per-seat relay section: **R11**
+(`canonicalize` is total, `NEVER_MATCH`, three ruled consumers, matcher arm FIRST), **G6**
+(every `validate_absolute_path` call site consumes its verdict), **§3.3's third arm**
+(a single pattern effective target → `malformed_resource`), and **§6.7's withdrawal** of
+*"the handler-level path check is secondary."* Wiring G6 found two things nothing else could:
+a `/*/*` grant covers a target rooted at a non-peer segment (the sentinel does not close it —
+only the consumed verdict does, and `entity-core-go`'s `validConcreteTarget` drops that
+clause, routed), and `is_peer_id` compared `!= 46` where §5.4 calls 46 a **minimum**.
+
+Also this round: the **403 code slot censused for the first time** — thirteen spellings the
+corpus defines nowhere, twelve ledgered for their owning tables (SA-PY-51) and `forbidden`
+swept to `capability_denied` at ten sites, two of them `system/tree` `get`/`put`; the
+**continuation advance's three forwarders** dropping the caller's `exclude` (go's `-11-a` §3
+shape, reached through a *suspension* rather than a copy); and **SA-PY-50**, a `[MUST]` whose
+literal pseudocode neither ground-up seat implements and nothing can detect.
+
+*(Prior sample: `1638 · 1621 P · 16 W · 0 F · 1 S @ core-go `b320c1e`` (2026-09-10) —*
 all seven `validate-complete.sh` passes exit 0, image built from `614a9d8`. **The 2 F are
 gone**: go re-based the two `system/*` checks onto `0.8.2.13`'s withdrawal, which is what the
 entry below said was theirs to do. The one skip is **declared**, not unmeasured —
@@ -57,7 +87,7 @@ entry below said was theirs to do. The one skip is **declared**, not unmeasured 
 (0.8.2.8, cf SA-PY-36): this peer registers a catch-all `*`, so the 404 row is not drivable
 against its posture. Check count `1637 -> 1638`; warns `15 -> 16`, the delta being
 `t1_1_concurrent_demux`, the documented timing warn that flips run to run (it was absent from
-the 2026-09-09 first sample and present in the second).
+the 2026-09-09 first sample and present in the second).*
 
 **The four F63/E3 origination rows PASS** (`dispatch_outbound_{reentry,ambient_refused,
 narrow_grant_refuses_out_of_scope,multisig_root_refused}`), which is go's sharpened §7a.1a

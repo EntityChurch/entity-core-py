@@ -268,6 +268,95 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A safety property that rests on *nothing happens to match it* is not a property — and the
+  ARGUMENT for it is what stops anyone re-checking.** ***RATIFIED 2026-09-11*** *— second shape of
+  R-27 clause 4's law (*write down the strongest reason you know, not the one that convinced
+  you*), with the reason not merely weak but **withdrawn by the ruling that arrived next**.*
+  Before 0.8.2.20 our `canonicalize` passed a reserved (`./`, `../`) or ambiguous (`*/`) string
+  through unchanged, and the docstring argued it: *a non-absolute string matches no canonical
+  `/{peer_id}/...` target, so a malformed grant pattern is fail-closed by construction.* **That
+  sentence is true of every input anyone named, and it is exactly what §5.4 now refuses to rest
+  on** — `matches_pattern` returns True for a bare `"*"` operand, one recursion step through the
+  `/*/` arm can produce one, and the ruling says in terms that *"safety MUST NOT rest on a value
+  merely looking unmatchable."* The remedy is a **named sentinel** (`NEVER_MATCH`) whose refusal
+  is a matcher rule stated FIRST, so the arm ordering is the property rather than the string
+  shape. Behaviour barely moved; what moved is that the next person to add a matcher arm cannot
+  silently delete the guarantee.
+  **Why this shape is worse than a weak reason:** a weak reason is inert until a refactor. An
+  argument of the form *nothing can reach this* is **load-bearing** and reads as a proof — it is
+  the sentence that makes a reviewer stop, and it cannot be falsified by any test, because a
+  test can only sample the inputs the author already thought of.
+  **Two findings fell out of wiring it, and both were reachable only from a new call site.**
+  §5.2's G6 rule (*consume `validate_absolute_path`'s verdict and fail closed*) put that
+  predicate on an authorization path for the first time — and (1) a **peer-wildcard** grant
+  (`/*/*`) strips the first segment whatever it is, so a target rooted at a non-peer segment was
+  **covered**, which the sentinel alone does not close; (2) `is_peer_id` compared `!= 46` where
+  §5.4 says `< 46` and calls 46 a **minimum**. The two forms agree on every peer this cohort has
+  minted; they disagree on a longer algorithm, where the equality form misclassifies a foreign
+  absolute path as peer-relative and `EntityTree.normalize_uri` re-roots it under **our own**
+  namespace. **Putting an existing predicate on a new path is a census of that predicate** — the
+  new call site is what tells you the old one was wrong, and a 48-character fixture peer id
+  refusing was the whole signal. Enforcement point:
+  `tests/integration/test_canonicalize_total_never_match_r11.py` — the arm-ordering row
+  (`matches_pattern("*", NEVER_MATCH)`), the G6 row driven at the ONE configuration that
+  separates it from the sentinel, its one-dimension-apart teeth control, and the minimum-not-
+  equality rows. Four mutations, four correct predictions.
+  *And `entity-core-go` diverges here: their `validConcreteTarget` checks the leading slash and
+  the path characters and **not** the peer_id segment — the one clause that bites against a
+  `/*/*` grant. Routed.*
+
+- **A status slot nobody NAMES is a slot nobody walks — every census this repo has run was
+  triggered from outside it.** *Candidate, 2026-09-11.* 501 came from a 0.8.2.7 ruling, 500 from
+  0.8.2.8, 404 and 400 from `entity-core-go` probe families. **403 had never been censused**, and
+  asking §3.3's own question of it — *which codes do we emit at this status, and does the corpus
+  define them?* — found **thirteen** spellings defined nowhere, in eight handlers. Twelve name
+  conditions and are ledgered for their owning tables (SA-PY-51). The thirteenth, `403
+  forbidden`, is ten sites carrying *"Capability doesn't grant {op} on {path}"* — §5.2a's
+  condition verbatim, which `EXTENSION-TREE` and `EXTENSION-REVISION` both spell
+  `capability_denied` — and **two of the ten are `system/tree` `get` and `put`**, the most
+  dispatched refusals in the peer.
+  **Why 403 is the slot this happens in**, and the part that generalizes: *every row that reads
+  a 403 is asserting the status.* A refusal is the expected outcome, the test passes, and the
+  code field is decoration — the *"a negative security test can PASS for the wrong reason"* law
+  with the **code** rather than the gate as the thing nobody checks. Same reason no probe family
+  exists: a prober writes rows for codes it can predict.
+  **And the census corrected its own routing paragraph.** A `grep -c '"forbidden"'` reported go 1
+  / rust 4 and the draft called it a cohort spelling; **walking the sites** shows all five are
+  comments and test fixtures and **neither sibling emits it**. That is AP-21's own law — *a count
+  of the token is not a census of the slot* — firing inside a census written to apply it, in the
+  flattering direction, where it would have converted a local defect into a cohort convergence
+  question. Enforcement point: `tests/integration/test_undeclared_403_code_census.py`, monotone
+  in both directions, reading **both** emission shapes — `tree.py`'s two sites are hand-rolled
+  dict literals, so the call-only extractor the 500 ledger uses would have found eight of the ten
+  and missed the two that matter most.
+
+- **A PRIVATE copy of a rule that is CORRECT is the copy nobody revisits when the rule grows an
+  arm — and the reason for the copy is usually the ENVELOPE, not the rule.** *Candidate,
+  2026-09-11, landing §3.3's third arm.* 0.8.2.20 adds *a single **pattern** target →
+  `malformed_resource`* to a row this repo had already censused twice and closed *"at one site"*.
+  Adding it to the shared helper turned the gate red on **four operations the helper does not
+  reach** — `compute:eval`/`install`/`uninstall` and `continuation:install` — each holding its
+  own **correct** copy of the first two arms. Correctness is what made them invisible: every
+  behavioural row passed, and a class whose members are codes cannot see a site that emits the
+  right ones.
+  **The reason all four re-derived the rule is the reusable half:** their refusals carry a
+  `compute/error` envelope rather than `system/protocol/error`, so *the shape of the answer* was
+  the reason to re-derive *the rule*. The fix is to make the envelope a parameter
+  (`require_single_resource_target(..., result_type=…)`) — **a differing result type must not be
+  a reason to own a copy of a row** — and to delete the constants the private copies used, since
+  a constant left behind after its call sites move is the invitation to re-inline.
+  **Measured, and it is why the class rows are labelled:** deleting the shared arm reddens **7 of
+  18** rows. The other eleven — `system/handler`'s two verbs and all seven `role` operations —
+  answer `malformed_resource` anyway from their own downstream path-shape check, so they score a
+  peer without the rule as conformant, *and they are the rows a later reader would cite because
+  §6.13 names them*. The three-arms-do-not-collapse row reddens on **none**: without the arm the
+  pattern input still produces some third code, so three-distinct is satisfied by a peer with no
+  pattern rule at all. Enforcement point:
+  `test_path_required_is_raised_by_the_handler.py::TestTheClassClosesAtOneSite::
+  test_no_resource_requiring_handler_keeps_a_PRIVATE_copy_of_the_row`, which reads the modules'
+  source — because a private copy that happens to be correct today is behaviourally
+  indistinguishable from the shared one.
+
 - **Cohort AGREEMENT is evidence about the reading implementers reach, not about the text —
   and it is the most convincing green there is.** ***RATIFIED 2026-09-10*** *— the CE-1 law
   (*"unruled" is a claim about the corpus, and three peers disagreeing is evidence about three
@@ -1314,6 +1403,18 @@ fails the gates rather than slipping past them.
   mutating a file whose feature is still uncommitted deletes the feature along with the
   mutation. Commit the change first, then mutate, then restore — or keep the mutation in a
   patch you reverse by hand.
+  ***THIRD instance, 2026-09-11, with this entry on screen*** *— which is the finding, because
+  "be careful" has now failed three times.* The new half is **where the restore lives**: the
+  mutation and its `git checkout --` were written as one shell invocation (mutate → run →
+  restore), so there was **no moment between them at which the dirty tree was observable**. The
+  fix had passed its tests, it had not been committed, and the restore took it out along with
+  the mutation — invisible until a `grep` for the identifier came back empty two steps later.
+  **The rule is structural, not behavioural: a mutation script MUST NOT contain its own restore
+  unless the file is committed.** Either commit first (then the restore is exact), or reverse the
+  mutation by re-applying the inverse edit in a separate step you can see fail. Cost here: the
+  fix was re-applied from the same script and the commit amended, so nothing shipped wrong — but
+  the tests were committed alongside the REVERTED source for one commit, which is a state that
+  reads green on the tests it was written to fail.
 
 - **The validator measures your *working tree*, so don't edit it mid-run — and pin the
   oracle or the number is not citable.** *2026-08-18, both halves learned in one run.*

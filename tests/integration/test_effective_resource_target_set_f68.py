@@ -325,6 +325,86 @@ class TestArchsSelfExcludedSecurityVector:
         )
 
 
+class TestArchsAntecedentControl:
+    """§6 requirement 3, and arch says outright why it is a requirement:
+    *"the antecedent control — same `P`, **no** `exclude` → `403
+    capability_denied`. Without this arm a run cannot tell a working guard
+    from a peer that denies everything."*
+
+    It is the one requirement in the set that is **not** about F68 at all. F-1
+    two classes up shows a peer refusing to act on a self-excluded
+    out-of-grant target; this shows that the same target without the exclude
+    is refused **by the resources dimension**, i.e. that the grant used in
+    these rows genuinely does not cover `P`. Take this row away and every
+    other row in the file is satisfied by a peer that 400s or 403s on
+    everything.
+
+    The pair is also the only thing that distinguishes the two refusals: F-1
+    is `400 path_required` (*you asked for nothing*) and this is `403
+    capability_denied` (*you asked for something you may not have*), and a
+    seat that answered one code to both would have collapsed the distinction
+    §5.2 turns on — that the exclusion is *"redundant but valid"* rather than
+    a denial.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_same_target_without_the_exclude_is_refused_by_the_grant(
+        self,
+    ):
+        from entity_core.peer.connection import Connection
+
+        server = (
+            PeerBuilder()
+            .with_keypair(Keypair.generate())
+            .with_all_handlers()
+            .with_default_grants([Grant.create(
+                handlers=["*"], operations=["*"], resources=SCOPED_RESOURCES,
+            )])
+            .debug_mode(True)
+            .build()
+        )
+        await server.start("127.0.0.1", 19094)
+        try:
+            conn = await Connection.connect("127.0.0.1", 19094, Keypair.generate())
+            try:
+                payload = {"type": "primitive/any",
+                           "data": {"hash": b"\x00" + b"\x11" * 32}}
+                uri = f"entity://{server.peer_id}/system/content"
+                denied = await conn.execute(
+                    uri, "get", payload, resource={"targets": [OUT_OF_SCOPE]},
+                )
+                excluded = await conn.execute(
+                    uri, "get", payload,
+                    resource={"targets": [OUT_OF_SCOPE],
+                              "exclude": [OUT_OF_SCOPE]},
+                )
+            finally:
+                conn.close()
+                await conn.wait_closed()
+        finally:
+            await server.stop()
+
+        assert denied.status == 403, (
+            f"{OUT_OF_SCOPE!r} is outside a grant scoped to "
+            f"{SCOPED_RESOURCES} and was answered {denied.status}. Every "
+            f"other row in this file assumes this target is out of grant; if "
+            f"it is not, they are all measuring nothing: {denied.result}"
+        )
+        assert (denied.result or {}).get("data", {}).get(
+            "code"
+        ) == "capability_denied"
+
+        assert excluded.status == 400, (
+            "the same target, excluded, must be the ABSENT case rather than a "
+            f"denial: {excluded.result}"
+        )
+        assert denied.status != excluded.status, (
+            "a peer answering one status to both inputs has one gate. §5.2 "
+            "calls the caller's own exclusion 'redundant but valid' — it is "
+            "not a denial, and the caller is owed the difference"
+        )
+
+
 class TestTheReductionIsAtTheAuthorizerAndNotInEachConsumer:
     """Structural — the property, not a behaviour.
 

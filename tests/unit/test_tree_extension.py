@@ -837,7 +837,11 @@ class TestCapabilityChecks:
         )
 
         assert result["status"] == 403
-        assert result["result"]["data"]["code"] == "forbidden"
+        # §5.2a's authz default, and `EXTENSION-TREE` §8 / Appendix A's own
+        # spelling (`merge` -> `capability_denied`). This read `forbidden`,
+        # which is defined nowhere in the corpus — see
+        # `test_status_code_slot_3_3.py::TestThe403Slot`.
+        assert result["result"]["data"]["code"] == "capability_denied"
 
     @pytest.mark.asyncio
     async def test_merge_forbidden_without_put_permission(

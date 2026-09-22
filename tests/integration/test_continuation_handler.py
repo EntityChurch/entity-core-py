@@ -699,6 +699,103 @@ class TestContinuationResourceTargets:
         assert ctx._dispatched_calls[0]["resource_targets"] is None
 
     @pytest.mark.asyncio
+    async def test_the_forwarded_set_is_the_EFFECTIVE_one(self, setup_context):
+        """⭐ §5.2's subject rule at a forwarder — the shape `entity-core-go`
+        routed after landing `effective_targets` unit-green and finding it
+        **inert on the wire**.
+
+        Their defect was a dispatch-time normalizer that rebuilt the resource
+        struct with only its targets, dropping the caller's `exclude`; the
+        relay asks every seat for *"any place that COPIES or REBUILDS the
+        resource struct between the wire decode and the handler."* This is
+        that place in this tree, three times over — and it is worse hidden
+        than theirs, because a continuation's `resource` is authored at
+        **install** and replayed at **advance**, so the two halves of the
+        derivation are separated by a suspension rather than by a function
+        call.
+
+        What it is not: their bypass. Nothing here rebuilds a struct an
+        authorizer later reads, so the downstream check re-tests every
+        forwarded target against the grant. What it produced was a **subject**
+        outside `effective_targets` — §5.2's `[MUST]`, and the half that is
+        wrong with or without an authorization gap.
+        """
+        emit_pathway, ctx, keypair = setup_context
+
+        kept = "system/validate/kept/item"
+        excluded = "system/validate/excluded/item"
+        continuation = Entity(
+            type=CONTINUATION_TYPE,
+            data={
+                "target": "entity://peer-b/system/tree",
+                "operation": "get",
+                "resource": {
+                    "targets": [excluded, kept],
+                    "exclude": [excluded],
+                },
+                "dispatch_capability": ctx._dispatch_cap_hash,
+            },
+        )
+
+        cont_path = "system/inbox/excluded-forward"
+        full_uri = emit_pathway.entity_tree.normalize_uri(cont_path)
+        emit_pathway.emit(
+            full_uri, continuation, EmitContext.protocol(author=keypair.peer_id)
+        )
+
+        await continuation_handler(
+            "system/continuation", "advance",
+            {"data": {"continuation_path": cont_path, "result": {"go": 1}}},
+            ctx,
+        )
+
+        assert len(ctx._dispatched_calls) == 1
+        forwarded = ctx._dispatched_calls[0]["resource_targets"]
+        assert forwarded == [kept], (
+            f"the advance dispatched with {forwarded!r}. The stored resource "
+            f"excludes {excluded!r}, so it is not a subject — and this site "
+            "read `resource['targets']` and never looked at "
+            "`resource['exclude']`, which is the arity check passing while "
+            "the identity is wrong (F68's F-2 shape at a forwarder)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_fully_excluded_resource_forwards_nothing(
+        self, setup_context,
+    ):
+        """The boundary of the row above, and the arm that decides what
+        "nothing survived" means.
+
+        `None` rather than `[]`: §3.3 gives an empty effective list and an
+        absent resource the same answer, so forwarding an empty list would ask
+        the receiving peer to distinguish two inputs the spec calls the same —
+        and `resource: {targets: []}` on the wire is a resource field naming
+        nothing, which is a different frame from no resource field.
+        """
+        emit_pathway, ctx, keypair = setup_context
+
+        only = "system/validate/only/item"
+        emit_pathway.emit(
+            emit_pathway.entity_tree.normalize_uri("system/inbox/all-excluded"),
+            Entity(type=CONTINUATION_TYPE, data={
+                "target": "entity://peer-b/system/tree",
+                "operation": "get",
+                "resource": {"targets": [only], "exclude": [only]},
+                "dispatch_capability": ctx._dispatch_cap_hash,
+            }),
+            EmitContext.protocol(author=keypair.peer_id),
+        )
+
+        await continuation_handler(
+            "system/continuation", "advance",
+            {"data": {"continuation_path": "system/inbox/all-excluded",
+                      "result": {"go": 1}}},
+            ctx,
+        )
+
+        assert ctx._dispatched_calls[0]["resource_targets"] is None
+
+    @pytest.mark.asyncio
     async def test_join_uses_resource_targets_from_resource_field(
         self, setup_context
     ):

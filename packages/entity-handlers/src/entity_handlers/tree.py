@@ -35,6 +35,7 @@ from entity_core.storage.entity_tree import EntityTree
 from entity_core.types.deletion_marker import is_deletion_marker
 from entity_core.utils.ecf import Hash, hash_to_display, is_zero_hash
 from entity_core.utils.path import validate_path_chars
+from entity_handlers._common import unresolvable_tree_path as _unresolvable_tree_path
 from entity_handlers.manifest import error_response as _error_response
 
 logger = logging.getLogger(__name__)
@@ -129,14 +130,29 @@ async def _handle_get(
     limit = params.get("limit")
     offset = params.get("offset", 0)
 
-    # Defense-in-depth: check caller's capability grants access to this path
+    # §5.4's third ruled consumer (0.8.2.20) — a path that canonicalizes to
+    # NEVER_MATCH MUST NOT be resolved against the tree. Structural, so it
+    # runs ahead of the authorization check.
+    unresolvable = _unresolvable_tree_path(request_path, ctx.local_peer_id)
+    if unresolvable is not None:
+        return unresolvable
+
+    # §6.7 (0.8.2.20): **not a secondary check.** The dispatch-level check
+    # authorizes the request the caller MADE; this one authorizes the path the
+    # handler is ABOUT TO TOUCH, and they differ whenever any part of the
+    # subject is derived after dispatch. The earlier characterization of this
+    # line as defense-in-depth rested on the premise that the dispatch-level
+    # check handles the primary resource check — F68 is the case where that
+    # premise is false, and the characterization is WITHDRAWN at §6.3, §6.7,
+    # §9.1 and the §8 layer table. It is also why this runs on a **read**: the
+    # rule was scoped to writes and the measured harm was a `get`.
     if not ctx.check_caller_permission("get", request_path):
         return {
             "status": 403,
             "result": {
                 "type": "system/protocol/error",
                 "data": {
-                    "code": "forbidden",
+                    "code": "capability_denied",
                     "message": f"Capability doesn't grant get on path: {request_path}",
                 },
             },
@@ -318,14 +334,21 @@ async def _handle_put(
     if path_char_error is not None:
         return _error_response(400, "invalid_path", f"invalid path: {path_char_error}")
 
-    # Defense-in-depth: check caller's capability grants access to this path
+    # §5.4's third ruled consumer (0.8.2.20) — a path that canonicalizes to
+    # NEVER_MATCH MUST NOT be **stored** or used as a storage key. Same
+    # placement and the same reason as the char scan directly above.
+    unresolvable = _unresolvable_tree_path(request_path, ctx.local_peer_id)
+    if unresolvable is not None:
+        return unresolvable
+
+    # §6.7 (0.8.2.20): not a secondary check — see `_handle_tree_get`.
     if not ctx.check_caller_permission("put", request_path):
         return {
             "status": 403,
             "result": {
                 "type": "system/protocol/error",
                 "data": {
-                    "code": "forbidden",
+                    "code": "capability_denied",
                     "message": f"Capability doesn't grant put on path: {request_path}",
                 },
             },
@@ -547,7 +570,7 @@ async def _handle_snapshot(
 
     # Check get permission on prefix
     if not ctx.check_caller_permission("get", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant get on prefix: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant get on prefix: {prefix}")
 
     # Build bindings with relative paths
     full_prefix = tree.normalize_uri(prefix)
@@ -983,7 +1006,7 @@ async def _handle_extract(
 
     # Check get permission on prefix
     if not ctx.check_caller_permission("get", prefix):
-        return _error_response(403, "forbidden", f"Capability doesn't grant get on prefix: {prefix}")
+        return _error_response(403, "capability_denied", f"Capability doesn't grant get on prefix: {prefix}")
 
     full_prefix = tree.normalize_uri(prefix)
     bindings: dict[str, bytes] = {}

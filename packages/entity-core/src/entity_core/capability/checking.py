@@ -38,6 +38,7 @@ from typing import Any, Callable
 from entity_core.capability.temporal import temporal_validity
 from entity_core.capability.token import CapabilityScope, get_scope
 from entity_core.utils.identity import is_peer_id
+from entity_core.utils.path import validate_absolute_path
 
 # Re-export for backward compatibility (some code may import from here)
 __all__ = [
@@ -151,22 +152,66 @@ def normalize(uri: str) -> str:
     return uri
 
 
-def canonicalize(path: str, local_peer_id: str) -> str:
-    """Resolve path to absolute form per V7 §5.4 (R2).
+NEVER_MATCH = "/never-match"
+"""The unmatchable value — §5.4 (0.8.2.20).
 
-    This is a **pure transform**, never a rejection point — it matches the
-    spec pseudocode (`matches_scope`/`check_permission` call canonicalize then
-    `matches_pattern` with no exception handling) and the §5.4 dispatch chain
-    (line 290-291: canonicalize *then* `validate_absolute_path`). Rejection of
-    a malformed *request* path is the job of `validate_absolute_path` at the
-    dispatch boundary, not of canonicalize.
+A single-segment absolute path whose first segment **cannot** be a peer_id
+(``is_peer_id`` requires >= 46 Base58 characters and ``-`` is outside the
+Base58 alphabet), so it is unreachable as a canonical path *by construction
+rather than by prohibition*. Star-free, plain ASCII, greppable.
+
+Three consumers are ruled, and all three are in this tree:
+
+==================================  ==========================================
+consumer                            rule
+==================================  ==========================================
+:func:`matches_pattern`             MUST return False for **either** operand
+``validate_absolute_path``          MUST error — it does, by construction, and
+                                    this is the designed destination for the
+                                    diagnostic :func:`canonicalize` no longer
+                                    raises
+storage / tree access               MUST NOT store, key, or resolve it
+==================================  ==========================================
+"""
+
+
+def is_pattern(path: str) -> bool:
+    """§5.2's ``is_pattern`` — does this path carry a wildcard?
+
+    Named rather than inlined because three rules now key on it: §5.2's
+    concrete-target validation (a pattern goes through matching, not tree
+    access), §3.3's ``malformed_resource`` arm (a resource-**requiring**
+    operation takes a concrete path), and §5.2's pattern-target grant-exclude
+    walk.
+    """
+    return "*" in path
+
+
+def canonicalize(path: str, local_peer_id: str) -> str:
+    """Resolve path to absolute form per V7 §5.4 (R2). **Total** (0.8.2.20).
+
+    .. rubric:: The return domain is *a canonical path OR* :data:`NEVER_MATCH`
+
+    0.8.2.20 (R11) makes this function total: malformed input yields the
+    sentinel rather than an error return or a pass-through, *"because every
+    normative call site of this function is a matcher with no error channel to
+    consume one."* The diagnostic belongs at admission (§6.5), which has a
+    caller to answer — here that is `validate_absolute_path` at the dispatch
+    boundary, which :data:`NEVER_MATCH` fails by construction.
+
+    **What changed and what did not.** Reserved (``./``, ``../``) and
+    ambiguous bare-peer-wildcard (``*/``) input used to pass through
+    unchanged, on the argument that a non-absolute string matches no canonical
+    ``/{peer_id}/...`` target and is therefore fail-closed anyway. That
+    argument is *true of every input we could name* and is exactly the shape
+    0.8.2.20 refuses to rest on: §5.4 says safety **MUST NOT** rest on a value
+    merely *looking* unmatchable, because :func:`matches_pattern` returns True
+    for a bare ``"*"`` operand and one recursion step can produce one. The
+    sentinel moves the property from *nothing happens to match it* to *the
+    matcher refuses it by name*.
 
     - Strips entity:// scheme first (via normalize)
-    - Reserved ./ and ../ prefixes and the ambiguous bare */ prefix
-      **pass through unchanged** (they are not absolute, so they match no
-      canonical `/{peer_id}/...` target — a malformed *grant* pattern is thus
-      fail-closed by construction per §1.11, not a crash; a malformed *request*
-      target is rejected downstream by validate_absolute_path)
+    - Reserved ``./`` / ``../`` and bare ``*/`` -> :data:`NEVER_MATCH`
     - Already absolute (starts with /) -> pass through
     - Bare "*" -> /{local_peer_id}/* (peer-relative wildcard)
     - Peer-relative path -> /{local_peer_id}/{path}
@@ -176,21 +221,19 @@ def canonicalize(path: str, local_peer_id: str) -> str:
         local_peer_id: The local peer's ID for expansion.
 
     Returns:
-        Absolute path starting with /, or the reserved/ambiguous input
-        unchanged (which validate_absolute_path will reject for request paths,
-        and which fails to match for grant patterns).
+        An absolute path starting with ``/``, or :data:`NEVER_MATCH`.
     """
     # First normalize (strip entity:// if present)
     path = normalize(path)
 
     # Reserved directory-relative and ambiguous bare-peer-wildcard prefixes
-    # pass through unchanged. They are non-absolute, so they match no canonical
-    # target (grant patterns fail closed) and validate_absolute_path rejects
-    # them for request paths. Folding rejection in here instead made a malformed
-    # *grant* pattern raise mid-capability-check and drop the connection
-    # (V7 §1.11 fail-closed / F5 — the malformed-resource-pattern probe).
+    # are UNREPRESENTABLE, not merely unmatched (§5.4, 0.8.2.20). Returning the
+    # sentinel rather than raising is what keeps a malformed *grant* pattern
+    # from raising mid-capability-check and dropping the connection (§1.11
+    # fail-closed / F5 — the malformed-resource-pattern probe), while making
+    # the refusal a matcher rule instead of an accident of string shape.
     if path.startswith("./") or path.startswith("../") or path.startswith("*/"):
-        return path
+        return NEVER_MATCH
 
     # Already absolute
     if path.startswith("/"):
@@ -217,6 +260,13 @@ def matches_pattern(pattern: str, uri: str) -> bool:
     Returns:
         True if the URI matches the pattern.
     """
+    # NEVER_MATCH never matches, in EITHER operand (§5.4, 0.8.2.20). This arm
+    # is FIRST and is a matcher rule, not a property of the string: the arm
+    # directly below returns True for a bare "*" operand, so safety MUST NOT
+    # rest on a value merely looking unmatchable.
+    if pattern == NEVER_MATCH or uri == NEVER_MATCH:
+        return False
+
     # Universal match (also base case for /*/* recursion)
     if pattern == "*":
         return True
@@ -477,6 +527,29 @@ def effective_resource_targets(
     derivation appearing — see
     ``tests/integration/test_effective_resource_target_set_f68.py``.
 
+    .. rubric:: The skip is decided CANONICALLY; the survivor is returned RAW
+
+    §5.2's pseudocode appends the canonical form (``out.append(ct)``). We
+    return the caller's spelling, deliberately, and so does ``entity-core-go``
+    — independently and for the same reason, which is why it is written down
+    here rather than filed as a departure: **§6.13's own worked example does a
+    peer-relative prefix check on this return** (``system/handler/{pattern}``),
+    and every handler in this tree resolves peer-relative paths through
+    ``normalize_uri``. Canonicalizing the return would double-qualify them.
+
+    The *security* property is unaffected: the skip decision is made on
+    canonical forms, so the authorizer and every handler agree on WHICH
+    targets survive, and the canonical form of the raw survivor is a member of
+    the canonical effective set — ``subject ⊆ effective_targets`` holds either
+    way. Routed to arch as **SA-PY-50**: two of three seats read a `[MUST]`
+    whose literal pseudocode neither implements.
+
+    A target that canonicalizes to :data:`NEVER_MATCH` is **not** skipped
+    here — no exclude can cover it (§5.4's matcher rule), so it stays in the
+    list and is refused by :func:`check_resource_scope`'s fail-closed
+    validation. Dropping it instead would convert a malformed target into an
+    *absent* one, i.e. a 400 for the wrong reason.
+
     Args:
         resource_targets: ``execute.resource.targets`` as sent.
         resource_exclude: ``execute.resource.exclude`` as sent, if any.
@@ -485,7 +558,8 @@ def effective_resource_targets(
             reduction being caller-authored.
 
     Returns:
-        The targets that survive the caller's own exclusions, order preserved.
+        The targets that survive the caller's own exclusions, order preserved,
+        in the caller's own spelling.
     """
     if not resource_exclude:
         return list(resource_targets)
@@ -564,6 +638,20 @@ def check_resource_scope(
         # Find a grant that covers this target AND matches handler/operation
         target_covered = False
         canonical_target = canonicalize(target, local_peer_id)
+
+        # G6 (0.8.2.20) — **consume the verdict and fail closed.** A concrete
+        # target is validated at the protocol boundary; a pattern target goes
+        # through pattern matching rather than tree access, so it is exempt by
+        # the same sentence. The spec's own two call sites of this validator
+        # invoked it *for effect* and discarded the return — one of them under
+        # a comment reading `MUST — reject malformed peer_id segment` — and a
+        # validator whose verdict is dropped enforces nothing. This peer had
+        # neither the call nor the drop: the refusal was real but rested on
+        # *no grant pattern happening to match a non-path*, which is the
+        # accident §5.4 now refuses to rest on.
+        if not is_pattern(canonical_target):
+            if validate_absolute_path(canonical_target) is not None:
+                return False
 
         for grant in capability_data.get("grants", []):
             # Check handler scope
