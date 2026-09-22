@@ -371,7 +371,7 @@ How a spec sentence turns into a defect: rows with two inputs, codes with no cen
   closed while `not_implemented` survived in all three trees. They then censused **by slot**
   — every code emitted at status 501 — across six trees and routed us four spellings.
   **Censusing instead by the row's INPUT** (*a handler is registered at this path and does not
-  implement the named operation*) **found four more at this seat, every one outside status
+  implement the named operation*) **found four more in this implementation, every one outside status
   501**: two at `404 unknown_operation`, one at `400` with **no `code` field at all**, and one
   at `400 invalid_request`.
   **The last is the shape to remember, because it is invisible twice over.**
@@ -619,12 +619,12 @@ How a spec sentence turns into a defect: rows with two inputs, codes with no cen
   is blind to.**
   **And the shape of the gap is language-shaped, which is why the cohort could not see it.** In go
   and rust *"does not decode"* is a language event — a typed decode — so the predicate is defined
-  by their type system and never written down. Python has no such event, so this seat had to write
+  by their type system and never written down. Python has no such event, so this implementation had to write
   the predicate as a function and found there was **nothing in the corpus to write it from**
   (filed, SA-PY-41). **When a spec row names a failure your siblings get for free from their type
   system, you are the only seat that has to state it — and the statement is a spec question, not
   an implementation detail.** The guard is deliberately the **intersection** of what go and rust
-  refuse, so adopting it cannot make this seat the outlier on any shape; the two rows where the
+  refuse, so adopting it cannot make this implementation the outlier on any shape; the two rows where the
   siblings disagree with *each other* are pinned at today's answer with the filing named in the
   assertion message rather than settled.
   Enforcement points: `tests/integration/test_tree_put_error_rows_appendix_a.py` (three mutations,

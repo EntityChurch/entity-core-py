@@ -19,7 +19,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   axis of the hearsay law, and the second time a premise saying **you already comply** shipped
   a live defect here (the first was §8.3's `_EVAL_LIMIT_CODES`). The new part is that the
   premise was **true**, about the component it named.* `CQ-22` ruled the signature message is
-  the target's **full `content_hash`**, and arch's packet exculpates this seat: *"Your peer is
+  the target's **full `content_hash`**, and arch's packet exculpates this implementation: *"Your peer is
   already right… **the sole implementation of the losing reading is the conformance
   fixture.**"* Measured: py has **two** homes for that rule and they disagreed.
   `auth.create_signature_entity` signs `target_hash` — §7.3, correct, which is why 8 of 8 live
@@ -83,7 +83,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   report's claims about our repo are hearsay" law, and the first where the claim is that we
   are **already conformant**. The tenth axis (a citation scoped by a surface they have) and
   the sixth (a wrong remedy) both fail when you look; this one is TRUE, about one of three
-  members, and terminates in no work.* `ROUTING-2026-09-15-b` closed the §4.11 framing split
+  members, and terminates in no work.* the packet that closed the §4.11 framing split
   with *"go was the bare-close seat (not rust, which silent-drops, and **not py, which
   already emits a coded frame**)."* Measured here before any edit, across §4.11's five
   causes: **un-parseable-but-whole CBOR** did emit a coded frame (SA-PY-61, ruled in our
@@ -118,7 +118,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   2026-09-14*** *— eleventh axis of the "a routed report's claims about our repo are hearsay"
   law, and the first where the claim is an **absence of work**. Four of 0.8.2.24's six deltas
   showed `—` for py and **three of them were owed here.*** Arch's §5 table reads
-  `N1 — · N2 — · N3 — · N4 —` for this seat. Measured before touching anything: **N1** was live
+  `N1 — · N2 — · N3 — · N4 —` for this implementation. Measured before touching anything: **N1** was live
   at four grant loops (we shipped clause 2 as SA-PY-60 three commits earlier, which is *why* the
   withdrawal costs us and nobody else); **N2** was live at four call sites; **N4** was a bare
   socket close at the serve loop, byte-identical to the go behaviour the packet contrasts py
@@ -253,7 +253,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   are hearsay", and the first where the wrong claim was about our **version** rather than our
   architecture or our coverage.*
   **Fourth instance, 2026-09-09, and the assumed baseline was in a section written TO US, by ARCH,
-  that says it is scoped by a diff.** `ROUTING-2026-09-09-i` is addressed to `entity-core-go` and
+  that says it is scoped by a diff.** that round's relay is addressed to `entity-core-go` and
   carries *"For `entity-core-rust` and `entity-core-py` — relay this section"*, opening with
   **"Scoped by the diff, not by what you shipped."** That sentence reads as a guarantee of
   completeness and is one — **for go**, whose baseline was 0.8.2.14. This repo was on **0.8.2.11**,
@@ -276,7 +276,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   catch-up pass, and `0.8.2.13`'s withdrawal is recorded at the site it was removed from
   (`entity_handlers/handlers.py`) as an argument against re-adding it — a withdrawn rule leaves no
   failing test behind, so the comment is the only thing that stops it coming back.
- `ROUTING-2026-08-21-a` routes COMPUTE **v3.26** with the sentence
+ The packet routing COMPUTE **v3.26** carried the sentence
   *"rust and py are not yet on v3.26."* True and useless: **this repo was on v3.23.** v3.24 and
   v3.25 were never routed here at all, so §3.5's three contained positions — `assoc`'s `value`,
   `concat`'s elements, `group-by`'s `members` — **did not exist to carve out.** The ruling's entire
@@ -360,7 +360,7 @@ Every entry here is one law: **a routed report's claims about *our* repo are hea
   the *order*, not the behaviour.
 
 - **A sibling's summary of your board is a claim about your filings — check it the same way
-  you check a claim about your code.** *Candidate, 2026-08-19.* `ROUTING-2026-08-19-c` §3
+  you check a claim about your code.** *Candidate, 2026-08-19.* Arch's ruling §3
   reads *"Cohort board: closed. Every routed registry item is ruled."* **SA-PY-15 is a routed
   registry item and is unaddressed** — the resolver-side ceiling is still `[MUST when present]`
   with no declared site, and arch's tree carries **zero** occurrences of the identifier while

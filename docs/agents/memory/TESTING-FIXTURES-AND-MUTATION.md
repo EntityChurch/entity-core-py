@@ -13,7 +13,7 @@ The mutation discipline and its failure modes, fixtures that cannot discriminate
 - **A vector whose expected value is unfilled RUNS your code and measures nothing — and it is
   green, every time, for the life of the corpus.** *Candidate, 2026-09-16.* Arch's `.26` note
   is *"nobody had ever EXECUTED a Class-B category… reading a normative artifact and running it
-  are different acts, and only one of them is a measurement."* This seat is the sharper case:
+  are different acts, and only one of them is a measurement."* This implementation is the sharper case:
   py **executes** all three Class-B signature constructions on every suite run, via
   `emit_canonical`, and `test_emit_canonical_no_errors` asserts `errors == {}` and the result
   counts. The corpus it loads is the **pre-cross-bless STARTER** copy in which every
@@ -57,7 +57,7 @@ The mutation discipline and its failure modes, fixtures that cannot discriminate
   two, and the first instance where the false claim had already been routed to two sibling
   seats as our data point.* `test_resolution_integrity_k1.py`'s module docstring read: *"go
   refuses by a receive-boundary connection close with no status … **py answers a coded 401 on
-  one arm and a coded 400 on the other**, so this seat's data point is: the coded response is
+  one arm and a coded 400 on the other**, so this implementation's data point is: the coded response is
   reachable."* The 401 arm is true. **The 400 arm was false.** Its row asserts
   `pytest.raises(HashValidationError)` against `recv_envelope` called **directly**, and the
   bridging sentence — *"which the wire boundary renders as that pair"* — is prose nothing drove.
@@ -85,7 +85,7 @@ The mutation discipline and its failure modes, fixtures that cannot discriminate
   with the diff that prompted the run.* `validate-complete.sh python` scored
   `published_root.v5_outbound_dial` **FAIL** — `fetch signature entity: … 404`. The prior number
   was `1644 · 0 F @ b8ee9e5` and the check has not changed in go since their initial release, so
-  the row moved at this seat. **It was not the session's diff:** `published_root.py` was untouched
+  the row moved at this implementation. **It was not the session's diff:** `published_root.py` was untouched
   and `serving.py`'s only change sat inside `CapTokenScope`, which the `--publish-root` path never
   constructs.
   **The verify cycle is TWO fetches** — `MANIFEST_GET` hands a consumer the head, then it fetches

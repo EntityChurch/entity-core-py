@@ -22,7 +22,7 @@ What we send is somebody else's premise. These entries are the ways an outbound 
   order of two adjacent checks, with no line anywhere stating a position.
   **The shape:** an SA's *"what we do in the meantime"* paragraph is written from the code you
   just wrote, at the moment you are most certain of it, and it is the paragraph arch quotes back
-  as this seat's data point. Same family as the `test_resolution_integrity_k1` docstring that
+  as this implementation's data point. Same family as the `test_resolution_integrity_k1` docstring that
   routed a false claim to two seats — with a **filing** rather than a docstring as the carrier,
   and the routing not yet sent.
   **The check:** every sentence in a filing whose subject is *py* is a row you owe before the
@@ -68,7 +68,7 @@ What we send is somebody else's premise. These entries are the ways an outbound 
   their release schedule, but the cost is a skip-on-absence check — the very thing the entry above
   says has never told you it passes. So the obligation moves from the suite to the calendar: **run it
   on every cohort catch-up against core-go and before replying to any routed compute item**, and
-  record the result with the go commit attached (`docs/status/ROUTING-2026-08-21-…`), never as a green
+  record the result with the go commit attached, and route it, never as a green
   suite. The py-side half of each row *is* armed in the fast suite
   (`test_compute_v324_collection_primitives.py::TestV325FlowThrough`), so a regression on **our** side
   of the disagreement fails immediately; only the claim about theirs is on the calendar.
@@ -329,7 +329,7 @@ What we send is somebody else's premise. These entries are the ways an outbound 
   the spec ratifies what implementations already do — the evidence has to come from the seats
   that would be ratified, and *"14 sites"* is a count of one seat however large it gets.
   **And say which branch the recommendation actually is.** Blessing `storage_error` is a
-  **convergence instruction to this seat**, not the ratification of a shared practice. That is a
+  **convergence instruction to this implementation**, not the ratification of a shared practice. That is a
   perfectly good outcome; it is just the opposite of what the word *bless* implies, and the
   routing packet is where the difference has to be visible.
   Enforcement point: `tests/integration/test_undeclared_500_code_census.py` — a ledger of every

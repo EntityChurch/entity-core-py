@@ -22,7 +22,7 @@ two more layers on top of that boundary.
 ## 1. What browser-rust said about us, verified here
 
 `AGENTS.md` holds that a routed report's claims about *our* repo are hearsay until checked here.
-Checked. **All four of browser-rust's claims (`ROUTING-2026-08-17-b` §3) hold**, including the
+Checked. **All four of browser-rust's claims (§3 of their review) hold**, including the
 two that were in our favour:
 
 | Their claim | Verdict | Evidence at `1d951f6` |
@@ -224,7 +224,7 @@ Sequenced so each step is independently verifiable and each one unblocks the nex
    `system/peer/published-root.prefix`; never inferred.** Retrofitting this costs the most, so
    it is a constraint on the first line of L4, not a review comment on the last.
 7. **`entity-app` L5** — `APP-CONVENTION-EMBED`, then `-SEMANTIC-CONTENT-SITE`, then share
-   (`app/share/*`, record shape per browser-rust `ROUTING-2026-08-17-b` §2.2; the
+   (`app/share/*`, record shape per browser-rust's review §2.2; the
    `peers`-vs-`grantee` trap in their §2.1). **File spec asks as we go** — the ambiguities a
    clean-room reader hits are the entire deliverable of being the second SDK implementation, and
    they are worth more logged than worked around.

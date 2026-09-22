@@ -46,7 +46,7 @@ document version and it is *not* our release version — this line read `entity-
 ## Versioning — ours, and it is NOT the protocol version
 
 **This repo's release version is its own. The protocol version is a different number and
-they are expected to disagree.** `entity-core` 0.9.0 implements Entity Core Protocol
+they are expected to disagree.** `entity-core` 0.10.0 implements Entity Core Protocol
 0.8.2. Full reasoning: the *"What the version numbers here mean"* section at the top of
 `CHANGELOG.md` — that section is the canonical statement and this is the pointer to it.
 

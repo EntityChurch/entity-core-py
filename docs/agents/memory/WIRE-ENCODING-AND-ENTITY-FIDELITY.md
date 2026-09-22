@@ -72,7 +72,7 @@ ECF/CBOR determinism, §1.8 byte fidelity, the hash preimage, tag policy, and th
   SA-PY-11, because picking a sibling's implementation as the spec is what we are otherwise
   not allowed to do. Enforcement point: `tests/unit/test_revision_exclude_glob.py`, which
   keeps `fnmatch` as an explicit **control row** so the wrong tool fails loudly later.
-  ***RULED 2026-08-18*** *(arch `ROUTING-2026-08-18-i` §1) — and the interim fix we shipped
+  ***RULED 2026-08-18*** *(arch's ruling §1) — and the interim fix we shipped
   was wrong in three separate ways, which is the part that generalizes.*
   §2.4 is now **four closed forms** — `*` · `<literal>/*` (§5.4 subtree, crosses `/`) ·
   `*<literal>` (byte suffix) · `<literal>` exact — plus §4.4.17 **V6**, which *rejects*

@@ -13,7 +13,7 @@ out-of-band, per [ADR-0002], which chose 3-field SemVer per implementation preci
 because a single string cannot carry both *which spec level an implementation targets*
 and *the implementation's own release* without conflating two different things.
 
-So: `entity-core` **0.9.0** implements Entity Core Protocol **0.8.2**. Those are two
+So: `entity-core` **0.10.0** implements Entity Core Protocol **0.8.2**. Those are two
 numbers about two subjects, and they are expected to disagree. They will drift further —
 a Python-side refactor bumps the left number and not the right one; a spec revision we
 already satisfy bumps the right and not the left.
@@ -37,41 +37,88 @@ for added surface or a breaking change, and the patch for fixes.
 
 ## [Unreleased]
 
-Development lands on `dev`; `master` carries the last release.
+Nothing yet. Development lands on `dev`; `master` carries the last release.
+
+## [0.10.0] — 2026-09-20
 
 _Protocol: Entity Core Protocol 0.8.2 (wire identifier `entity-core/1.0`, V7 §8.4)._
 
-### Fixed
+A minor bump, and it **is breaking**: this release changes which peers can complete a
+handshake with this one, and which requests an existing capability authorizes. Nothing was
+removed, renamed or re-signatured in the Python API of the four packages, and the CLI's verbs
+and flags are unchanged — the breakage is entirely on the wire and in authorization.
 
-- **The advertised protocol version is `entity-core/1.0`, per V7 §8.4.** This peer had
-  advertised `entity-core/7.0` since the Genesis release — the specification's *title*
-  version rather than the wire identifier §8.4 pins. It went unnoticed because §4.5's
-  `protocols` rule (*"Intersection, must be non-empty"*) had no implementer in any
-  implementation: every peer carried the field on every hello and none read it, so the
-  value had never been compared. It is now a single constant with a test pinning it to
-  §8.4 and a gate against a second literal.
+*Breaking* is measured here against what a peer on the other end of a socket observes (the
+advertised protocol identifier, the handshake sequence, and the `(status, code)` pairs a
+refusal carries), what a minted capability grants, and the public Python API of `entity-core`,
+`entity-handlers`, `entity-sdk` and `entity-cli`. Internal module layout, docstrings and
+console rendering are outside it.
+
+### Changed in ways that can break an existing caller
+
+- **The advertised protocol version is `entity-core/1.0`, per V7 §8.4 — and the `protocols`
+  intersection is now enforced (§4.5 / §4.7 row 1). Together these change who can connect.**
+  This peer had advertised `entity-core/7.0` since the Genesis release: the specification's
+  *title* version rather than the wire identifier §8.4 pins. It survived because §4.5's
+  *"Intersection, must be non-empty"* had no implementer in any implementation — every peer
+  carried the field on every hello and none read it, so a dead field could not diverge
+  observably. A hello whose non-empty `protocols` set is disjoint from ours is now refused
+  `400 incompatible_protocol` rather than completing a handshake with a peer that speaks no
+  version we support. **A 0.9.0 peer of ours, which advertises `entity-core/7.0`, is
+  therefore refused by a 0.10.0 peer of ours.** An omitted or empty list stays unconstrained
+  (SA-PY-31). The identifier is a single constant, with a test pinning it to §8.4 and a gate
+  against a second literal.
   *Earlier entries in this file describe the protocol as `entity-core/7.0`; they are left
   as written, because they record what was shipped.*
-- **The `protocols` intersection is checked (V7 §4.5 / §4.7 row 1).** A hello whose
-  non-empty `protocols` set is disjoint from ours is refused with
-  `400 incompatible_protocol` instead of completing a handshake with a peer that speaks no
-  version we support. An omitted or empty list stays unconstrained (SA-PY-31).
-- **An unallocated `key_type` is refused at hello**, which §4.5 names as the canonical
-  earliest reject point. The peer previously refused only at `authenticate`; the
-  `AGILITY-UNKNOWN-1` vector accepted that, being satisfied *"at any handshake surface"*.
-- **V7 §4.7 row 10 is split into its two failures (arch FM-2 Edit D).** A second `hello`
-  mid-handshake is a state conflict — `409 connection_sequence_error`, consistent with row 9's
-  `connection_already_established`. An unknown connect operation is `400 invalid_request`:
-  nothing is out of *order* when the operation name exists in no state, and
-  `connection_sequence_error` told a client its ordering was wrong when its name was wrong.
-- **Row 10's split is applied to the operation this peer implements, and in both states.**
-  0.8.2.4 decides the row on one predicate — *does the responder implement this operation* —
-  and the two wire boundaries answered it differently. A pre-handshake `ping` (§5.1 keepalive,
-  which this peer serves) was refused `400 invalid_request`, the row for an operation we do not
-  implement; it is now `409 connection_sequence_error`. An unknown operation on an **established**
-  connection was refused `409 connection_already_established` — the connection's state blamed for
-  a defect in the frame's name; row 10 says *"in any state"*, so it is now `400 invalid_request`
-  there too. Both boundaries classify from one set.
+- **Requests an existing grant did not actually authorize are now refused.** Five enforcement
+  points that the `resources` dimension was supposed to bind, and did not — a caller upgrading
+  should re-read what its capabilities say before assuming the same calls still succeed:
+  - Eight of `EXTENSION-REVISION`'s nineteen handler operations — `log`, `status`, `diff`,
+    `fetch`, `fetch-entities`, `branch`, `tag`, `push` — called no permission check at all,
+    and took their prefix from the caller's own params rather than from `resource.targets[0]`.
+    Four of them write.
+  - §6.3's per-entry listing filter was absent on all three bulk readers, so a grant's
+    `resources.exclude` carved nothing out of a listing, an `extract` or a `snapshot`. With
+    `limit` set, pagination ran over the *unfiltered* set, which is worse than a no-op.
+  - `check_resource_scope` and `check_path_permission` each had a concrete arm and no pattern
+    arm, so re-spelling a target as a pattern stepped past an exclude — including, through
+    `EXTENSION-SUBSCRIPTION` §2.3, subscribing with `include_payload` to a path the grant
+    excludes, which pushes the body on every write for the life of the subscription.
+  - An unmatchable `exclude` carved out nothing instead of everything. It now excludes
+    everything at evaluation, and a capability carrying one is invalid at mint, at delegate
+    and at chain verification (`400 invalid_path`).
+  - `resource.targets` narrowed to the empty set is no longer indistinguishable from an
+    absent `resource` (§3.3). A continuation whose stored resource was self-excluded used to
+    advance as though it had named none — at `tree:snapshot`, the whole tree — and a
+    cross-peer dispatch dropped the field where the in-process one refused. The same request
+    now gets the same answer through either door.
+- **An id-scope dimension is no longer canonicalized as a path, which widens some grants.**
+  `operations: {include: ["*"], exclude: ["*/apply"]}` authorized *no* operation at all: the
+  §5.4 path sentinel was applied to `operations`, `peers` and `type_scope`, denying the whole
+  dimension on a property unrelated to what it excludes. Those grants now authorize what they
+  say. Also withdrawn: the refusal of a contradicting `scope.type`, which obliged reading the
+  field whose absence is the safety property.
+- **An unallocated `key_type` is refused at `hello`**, which §4.5 names as the canonical
+  earliest reject point. The peer previously refused only at `authenticate`, so a caller that
+  read the refusal off the second step now sees it on the first.
+- **V7 §4.7 row 10 is split into its two failures, in both connection states.** A second
+  `hello` mid-handshake is a state conflict — `409 connection_sequence_error`, consistent
+  with row 9's `connection_already_established`. An
+  unknown connect operation is `400 invalid_request`: nothing is out of *order* when the
+  operation name exists in no state. Applied to the operations this peer actually implements:
+  a pre-handshake `ping` (§5.1 keepalive, which this peer serves) was `400 invalid_request`
+  and is now `409 connection_sequence_error`; an unknown operation on an **established**
+  connection was `409 connection_already_established` and is now `400 invalid_request`. Both
+  boundaries classify from one set.
+- **Pre-admission framing refusals carry the cause's own code (§4.11).** An oversize frame is
+  `413 payload_too_large` where one `else` had given every framing error `400 invalid_request`
+  — `payload_too_large` had zero occurrences in the tree. A truncated frame now gets a coded
+  refusal instead of a bare close logged as a clean hangup. A payload that decodes to
+  something other than a map is refused rather than raising out of the framing layer. Whether
+  the stream survives the refusal is now a property of the cause rather than a blanket close.
+
+### Fixed
+
 - **A handshake refusal at the `hello` step now carries the remote's `(status, code)`.**
   Both the TCP and HTTP dialers read `peer_id`/`nonce` straight out of the hello response
   and reported *"Missing peer_id or nonce"* for what was actually a coded refusal, dropping
