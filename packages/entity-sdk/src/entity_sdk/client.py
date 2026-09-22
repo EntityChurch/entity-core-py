@@ -35,6 +35,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from entity_core.protocol.entity import Entity
 from entity_core.sdk import Dispatcher, ExecuteRequest
 
 from entity_sdk.errors import raise_for_status
@@ -371,7 +372,29 @@ class EntityClient:
         expected_hash: bytes | None,
     ) -> bytes:
         target = self.resolve(path)
-        payload: dict[str, Any] = {"entity": {"type": type, "data": data}}
+        # §3.2's signature IS the construction step: `put(path, type, data) →
+        # hash` takes an unhashed payload and returns a content hash, and the
+        # SDK cannot return a hash it did not compute. So the entity is
+        # constructed *here*, before anything reaches the wire (0.8.2.11 §6.3;
+        # SDK-OPERATIONS §3.2, normative since the same fold).
+        #
+        # This used to send `{"type": type, "data": data}` — two keys — and the
+        # peer authored the third back. That is a compensating pair inside one
+        # tree: our own round-trip was perfect and our whole suite was blind to
+        # it, because the lenient peer and the stripping SDK were both ours.
+        # It breaks only across a seat boundary, which is where it surfaced:
+        # this client could not `put` to a go peer at all.
+        #
+        # The hash is authored under the process-global format, which is what
+        # the peer's late authoring arm used, so no hash on any existing path
+        # moves. §4.5a's connection-bound authoring would use the connection's
+        # negotiated `active_hash_format` instead — not read here because the
+        # `Dispatcher` Protocol is `execute` and nothing else, and widening it
+        # is a tier-boundary change for a case the receipt path already covers:
+        # validation reads the claimed hash's own leading format byte, so a
+        # default-format hash verifies on a connection negotiated to anything
+        # the peer supports.
+        payload: dict[str, Any] = {"entity": Entity(type=type, data=data).to_dict()}
         if cas:
             payload["expected_hash"] = expected_hash
         result = await self._tree(

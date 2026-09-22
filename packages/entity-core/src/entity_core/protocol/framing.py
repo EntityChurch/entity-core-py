@@ -16,6 +16,7 @@ from typing import Any
 from entity_core.protocol.envelope import Envelope
 from entity_core.utils.ecf import (
     Hash,
+    UnsupportedContentHashFormatError,
     compute_ecf_hash,
     ecf_decode,
     ecf_encode,
@@ -63,6 +64,152 @@ def _format_value_for_debug(value: Any, max_bytes: int = 64) -> str:
         return repr(value)
 
 
+def validate_entity_structure(value: Any) -> str | None:
+    """Return why ``value`` does not decode as an entity, or ``None``.
+
+    The *structural* half of receipt validation, and the half that MUST run
+    **before** :func:`validate_entity_hash` — EXTENSION-TREE Appendix A (v4.4)
+    splits a bad submission into two 400 rows and the split is only
+    expressible if structure is decided first:
+
+    * *does not decode* → ``invalid_request`` (§3.3's generic 400 default);
+    * *decodes, but the claimed hash is not its hash* → ``hash_mismatch``.
+
+    A malformed entity that also carries a hash satisfies both descriptions,
+    so an implementation that validates the hash first answers
+    ``hash_mismatch`` for a submission whose real defect is its shape.
+    Both siblings order it structure-first for exactly this reason
+    (`entity-core-go` ``core/tree/handler.go`` decode-then-``Validate``,
+    `entity-core-rust` ``core/tree/src/lib.rs`` ``decode_entity_from_cbor``
+    then ``entity.validate``).
+
+    Python is the seat that needs this stated as a function. Go and Rust
+    decode into a typed ``Entity``, so *"does not decode"* is a language
+    event they get for free; ``cbor2`` hands back a native mapping, so every
+    shape below reaches the handler intact and fails later — as a
+    ``TypeError``/``KeyError`` on the far side of the hash check, i.e. as a
+    client-triggerable ``500``.
+
+    **Ruled at 0.8.2.11 / EXTENSION-TREE v4.5, and the predicate we routed as
+    SA-PY-41 was the answer.** The corpus did not need a new sentence: §3.9
+    types ``put-request.entity`` as ``core/entity``, and
+    ``ENTITY-NATIVE-TYPE-SYSTEM`` §8.1 declares that type with three fields and
+    no ``optional`` marker on any of them — so *"does not decode"* means *"is
+    not a `core/entity`"*. Six homes carried the strong form; §2.8 — the only
+    table in the corpus describing what is **on the wire** at a ``core/entity``
+    slot, i.e. exactly this surface — carried ``content_hash?`` and was
+    corrected in the same fold.
+
+    ==============================  ======  ======  ==============================
+    Shape                            go      rust    Refused here
+    ==============================  ======  ======  ==============================
+    not a map                        yes     yes     yes
+    ``type`` absent                  yes     yes     yes
+    ``type`` not a text string       yes     yes     yes
+    ``data`` absent                  yes     yes     yes
+    ``type`` empty string            yes     no      **yes** — ruled 0.8.2.11 §6.3
+    ``data`` null / non-map          no      no      no
+    ==============================  ======  ======  ==============================
+
+    The empty-``type`` row was routed as SA-PY-41 row 7 rather than settled
+    locally, and the ruling went go's way: §6.3 step 1 says **non-empty**
+    text-string ``type``, derived from §2.7 (*"the name is the interop
+    contract"*) plus 0.8.2.4's precedent that a present-but-empty ``protocols``
+    is *"a malformed request"*. An empty interop contract is not a contract.
+
+    ``data: null`` stays **accepted** — §6.3 step 1 says *any CBOR value*, and
+    names null as a legal payload outright, because ``primitive/any`` is
+    unconstrained. This function refuses a *missing* ``data``, never an empty
+    one, and a seat that "tightens" it to falsiness partitions the cohort in
+    the direction nothing measures.
+
+    **``content_hash`` is not checked here** — see
+    :func:`validate_carried_content_hash`. The two clauses are §6.3 step 1's
+    two halves and both emit ``invalid_request`` at ``put``, but they are
+    separate functions because the *shape* half also guards
+    ``system/tree:merge``'s ``source_envelope`` members, which are ingested by
+    a path the admission ladder does not govern. Folding the hash clause in
+    here would have extended a ruled ``put`` rule to an unruled surface by
+    accident of code reuse.
+
+    Args:
+        value: The candidate entity, as decoded off the wire.
+
+    Returns:
+        A human-readable reason, or ``None`` when the shape decodes.
+    """
+    if not isinstance(value, dict):
+        return f"entity must be a map, got {type(value).__name__}"
+    if "type" not in value:
+        return "entity is missing 'type'"
+    if not isinstance(value["type"], str):
+        return (
+            "entity 'type' must be a text string, got "
+            f"{type(value['type']).__name__}"
+        )
+    if value["type"] == "":
+        return "entity 'type' is empty"
+    if "data" not in value:
+        return "entity is missing 'data'"
+    return None
+
+
+def validate_carried_content_hash(entity: dict[str, Any]) -> tuple[str, str] | None:
+    """§6.3 step 1's ``content_hash`` clause. Returns ``(code, reason)`` or ``None``.
+
+    ``put`` is a **receipt** path (0.8.2.11 §6.3, §1.8 item 1): the submitter
+    authors the entity, the peer validates what it received, and a peer
+    **MUST NOT** author a submitted entity's ``content_hash`` on the
+    submitter's behalf. The authoring step exists and belongs to the SDK —
+    ``SDK-OPERATIONS`` §3.2's ``put(path, type, data) → hash`` cannot return a
+    hash it did not compute.
+
+    Two codes come out of this one clause, and the split is
+    ``ENTITY-CORE-PROTOCOL`` §4.7 row 5 restated on EXTENSION-TREE Appendix A
+    v4.5:
+
+    * **absent, null, not a bstr, or mis-sized for its format code** — the
+      value never was a ``system/hash``, so the entity is not a
+      ``core/entity``: ``400 invalid_request`` (row 1).
+    * **well-formed but naming a format code this peer does not support** —
+      the value *is* a structurally valid hash and the peer simply cannot
+      verify it: ``400 unsupported_content_hash_format`` (row 4). Not row 1,
+      and the distinction is caller-actionable: row 1 says *fix your request*,
+      row 4 says *this peer cannot speak your format*.
+
+    The order below is :func:`entity_core.utils.ecf.validate_hash`'s own —
+    format code first, then digest length — which is the only order that has an
+    answer, since the expected length is a function of the format code.
+
+    Args:
+        entity: A value that has already passed :func:`validate_entity_structure`.
+
+    Returns:
+        ``(code, reason)`` for a refusal, or ``None`` when the carried hash is
+        well-formed and verifiable here.
+    """
+    if entity.get("content_hash") is None:
+        return (
+            "invalid_request",
+            "entity is missing 'content_hash' — `put` is a receipt path and "
+            "the peer does not author one (0.8.2.11 §6.3; the SDK's "
+            "construction step is SDK-OPERATIONS §3.2)",
+        )
+    claimed = entity["content_hash"]
+    if not isinstance(claimed, bytes):
+        return (
+            "invalid_request",
+            f"entity 'content_hash' must be a byte string, got {type(claimed).__name__}",
+        )
+    try:
+        validate_hash(claimed)
+    except UnsupportedContentHashFormatError as exc:
+        return ("unsupported_content_hash_format", str(exc))
+    except ValueError as exc:
+        return ("invalid_request", f"entity 'content_hash' is not a hash: {exc}")
+    return None
+
+
 def validate_entity_hash(entity: dict[str, Any]) -> Hash:
     """Validate that an entity's content_hash matches its content.
 
@@ -77,17 +224,28 @@ def validate_entity_hash(entity: dict[str, Any]) -> Hash:
     Returns:
         The validated hash (bytes).
 
+    This is **step 2** of ``put``'s admission ladder (0.8.2.11 §6.3) and it
+    presupposes step 1: a caller that has an ``invalid_request`` row to answer
+    runs :func:`validate_entity_structure` and
+    :func:`validate_carried_content_hash` first, and only then arrives here
+    with a value it knows is an entity carrying a parseable hash. The
+    absent/unparseable arms below stay as a guard for the receipt sites that
+    have no such ladder (``http_server``, ``http_client``), where a bad hash is
+    a rejection and not a distinct wire row.
+
     Raises:
-        HashValidationError: If content_hash doesn't match or is missing.
+        HashValidationError: If content_hash doesn't match, is missing, or does
+            not parse as a hash.
     """
     content_hash = entity.get("content_hash")
     if not content_hash:
         raise HashValidationError("Entity missing content_hash")
 
-    # Parse claimed hash from wire format
     try:
         if not isinstance(content_hash, bytes):
-            raise HashValidationError(f"Invalid content_hash type: {type(content_hash)}")
+            raise HashValidationError(
+                f"Invalid content_hash type: {type(content_hash)}"
+            )
         validate_hash(content_hash)
         claimed = content_hash
     except ValueError as e:

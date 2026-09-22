@@ -9,6 +9,7 @@ from entity_core.crypto.identity import Keypair
 from entity_core.handlers.connect import PROTOCOL_VERSION
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.peer.connection import Connection
+from entity_core.protocol.entity import Entity
 
 
 @pytest.fixture
@@ -78,10 +79,9 @@ async def test_execute_storage_write_read(server_peer: Peer):
             uri=f"entity://{server_peer.peer_id}/data/test",
             operation="write",
             params={
-                "entity": {
-                    "type": "test-data",
-                    "data": {"message": "Hello from Python!"},
-                }
+                "entity": Entity(
+                    type="test-data", data={"message": "Hello from Python!"}
+                ).to_dict()
             },
             authenticated=True,
         )

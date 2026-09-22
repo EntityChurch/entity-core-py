@@ -9,6 +9,7 @@ import pytest
 from entity_core.crypto.identity import Keypair
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.peer.connection import Connection
+from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.messages import Execute, ExecuteResponse
 
@@ -131,7 +132,10 @@ async def test_storage_write_read(server_peer: Peer):
         write_response = await conn.execute(
             uri=f"entity://{server_peer.peer_id}/data/auth-test",
             operation="write",
-            params={"entity": {"type": "test", "data": {"value": 42}}},
+            # All three `core/entity` keys — `system/storage:write` delegates
+            # to `system/tree:put`, which is a receipt path and authors nothing
+            # (0.8.2.11 §6.3). The submitter constructs; here that is this test.
+            params={"entity": Entity(type="test", data={"value": 42}).to_dict()},
             authenticated=True,
         )
 

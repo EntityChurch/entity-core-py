@@ -1741,6 +1741,60 @@ fails the gates rather than slipping past them.
   until now), a control asserting we *serve* `ping` (the 409 is only conformant for a peer that
   does — go's probe carries that caveat in prose and nothing asserted it), and the structural row
   pinning both boundaries to one set. Four mutations, four correct predictions.
+  **Fourth instance, 2026-09-06, and the unit shrinks again: the sibling reported ONE row, and a
+  row is a PREDICATE while a probe is one member of it.** `entity-core-go` drove
+  `EXTENSION-TREE` Appendix A's three `put` rows and reported py `3/4` — row 1 (*"the submitted
+  entity does not decode"*) answered `500 internal_error`. Correct, reproducible, and their vector
+  is `entity = 42`. Walking the **predicate** instead found **five** shapes reaching
+  `Entity.from_dict`/`validate_entity_hash` intact, each answering a non-conformant pair.
+  **The instructive one answered `200`.** A `type` of `42` is not a decode *failure* in Python at
+  all — `cbor2` returns a native mapping, `compute_ecf_hash` encodes the integer, and the entity is
+  **stored and bound under a type no typed peer can decode**. So the class had a member that was a
+  success, and *nothing keyed on a status can reach it*: not go's relay (keyed on the 500), not our
+  §3.3 slot census (keyed on the status), not a grep for a code (there is no code). Only driving
+  the predicate's inputs finds it. **A defect class is bounded by its INPUTS; a success is a member
+  of the class exactly as often as a wrong code is, and it is the member every status-keyed method
+  is blind to.**
+  **And the shape of the gap is language-shaped, which is why the cohort could not see it.** In go
+  and rust *"does not decode"* is a language event — a typed decode — so the predicate is defined
+  by their type system and never written down. Python has no such event, so this seat had to write
+  the predicate as a function and found there was **nothing in the corpus to write it from**
+  (filed, SA-PY-41). **When a spec row names a failure your siblings get for free from their type
+  system, you are the only seat that has to state it — and the statement is a spec question, not
+  an implementation detail.** The guard is deliberately the **intersection** of what go and rust
+  refuse, so adopting it cannot make this seat the outlier on any shape; the two rows where the
+  siblings disagree with *each other* are pinned at today's answer with the filing named in the
+  assertion message rather than settled.
+  Enforcement points: `tests/integration/test_tree_put_error_rows_appendix_a.py` (three mutations,
+  three correct predictions) and `tests/interop/test_go_peer_tree_put_decode_predicate.py`, which
+  **drives** the go column of SA-PY-41's table rather than reading it — 6/6 against a live peer at
+  `69ec9e2`, including `EntityClient.put` itself raising a `400`, because *"our SDK cannot put to a
+  go peer"* is a claim about a sibling and this repo does not route those on a source read. Same
+  `ENTITY_GO_PEER=host:port` opt-in as the v324 probe, so the same **calendar** obligation applies:
+  run it on every cohort catch-up and before replying to any routed tree item, and record the
+  result with the go commit attached — never as a green suite.
+
+- **The ORDER between two rows of one table is a rule no row states, and no per-row vector can
+  reach it.** *Candidate, 2026-09-06 — found landing the row-1 fix above; reached independently by
+  `entity-core-go` in their cycle 4, which is what makes it a shape rather than our bug.*
+  `EXTENSION-TREE` Appendix A gives `put` two 400 rows: *does not decode* → `invalid_request`, and
+  *the claimed hash is not its hash* → `hash_mismatch`. **An entity that is malformed AND carries a
+  hash satisfies both descriptions**, so the table is individually satisfiable and jointly
+  ambiguous. py validated the hash first and answered `hash_mismatch` for a submission whose defect
+  was its shape — the caller told *"your hash is wrong"* when the fix is *"your entity is not an
+  entity"*. go recorded the same thing about their own tree (*"`Validate` checks structure before
+  hash — flipping wholesale to `hash_mismatch`, as the worklist prose read, would mis-code the
+  structural case"*).
+  **Why no vector catches it:** a vector is written per row, so it carries exactly the one fault its
+  row names. go's row-1 vector (`42`) has no `content_hash` to disagree with, so a hash-first peer
+  reaches the structural branch anyway and **passes**. The discriminating input is the one no
+  row-scoped author writes, because it belongs to two rows at once.
+  **The checks:** when a table gives one operation two rows over overlapping conditions, write the
+  input that satisfies both and decide the order **explicitly** — then pin the order **structurally**,
+  not behaviourally, because two correct-looking branches read fine in either sequence and a later
+  seat hoisting one for tidiness reintroduces the defect at every overlapping input. And route the
+  ordering: it is a missing sentence in the table, not a local choice
+  (`TestTheOrderIsTheRow::test_the_source_orders_the_structural_check_before_the_hash`).
 
 - **A DRAFT ruling is a thing to build, not a thing to wait on — the fold ratifies what the
   seats built.** ***RATIFIED 2026-09-04*** *— second instance, a different shape, a different
@@ -1933,6 +1987,67 @@ fails the gates rather than slipping past them.
   green recorded at the call site so a later reader restoring it "for safety" is told what it
   costs; the row that now discriminates is
   `test_an_unresolvable_type_is_404_type_not_found[adopt]`, re-verified RED.
+
+- **A filing posed as "which of these two readings" asserts that they are alternatives — check
+  whether they are at different LAYERS before you make arch choose.** *Candidate, 2026-09-06 —
+  SA-PY-41 ask 2, and the one ask of four that did not go either way we posed it.* We asked: is
+  `put` a **wire-receipt** path (§1.8: validate the carried hash, never recompute) or an
+  **authoring** path (§4.5a: the submitter chooses the format)? Both, and the corpus already said
+  where: the peer's `system/tree:put` is receipt, the SDK's `put(path, type, data) → hash` is
+  authoring, and they compose exactly — an SDK **cannot return a hash it did not compute**. The
+  §4.5a half of the dichotomy was never an authoring *arm* at all; it governs which format an
+  author uses and **presupposes** an author.
+  **Why an either/or framing is worse than a bad answer:** it narrows the ruling's search space to
+  the two branches you named, and both of ours were peer-side, so the whole SDK layer was outside
+  the question. Arch went and looked anyway. Had it not, the ruling would have picked one of two
+  wrong shapes and every seat would have implemented it.
+  **The two checks, both cheap.** (1) When you cite two sections as opposed, **name the subject of
+  each sentence** — ours were *a receiver* and *an author*, which is not a disagreement. (2) When
+  an ambiguity is about **who does X**, enumerate the layers that could, including the ones above
+  the wire: an SDK contract is normative here (`SDK-OPERATIONS`) and is the layer a peer-side
+  reading structurally cannot see. *A dichotomy is a claim, and it is the claim in a filing that
+  nobody checks, because the filing is framed as not knowing the answer.*
+
+- **Two defects that cancel inside one tree are invisible to that tree's entire suite — and the
+  pair you are most likely to own is a lenient RECEIVER plus a lax SENDER of the same field.**
+  ***RATIFIED 2026-09-06*** *— the two-representations law with a **protocol layer boundary** as
+  the thing represented twice, and the first instance where our own SDK and our own peer were the
+  two halves. Filed as SA-PY-41, ruled the next day at 0.8.2.11 §6.3.*
+  `EntityClient._put` sent `{"type", "data"}` — two of `core/entity`'s three required fields — and
+  `system/tree:put` fell through to `Entity.from_dict` and minted the third. Each defect is the
+  other's cover: the SDK's omission never surfaces because the peer supplies it, and the peer's
+  authoring never surfaces because nothing local omits the field on purpose. **4289 tests, ~90
+  driving `put`, and not one could fail** — a round-trip test asserts the value the caller gets
+  back, and that value was right the whole time.
+  **The tell is structural, not behavioural, and it is the reusable half.** A compensating pair
+  needs *one tree containing both roles* of a wire contract. This repo carries the SDK and the peer
+  in-tree (deliberately — see "Project structure"), so **every field on every request we both send
+  and serve is a candidate**, and the isolation the tier gates give us is about *imports*, not about
+  this. rust has the identical shape at the identical field and did not see it either; go, which
+  had only the receiver defect, was the seat that could not help finding it.
+  **The check, and there is only one that works:** for a field your own code both **emits** and
+  **admits**, the discriminating test is one where the other end is *not yours*. A same-tree test
+  cannot distinguish "we agree with the spec" from "we agree with ourselves" — the standing
+  `entity-core/7.0` shape (*our constant against our constant*), now with a **required field's
+  presence** as the constant. Enforcement points: `test_sdk_l1_operations.py::
+  TestTheSDKConstructsTheEntity`, whose rows read the **request** rather than the result and whose
+  last row drives the peer's refusal of the old shape so restoring either half alone fails; and
+  `tests/interop/test_go_peer_tree_put_decode_predicate.py::test_our_own_sdk_can_now_put_to_a_go_peer`,
+  which is the same assertion inverted at the boundary and is the only row in either repo that can
+  see the SDK half at all.
+  **Two corollaries earned landing it.**
+  1. **A ruling that names two layers has a landing ORDER inside your seat, and getting it wrong
+     breaks you rather than the cohort.** Sender-side construction first, receiver-side strictness
+     second — the reverse leaves your own SDK talking to your own now-strict peer. Arch stated it;
+     it is worth restating because *the receiver fix is the one that reads as "the conformance
+     work"* and is therefore the one a seat reaches for first.
+  2. **Fixing the receiver is not fixing the seat: census every SUBMITTER, including the ones no
+     SDK reaches.** Ours were compute's `store` builtin (in-process, dispatches to `system/tree:put`
+     with a hand-built dict) and `system/storage:write`'s wire callers. A grep for the *operation*
+     finds them; a grep for the SDK method does not.
+  *And the count is the fixture measurement, again: **10 of 4289** tests armed the newly-invalid
+  form and one asserted it as the contract, docstring and all. A rule landing on a field you have
+  never asserted turns your fixtures into the finding.*
 
 - **A cohort-consistency argument is only as good as the census behind it — and the generated
   family is the one a ground-up seat forgets it is in a cohort with.** ***RATIFIED 2026-09-04***

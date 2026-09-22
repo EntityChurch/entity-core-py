@@ -176,6 +176,119 @@ class TestCoreTreeOperations:
 
 
 # ---------------------------------------------------------------------------
+# §3.2 — the SDK is the authoring layer
+# ---------------------------------------------------------------------------
+
+
+class TestTheSDKConstructsTheEntity:
+    """`SDK-OPERATIONS` §3.2 (normative since 0.8.2.11) — the SDK computes the hash.
+
+    ``put(path, type, data) → hash`` takes an unhashed payload and returns a
+    content hash, **and the SDK cannot return a hash it did not compute**. The
+    wire operation it dispatches to is a *receipt* path: a peer MUST NOT author
+    a missing ``content_hash`` on the submitter's behalf.
+
+    This client used to send a two-key ``{type, data}`` and our peer authored
+    the third back — a compensating pair inside one tree. **Every round-trip
+    test above passed on both sides of the defect**, which is why the rows here
+    read the request rather than the result: what is wrong is not the value the
+    caller gets, it is what went on the wire to produce it. The break was only
+    ever observable across a seat boundary, and it surfaced the day this SDK
+    was driven against a live go peer.
+    """
+
+    class _CapturingDispatcher:
+        """Records the request and answers a plausible put-result."""
+
+        def __init__(self) -> None:
+            self.requests: list = []
+
+        async def execute(self, request):
+            from entity_core.handlers.context import ExecuteResult
+
+            self.requests.append(request)
+            return ExecuteResult(
+                status=200,
+                result={
+                    "type": "system/tree/put-result",
+                    "data": {"hash": b"\x00" + b"\x11" * 32},
+                },
+                error=None,
+            )
+
+        @property
+        def entity(self) -> dict:
+            return self.requests[-1].params["data"]["entity"]
+
+    async def test_put_sends_all_three_keys(self):
+        from entity_core.protocol.entity import Entity
+
+        d = self._CapturingDispatcher()
+        await EntityClient(d, "peer-a").put("docs/x", "app/note", {"v": 1})
+
+        assert set(d.entity) == {"type", "data", "content_hash"}, (
+            "core/entity has three required fields (ENTITY-NATIVE-TYPE-SYSTEM "
+            "§8.1); a two-key map is a request the peer is obliged to refuse "
+            "400 invalid_request"
+        )
+        assert d.entity["content_hash"] == Entity(
+            type="app/note", data={"v": 1}
+        ).compute_hash(), "and it must be the hash OF the entity being sent"
+
+    async def test_put_cas_sends_all_three_keys_too(self):
+        """The second construction site, and the one a single-path fix misses.
+
+        ``put`` and ``put_cas`` are separate methods on purpose (§3.2's
+        three-value ``expected_hash`` semantics), so a fix applied at one of
+        them leaves the other emitting the two-key form.
+        """
+        d = self._CapturingDispatcher()
+        await EntityClient(d, "peer-a").put_cas("docs/x", "app/note", {"v": 1}, None)
+
+        assert set(d.entity) == {"type", "data", "content_hash"}
+        assert d.requests[-1].params["data"]["expected_hash"] == ZERO_HASH
+
+    async def test_the_hash_the_sdk_returns_is_the_hash_it_authored(self, client):
+        """Driven through the real peer, which now verifies rather than authors.
+
+        The teeth for the two rows above: they assert what goes out, and this
+        asserts the peer agreed — under the old pair both would have passed
+        while the peer computed a hash of its own.
+        """
+        from entity_core.protocol.entity import Entity
+
+        returned = await client.put("docs/authored", "app/note", {"v": 7})
+        assert returned == Entity(type="app/note", data={"v": 7}).compute_hash()
+
+    async def test_a_two_key_entity_is_refused_by_our_own_peer(self, client, peer):
+        """The other half of the pair, asserted from the SDK's side of it.
+
+        If a later seat restores the peer's authoring arm, the SDK rows above
+        keep passing — the SDK would still be conformant and the compensating
+        pair would be back. This row fails in that case, and it is here rather
+        than only in the tree tests because *this* is the pairing that hid the
+        defect.
+        """
+        result = await peer._dispatch_local_execute(
+            f"entity://{peer.keypair.peer_id}/system/tree",
+            "put",
+            {
+                "type": "system/tree/put-request",
+                "data": {
+                    "path": "docs/twokey",
+                    "entity": {"type": "app/note", "data": {"v": 1}},
+                },
+            },
+            BLANKET,
+            None,
+            None,
+            ["docs/twokey"],
+        )
+        assert result.status == 400
+        assert (result.result or {}).get("data", {}).get("code") == "invalid_request"
+
+
+# ---------------------------------------------------------------------------
 # §3.3 list — the Entry projection
 # ---------------------------------------------------------------------------
 

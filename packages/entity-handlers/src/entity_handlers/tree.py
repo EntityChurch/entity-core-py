@@ -23,7 +23,12 @@ from typing import Any
 
 from entity_core.handlers.context import HandlerContext
 from entity_core.protocol.entity import Entity
-from entity_core.protocol.framing import HashValidationError, validate_entity_hash
+from entity_core.protocol.framing import (
+    HashValidationError,
+    validate_carried_content_hash,
+    validate_entity_hash,
+    validate_entity_structure,
+)
 from entity_core.storage.content_store import ContentStore
 from entity_core.storage.emit import EmitContext
 from entity_core.storage.entity_tree import EntityTree
@@ -385,18 +390,64 @@ async def _handle_put(
     # holder of the authored reference can resolve it (ENC-ROUNDTRIP-FORMAT-1,
     # V7 §1.8 / v7.69 §4.5a). Validation is format-aware — it reads the claimed
     # hash's own leading format byte, not our default.
-    if isinstance(entity_data, dict) and entity_data.get("content_hash") is not None:
-        try:
-            validate_entity_hash(entity_data)
-        except HashValidationError as exc:
-            return _error_response(
-                400, "hash_mismatch",
-                f"entity content_hash does not match its {{type, data}}: {exc}",
-            )
-        entity, _ = Entity.from_wire_dict(entity_data)
-    else:
-        # Locally-authored: no claimed hash to preserve, so author one.
-        entity = Entity.from_dict(entity_data)
+    #
+    # ENTITY-CORE-PROTOCOL 0.8.2.11 §6.3 — admission is TWO ORDERED STEPS, and
+    # the order is a data dependency rather than a convention: step 2's inputs
+    # are exactly what step 1 establishes, because you cannot compare a carried
+    # `content_hash` against `content_hash({type, data})` until you know there
+    # IS a content_hash, a type and a data. So a submission that is BOTH
+    # malformed and mis-hashed is step 1's and answers `invalid_request` — the
+    # caller reading "your hash is wrong" when the fix is "your entity is not
+    # an entity" is the failure this ordering prevents, and no vector carrying
+    # a single fault can discriminate it (each row's own input reaches its own
+    # branch either way).
+    #
+    # STEP 1a — shape.
+    structural_error = validate_entity_structure(entity_data)
+    if structural_error is not None:
+        return _error_response(
+            400, "invalid_request", f"entity does not decode: {structural_error}"
+        )
+
+    # STEP 1b — the carried hash is a well-formed `system/hash` this peer can
+    # verify. Two codes: `invalid_request` for a value that never was a hash,
+    # `unsupported_content_hash_format` for one that is a hash in a format we
+    # do not implement (Appendix A v4.5's fourth row, restated from §4.7 row 5).
+    #
+    # There is NO authoring arm. `put` is a receipt path: an absent
+    # `content_hash` is a required field's absence and refuses at row 1. This
+    # peer used to fall through to `Entity.from_dict` and mint one, which is
+    # supplying an authorship the protocol assigns to the submitter — and it
+    # was invisible here because our own SDK stripped the hash, so the two
+    # defects compensated inside one tree and the round-trip looked perfect.
+    hash_error = validate_carried_content_hash(entity_data)
+    if hash_error is not None:
+        return _error_response(400, hash_error[0], hash_error[1])
+
+    # STEP 2 — the carried hash is the entity's hash.
+    #
+    # §1.8 strict entity fidelity: a validated content_hash is trusted verbatim
+    # and never recomputed. `Entity.from_dict` would drop it and re-derive on
+    # demand under this peer's HOME format, which is invisible while author and
+    # receiver share a format (the recompute coincides) and silently rewrites
+    # the reference the moment they do not: a SHA-384-authored entity read back
+    # as a SHA-256 hash, so no holder of the authored reference can resolve it
+    # (ENC-ROUNDTRIP-FORMAT-1, V7 §1.8 / v7.69 §4.5a). Validation is
+    # format-aware — it reads the claimed hash's own leading format byte.
+    #
+    # `HashFormatError` is NOT caught here, and that is deliberate rather than
+    # an omission: step 1b has already established the hash parses, so an arm
+    # for it would be unreachable — a second path to one wire answer that no
+    # mutation of step 1b could redden. A mutation that unarms step 1b now
+    # reddens the `invalid_request` rows instead of being absorbed.
+    try:
+        validate_entity_hash(entity_data)
+    except HashValidationError as exc:
+        return _error_response(
+            400, "hash_mismatch",
+            f"entity content_hash does not match its {{type, data}}: {exc}",
+        )
+    entity, _ = Entity.from_wire_dict(entity_data)
     emit_ctx = EmitContext.from_handler_context(ctx, "put")
     emit_result = ctx.emit_pathway.emit(full_uri, entity, emit_ctx)
 
@@ -743,13 +794,34 @@ async def _handle_merge(
             return _error_response(400, "invalid_params", "source_envelope missing root")
 
         # Ingest all included entities into content store.
+        #
+        # The same structural guard `put` carries, at the second site that
+        # decodes a caller-supplied entity. Appendix A has no `merge` row for
+        # an undecodable entity, so this is §3.3's generic 400 default. Without
+        # it a malformed `source_envelope` member reaches `Entity.from_dict`
+        # and dies as a KeyError/TypeError — i.e. as a client-triggerable 500,
+        # which is the same defect `put` had, in the copy nobody drove.
         cs = ctx.emit_pathway.content_store
         for entity_data in (included.values() if isinstance(included, dict) else included):
             if isinstance(entity_data, dict):
+                member_error = validate_entity_structure(entity_data)
+                if member_error is not None:
+                    return _error_response(
+                        400,
+                        "invalid_request",
+                        f"source_envelope included entity does not decode: {member_error}",
+                    )
                 ent = Entity.from_dict(entity_data)
                 cs.put(ent)
 
         # Store the root (snapshot) entity and use its hash as source.
+        root_error = validate_entity_structure(root_entity)
+        if root_error is not None:
+            return _error_response(
+                400,
+                "invalid_request",
+                f"source_envelope root does not decode: {root_error}",
+            )
         root_ent = Entity.from_dict(root_entity)
         source_hash = cs.put(root_ent)
 

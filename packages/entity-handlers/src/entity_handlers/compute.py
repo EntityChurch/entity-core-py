@@ -1975,8 +1975,16 @@ def _eval_builtin_store(args: dict[str, Any], ctx: EvalContext) -> Any:
     if ctx._execute_fn is not None:
         # tree:put reads the path from resource.targets[0] and the entity from
         # params.entity; capability is checked by the tree handler.
+        #
+        # `to_dict()` rather than the two-key `ent_dict`: `put` is a receipt
+        # path and the peer authors nothing (0.8.2.11 §6.3), so every submitter
+        # constructs — including an in-process one. This site is the second
+        # `put` submitter in the tree and it is not reachable from the SDK, so
+        # nothing in `entity_sdk` covers it.
         return ctx._execute_fn(
-            "system/tree", "put", {"entity": ent_dict}, ctx, None, [path_val], None,
+            "system/tree", "put",
+            {"entity": Entity(type=ent_dict["type"], data=ent_dict["data"]).to_dict()},
+            ctx, None, [path_val], None,
         )
 
     # Fallback: no dispatcher wired — write directly, gated here.

@@ -66,7 +66,16 @@ def _ctx(emit_pathway: EmitPathway, tree_registry: TreeRegistry, target_path: st
 
 
 def _entity(value: str) -> dict:
-    return {"type": "test/blob", "data": {"value": value}}
+    """A submittable entity — all three ``core/entity`` fields.
+
+    ``put`` is a receipt path (0.8.2.11 §6.3): the submitter authors, the peer
+    validates, and a two-key ``{type, data}`` is refused ``400 invalid_request``
+    before any CAS row below is reached. Every fixture in this file used the
+    two-key form, which is the *"count how many existing tests construct the
+    newly-invalid form"* measurement — a fact about our fixtures, not about the
+    rule.
+    """
+    return Entity(type="test/blob", data={"value": value}).to_dict()
 
 
 @pytest.mark.asyncio

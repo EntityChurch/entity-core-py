@@ -21,6 +21,7 @@ from entity_core.crypto.ed448 import Ed448Keypair
 from entity_core.crypto.identity import Keypair
 from entity_core.peer import PeerBuilder
 from entity_core.peer.connection import Connection
+from entity_core.protocol.entity import Entity
 
 
 def _make_keypair(kind: str):
@@ -141,7 +142,7 @@ async def test_ed448_server_self_serves_authenticated_execute(server_kind):
             write = await conn.execute(
                 uri=f"entity://{server.peer_id}/data/ed448-check",
                 operation="write",
-                params={"entity": {"type": "test-data", "data": {"v": 1}}},
+                params={"entity": Entity(type="test-data", data={"v": 1}).to_dict()},
                 authenticated=True,
             )
             assert write.status == 200, f"write rejected: {write.error}"

@@ -137,14 +137,34 @@ async def test_put_rejects_a_lying_content_hash(emit_pathway, tree_registry):
 
 
 @pytest.mark.asyncio
-async def test_put_authors_a_hash_when_none_is_carried(emit_pathway, tree_registry):
-    """A locally-constructed entity carries no claimed hash, so the peer
-    authors one under its own format. The trust rule is about *received*
-    hashes; it does not mean an absent hash is an error."""
+async def test_put_refuses_to_author_a_hash_when_none_is_carried(
+    emit_pathway, tree_registry
+):
+    """The inverse of what this file asserted until 0.8.2.11, and the reason is
+    that "validate-then-trust" and "author on absence" are not two halves of one
+    rule — they are two layers, and only one of them is the peer's.
+
+    The old row read: *"a locally-constructed entity carries no claimed hash, so
+    the peer authors one under its own format. The trust rule is about received
+    hashes; it does not mean an absent hash is an error."* Every clause of that
+    is true about `Entity` and none of it is true about `put`, whose argument is
+    typed `core/entity` — three required fields (`ENTITY-NATIVE-TYPE-SYSTEM`
+    §8.1). There is no locally-constructed entity on a wire operation's params:
+    §6.3 is a **receipt** path and the construction happened at the submitter,
+    which for this repo means `SDK-OPERATIONS` §3.2's `put(path, type, data) →
+    hash`.
+
+    The old reading was not idle — it is what made this peer accept the two-key
+    form our own SDK was sending, so the two defects compensated and neither
+    was visible from inside this tree.
+    """
     path = "data/fidelity/local"
     result = await _put(
         emit_pathway, tree_registry, path,
         {"type": "test/blob", "data": {"value": "local"}},
     )
-    assert result["status"] == 200
-    assert result["result"]["data"]["hash"][0] == ALG_ECFV1_SHA256
+    assert result["status"] == 400
+    assert result["result"]["data"]["code"] == "invalid_request"
+    assert emit_pathway.entity_tree.get(
+        emit_pathway.entity_tree.normalize_uri(path)
+    ) is None, "a refused put binds nothing"

@@ -4120,9 +4120,7 @@ class Peer:
             if resolved.status == 404:
                 # §3.3 / §6.2's 404 row: no handler is registered at the
                 # resolved path, on a path targeting the local peer. This is
-                # the ONE call site of the row in this tree; the three
-                # `ExecuteResponse.not_found` sites in `_handle_get` are
-                # entity-level and stay as they are.
+                # the ONE call site of the row in this tree.
                 logger.debug(
                     "[dispatch] -> response status=404 code=handler_not_found"
                 )
@@ -4656,136 +4654,6 @@ class Peer:
                 )
         except Exception as e:
             logger.exception("[dispatch:async] delivery error: %s", e)
-
-    def _handle_get(
-        self, request_id: str, path: str, params: dict[str, Any]
-    ) -> ExecuteResponse:
-        """Handle get operation - direct entity tree read.
-
-        Args:
-            request_id: Request ID for correlation.
-            path: The path to get. Trailing slash returns tree listing.
-            params: May contain 'hash' for direct content store lookup.
-
-        Returns:
-            ExecuteResponse with the entity or tree listing.
-        """
-        # Get by hash (direct content store lookup)
-        if "hash" in params:
-            entity = self.content_store.get(params["hash"])
-            if entity is None:
-                return ExecuteResponse.not_found(request_id, "Hash not found")
-            return ExecuteResponse.success(request_id, entity.to_dict())
-
-        # Trailing slash = tree listing
-        if path.endswith("/"):
-            return self._handle_tree_listing(request_id, path)
-
-        # Get by URI (tree lookup)
-        full_uri = self.entity_tree.normalize_uri(path)
-        hash_str = self.entity_tree.get(full_uri)
-        if hash_str is None:
-            return ExecuteResponse.not_found(request_id, f"Not found: {path}")
-
-        entity = self.content_store.get(hash_str)
-        if entity is None:
-            return ExecuteResponse.not_found(request_id, f"Entity missing: {hash_str}")
-
-        return ExecuteResponse.success(request_id, entity.to_dict())
-
-    def _handle_tree_listing(self, request_id: str, path: str) -> ExecuteResponse:
-        """Handle tree listing for paths ending with /.
-
-        Args:
-            request_id: Request ID for correlation.
-            path: The prefix path (ends with /).
-
-        Returns:
-            ExecuteResponse with tree/listing entity.
-        """
-        prefix = self.entity_tree.normalize_uri(path)
-        uris = self.entity_tree.list_prefix(prefix)
-
-        # Build entries: extract child names and their info
-        entries: dict[str, dict[str, Any]] = {}
-        seen_prefixes: set[str] = set()
-
-        for uri in uris:
-            # Get the part after the prefix
-            suffix = uri[len(prefix) :]
-            if not suffix:
-                continue
-
-            # Get immediate child name (first path segment)
-            parts = suffix.split("/")
-            child_name = parts[0]
-
-            if child_name in seen_prefixes:
-                continue
-            seen_prefixes.add(child_name)
-
-            # Check if this is a direct entity or a subtree
-            child_uri = prefix + child_name
-            hash_str = self.entity_tree.get(child_uri)
-            has_children = len(parts) > 1 or any(
-                u.startswith(child_uri + "/") for u in uris
-            )
-
-            entries[child_name] = {
-                "hash": hash_str,
-                "has_children": has_children,
-            }
-
-        result = {
-            "type": "tree/listing",
-            "data": {
-                "path": path,
-                "entries": entries,
-                "count": len(entries),
-            },
-        }
-        return ExecuteResponse.success(request_id, result)
-
-    def _handle_put(
-        self,
-        request_id: str,
-        path: str,
-        params: dict[str, Any],
-        remote_peer_id: str,
-    ) -> ExecuteResponse:
-        """Handle put operation - direct entity tree write.
-
-        Args:
-            request_id: Request ID for correlation.
-            path: The path to put at.
-            params: Must contain 'entity' with the entity to store.
-            remote_peer_id: The peer making the request (for emit context).
-
-        Returns:
-            ExecuteResponse with the hash or error.
-        """
-        entity_data = params.get("entity")
-        if not entity_data:
-            return ExecuteResponse.bad_request(
-                request_id=request_id,
-                message="Missing entity in params",
-                # §3.3's `invalid_params` — a required params field is absent,
-                # which is what that code names. go answers it at the matching
-                # seam (`execute.go`, "params entity missing type field").
-                code="invalid_params",
-            )
-
-        entity = Entity.from_dict(entity_data)
-
-        # Use emit pathway for writes (dispatches change events)
-        ctx = EmitContext.protocol(author=remote_peer_id)
-        full_uri = self.entity_tree.normalize_uri(path)
-        hash_str = self.emit_pathway.emit(full_uri, entity, ctx).hash
-
-        return ExecuteResponse.success(
-            request_id,
-            {"hash": hash_str, "uri": full_uri},
-        )
 
     async def _dispatch_local_execute(
         self,

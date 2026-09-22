@@ -373,3 +373,113 @@ class TestStoreStillRejectsWhatItAlwaysDid:
 
         assert is_error(result)
         assert result["data"]["code"] == ERR_TYPE_MISMATCH
+
+
+class TestTheDispatchedStoreReachesTheREALTreeHandler:
+    """`store`'s dispatched arm, driven through `system/tree:put` itself.
+
+    **Why this class exists, and it is a coverage finding rather than a rule.**
+    Landing 0.8.2.11's `put` admission, the mutation that reverts *this
+    builtin's* construction step — sending `{type, data}` again where the
+    ruling requires all three `core/entity` fields — **reddened nothing across
+    4289 tests**. Traced (A1): `_Fixture._dispatch` above is a stand-in that
+    reads `params["entity"]["type"]` and `["data"]` and validates nothing, so
+    the `dispatched` half of every row in this file is evidence about the
+    builtin's *arguments* and about nothing on the far side of the seam.
+
+    That is the standing law verbatim — *a test that substitutes the dispatcher
+    cannot be evidence about the dispatcher; when the thing under test is the
+    seam, the stub is the bug's hiding place* — with a **builtin's write
+    payload** as the subject. The stub is right for the rows above, whose
+    subject is what `store` materializes; it is the wrong instrument for
+    whether the peer would accept it.
+
+    `store` is the second `put` submitter in this repo and the one no SDK
+    reaches, so nothing in `entity_sdk`'s coverage speaks for it either.
+    """
+
+    @pytest.fixture
+    def peer(self):
+        from entity_core.crypto.identity import Keypair
+        from entity_core.peer import PeerBuilder
+
+        from entity_core.capability.grant import Grant
+
+        return (
+            PeerBuilder()
+            .with_keypair(Keypair.generate())
+            .with_all_handlers()
+            .with_default_grants([Grant.create(
+                handlers=["*"], operations=["*"], resources=["*"],
+            )])
+            .build()
+        )
+
+    def _real_ctx(self, peer):
+        """An EvalContext whose `_execute_fn` is the peer's own dispatcher.
+
+        Built the way `compute.py` builds it for a live evaluation — through
+        `_make_sync_dispatch` over a real `HandlerContext` — so the entity the
+        builtin emits is admitted by the same `_handle_put` a wire caller hits.
+        """
+        from entity_core.handlers.context import HandlerContext
+        from entity_handlers.compute import _make_sync_dispatch
+
+        handler_ctx = HandlerContext(
+            local_peer_id=peer.keypair.peer_id,
+            remote_peer_id="test-remote",
+            handler_grant=WILDCARD_CAP,
+            caller_capability=WILDCARD_CAP,
+            emit_pathway=peer.emit_pathway,
+            _execute_dispatcher=peer._dispatch_local_execute,
+        )
+        return EvalContext(
+            content_store=peer.emit_pathway.content_store,
+            entity_tree=peer.emit_pathway.entity_tree,
+            local_peer_id=peer.keypair.peer_id,
+            capability=WILDCARD_CAP,
+            caller_capability=WILDCARD_CAP,
+            emit_pathway=peer.emit_pathway,
+            included={},
+            has_content_store_access=True,
+            _execute_fn=_make_sync_dispatch(handler_ctx, WILDCARD_CAP),
+        )
+
+    def test_a_dispatched_store_is_accepted_by_the_real_put_admission(self, peer):
+        """The row the stub could not carry.
+
+        `put` is a receipt path since 0.8.2.11 §6.3 — it authors nothing — so a
+        builtin that emits a two-key `{type, data}` is refused
+        `400 invalid_request` and the write silently does not land. Reading the
+        eval result is not enough: `store` returns the dispatch result, so the
+        assertion is on the **binding**.
+        """
+        cs = peer.emit_pathway.content_store
+        expr = _apply_store(cs.put(_lit("corpus/viadispatch")), cs.put(_lit(42)))
+
+        result = evaluate(expr, Scope(), Budget(), self._real_ctx(peer))
+
+        assert not is_error(result), (
+            f"the dispatched store was refused by the real tree handler: "
+            f"{result!r} — the builtin is a `put` SUBMITTER and must construct "
+            f"the entity (0.8.2.11 §6.3), exactly as the SDK does"
+        )
+        tree = peer.emit_pathway.entity_tree
+        bound = tree.get(tree.normalize_uri("corpus/viadispatch"))
+        assert bound is not None, "a refused put binds nothing"
+        assert cs.get(bound).data == 42
+
+    def test_the_hash_bound_is_the_one_the_builtin_authored(self, peer):
+        """Teeth: a 200 alone would also be satisfied by a peer that authored.
+
+        The point of the ruling is *who* computes the hash, so the row has to
+        assert the identity of the bound hash rather than the fact of a write.
+        """
+        cs = peer.emit_pathway.content_store
+        expr = _apply_store(cs.put(_lit("corpus/authored")), cs.put(_lit(7)))
+
+        evaluate(expr, Scope(), Budget(), self._real_ctx(peer))
+
+        tree = peer.emit_pathway.entity_tree
+        bound = tree.get(tree.normalize_uri("corpus/authored"))
+        assert bound == Entity(type="primitive/any", data=7).compute_hash()
