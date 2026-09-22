@@ -6,6 +6,25 @@ operation it does not serve, produces `404 handler_not_found` at the
 dispatch boundary — the grant implied a contract the peer cannot honour,
 and the caller cannot tell a withheld authority from a broken one.
 
+.. rubric:: Two corrections to the sentence above, both landed 0.8.2.7
+
+**It was false when written, and arch found it by reading it.** `handler_not_
+found` occurred **zero** times in this tree: the dispatch boundary emitted
+`not_found`. That is the L20 corollary — *a comment asserting a behaviour is
+the highest-value line in a file to write a test against, because it is where
+the author said what they believed* — and it took a sibling reading our source
+to notice, because nothing here drove the boundary. It is true now
+(`ExecuteResponse.handler_not_found`, one call site in `peer/peer.py`).
+
+**And it is still narrower than it reads.** *"An operation it does not serve"*
+is §3.3's **501** row, not this one — a handler IS registered, so the boundary
+is never reached. Only the *"handler this peer never registered"* half is this
+404. Worse, on a peer built with `with_default_handlers()` that half is not
+reachable either: `storage_handler` is registered at `*` with priority 0, so
+`_resolve_handler` never returns None. See
+`tests/integration/test_status_code_slot_3_3.py::TestThe404Row`, which asserts
+both facts rather than leaving this paragraph as the only record of them.
+
 **The matching rule is pinned** (`EXTENSION-SIGNALING.md` §6.5 (b)
 "Contents", arch `977667f`): an assembled entry is retained iff the peer's
 advertised served-scope **covers** it on the *same four axes the chain uses

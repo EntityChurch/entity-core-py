@@ -108,15 +108,19 @@ class Backoff(ClientError):
 class Unsupported(ClientError):
     """The node does not serve this operation on this surface (501).
 
-    **Not what a ``reflect`` call gets.** ``reflect`` is not a core operation at
-    all (§1.4), so a wrapped node never answers 501 for it — a "not implemented
-    here" would imply this is a surface where it could be. What it *does* answer
-    depends on the caller's grant: **403** against a real node, whose enumerated
-    grant names only ``offer``/``collect``/``advertise`` so the capability check
-    refuses before dispatch, and 400 ``unknown_operation`` only for a
-    wildcard-granted caller that reaches the handler. There is deliberately no
-    ``reflect`` method here: it belongs to the unwrapped listener, whose protocol
-    is §5.1 and unwritten.
+    **This is what a ``reflect`` call gets, once it reaches the handler**, and
+    that is a correction (0.8.2.7). This docstring used to say the opposite —
+    that a wrapped node "never answers 501 for it", because "not implemented
+    here" would imply a surface where it could be. Core §3.3's 501 row is not
+    scoped by that intent: its input is *a handler is registered and does not
+    implement the named operation*, and §6.2 states the rule generally.
+
+    What the caller sees still depends on the grant: **403** against a real
+    node, whose enumerated grant names only ``offer``/``collect``/``advertise``
+    so the capability check refuses before dispatch; ``501
+    unsupported_operation`` for a wildcard-granted caller that reaches the
+    handler. There is deliberately no ``reflect`` method here: it belongs to
+    the unwrapped listener, whose protocol is §5.1 and unwritten.
     """
 
 

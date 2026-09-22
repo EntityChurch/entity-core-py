@@ -26,8 +26,12 @@ OP_COLLECT = "collect"
 OP_ADVERTISE = "advertise"
 
 #: Exactly three (§1). ``reflect`` is deliberately **not** here: it is the
-#: unwrapped listener's verb (§1.4), so asking a wrapped node for it is an
-#: ordinary ``unknown_operation`` / 400, not a 501.
+#: unwrapped listener's verb (§1.4). Asking a *wrapped* node for it is
+#: therefore an operation a registered handler does not implement, which is
+#: core §3.3's 501 row — ``501 unsupported_operation``, not a 400. (This read
+#: ``ordinary unknown_operation / 400, not a 501`` until 0.8.2.7; the
+#: intent-flavoured distinction it drew is one §6.2 says the corpus does not
+#: make.)
 OPERATIONS: tuple[str, ...] = (OP_OFFER, OP_COLLECT, OP_ADVERTISE)
 
 # ---------------------------------------------------------------------------
@@ -59,8 +63,22 @@ CODE_MESSAGE_TOO_LARGE = "message_too_large"
 CODE_BUCKET_FULL = "bucket_full"
 #: The node is at ``max_keys`` — 429.
 CODE_CAPACITY_EXHAUSTED = "capacity_exhausted"
-#: Unknown signaling operation — 400. This is what ``reflect`` gets (§1.4).
-CODE_UNKNOWN_OPERATION = "unknown_operation"
+# `CODE_UNKNOWN_OPERATION = "unknown_operation"` lived here until 0.8.2.7,
+# documented as *"Unknown signaling operation — 400. This is what `reflect`
+# gets (§1.4)."* It is gone rather than renamed. Three separate things were
+# wrong with it and only the first is about spelling:
+#
+#   1. `unknown_operation` is the synonym §3.3's 501 row forbids outright.
+#   2. `EXTENSION-SIGNALING` pins no such code — grepped at arch `646b82e`,
+#      **zero** occurrences in the extension. So unlike SA-PY-33's
+#      `bad_request`, this was not a corpus conflict to file; it was
+#      vocabulary this seat minted and then exported in `__all__`.
+#   3. It was **never emitted**. The node answered `CODE_INVALID_REQUEST` at
+#      that site, so nothing would have caught the constant drifting — a
+#      declared-but-dead wire value has no consumer to disagree with it.
+#
+# The node now answers `501 unsupported_operation` there, which is the core
+# code and needs no signaling-local constant.
 
 # ---------------------------------------------------------------------------
 # Key and lobby constants

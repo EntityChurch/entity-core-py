@@ -212,10 +212,12 @@ class TestIssuerPolicy:
         assert (await get_issuer_policy(client)).default_ttl == _LIVE_TTL
 
     async def test_domain_control_is_refused_by_the_registry_not_pre_empted(self, client):
-        """§6a.9.1 — the registry refuses to *store* a mode it cannot enforce,
-        with `400 unsupported_mode`. The SDK surfaces that rather than
-        rejecting client-side, so the ratified server-side rule stays the thing
-        under test."""
+        """§6a.9.1/§6a.9.2 — the registry refuses to *store* a mode it cannot
+        enforce, with `400 unsupported_mode` (pinned `[MUST]`; core §9.1's 501
+        synonym list does not reach it — see SA-PY-37). The SDK surfaces the
+        peer's answer rather than rejecting client-side, so the ratified
+        server-side rule stays the thing under test — which is why this row
+        asserts the code at all rather than just the exception class."""
         with pytest.raises(BadRequest) as exc:
             await set_issuer_policy(client, IssuerPolicy(mode="domain-control"))
         assert exc.value.status == 400

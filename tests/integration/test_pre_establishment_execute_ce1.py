@@ -95,6 +95,7 @@ from pathlib import Path
 import pytest
 
 from entity_core.crypto.identity import Keypair
+from entity_core.handlers.connect import ADVERTISED_PROTOCOLS
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.peer.connection import Connection
 from entity_core.peer.http_client import (
@@ -107,6 +108,10 @@ from entity_core.protocol.entity import Entity
 from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.framing import recv_envelope, send_envelope
 from entity_core.protocol.messages import Execute, ExecuteResponse
+from entity_core.utils.ecf import (
+    DEFAULT_ADVERTISED_KEY_TYPES,
+    default_advertised_hash_formats,
+)
 
 PORT = 19091
 
@@ -454,4 +459,257 @@ class TestBothBoundariesShareOneRefusal:
         assert not offenders, (
             "0.8.2.5: `Implementations MUST NOT emit connection_required or "
             f"handshake_failed` — both are minted codes in no spec set: {offenders}"
+        )
+
+
+# --------------------------------------------------------------------------
+# The two rows arch reported as never driven against this seat
+# --------------------------------------------------------------------------
+
+
+class TestTheTwoRowsNobodyDrove:
+    """`ROUTING-2026-09-03-a` §5.2, verbatim: *"Two rows unmeasured at your
+    seat, both cheap: a pre-establishment **foreign-namespace** EXECUTE (→ `400
+    invalid_request`), and an unauthenticated **post-handshake `ping`** (→ must
+    be served). Neither has ever been driven against py."*
+
+    Both claims were correct, and the pair of them is the shape worth naming.
+    **They are the two arms adjacent to rows this seat had just fixed**, one on
+    each side:
+
+    * CE-1's own row deliberately targets the responder's **own** namespace so
+      the measurement attributes (the §1.4 gate would otherwise refuse first).
+      That care is what leaves the foreign arm undriven — *the control that
+      makes a measurement attributable is also what stops it covering the
+      neighbour.*
+    * `827cbe3` fixed the **pre-hello** `ping` and this file already asserts it.
+      The **post-hello** arm is the far side of a handshake a probe writes as
+      setup, which is the standing "a probe family's blind spot is the seat the
+      prober sits in" finding — here reaching us as our own blind spot rather
+      than a sibling's.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_pre_establishment_foreign_namespace_execute_is_400(
+        self, server_peer: Peer
+    ) -> None:
+        """0.8.2.6 Q1: **address is evaluated before authentication.**
+
+        The deciding argument is 0.8.2.4's own: a `401` directs the caller to
+        authenticate and retry, and for a foreign address that retry cannot
+        succeed at any authentication state — so the `401` names a remedy that
+        does not exist. This is therefore NOT CE-1's row even though the
+        connection state is identical; the §1.4 canonicalization gate answers
+        first, and that ordering is the ruling.
+        """
+        response = await _send_before_handshake(
+            Execute.create(
+                uri="entity://someone-elses-peer-id/system/status",
+                operation="get",
+            )
+        )
+        assert _pair(response) == (400, "invalid_request"), (
+            "§1.4 / §5.2a: a foreign namespace is refused at canonicalization, "
+            "ahead of §4.2's pre-authorization bullet — a 401 here would name a "
+            f"remedy no authentication state can reach. Got {_pair(response)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_foreign_arm_and_the_local_arm_do_not_collapse(
+        self, server_peer: Peer
+    ) -> None:
+        """The discriminator, because both rows are pre-establishment refusals.
+
+        A peer that answered `400 invalid_request` to everything before the
+        handshake passes the row above and fails this one; a peer that answered
+        `401` to everything passes CE-1's row and fails the one above. Only the
+        pair of answers shows the two gates are both present and correctly
+        ordered.
+        """
+        foreign = await _send_before_handshake(
+            Execute.create(
+                uri="entity://someone-elses-peer-id/system/status",
+                operation="get",
+            )
+        )
+        local = await _send_before_handshake(
+            _non_connect_execute(server_peer.peer_id)
+        )
+        assert _pair(foreign) != _pair(local), (
+            "the §1.4 address gate and §4.2's pre-authorization bullet are two "
+            f"gates; one answer for both inputs means one of them is missing: "
+            f"foreign={_pair(foreign)} local={_pair(local)}"
+        )
+        assert _pair(foreign) == (400, "invalid_request")
+        assert _pair(local) == RULED_PAIR
+
+    @pytest.mark.asyncio
+    async def test_the_http_boundary_answers_the_foreign_arm_too(
+        self, server_peer: Peer
+    ) -> None:
+        """The gap the mutation run found in this file's own coverage.
+
+        Disarming the address gate reds two rows; removing `uri=` from the
+        **HTTP** call site reds nothing, because the existing HTTP row uses the
+        responder's own namespace and this class's foreign rows are TCP-only.
+        That is precisely the two-hand-rolled-copies shape `_pre_establishment_
+        refusal`'s docstring exists to prevent, reappearing as a **test-side**
+        asymmetry one commit after the code-side one was closed: the refusal is
+        shared, and the coverage of it was not.
+
+        No cohort probe dials HTTP, so without this row the HTTP boundary could
+        drift back to a 401 through any number of green cross-impl runs.
+        """
+        http_server = await server_peer.start_http("127.0.0.1", 0)
+        bind = http_server.bound_socket()
+        assert bind is not None
+        url = f"http://{bind[0]}:{bind[1]}/entity"
+
+        envelope = Envelope(
+            root=Execute.create(
+                uri="entity://someone-elses-peer-id/system/status",
+                operation="get",
+            ).to_entity()
+        )
+        status, _headers, body = await http_post(
+            url, _envelope_to_body(envelope),
+            headers={"content-type": "application/cbor"},
+        )
+        assert status == 200, "the refusal rides in the EXECUTE_RESPONSE body"
+        response = ExecuteResponse.from_entity(_body_to_envelope(body).root)
+        assert _pair(response) == (400, "invalid_request"), (
+            "the HTTP boundary must order address-before-auth exactly as the "
+            f"TCP one does: {_pair(response)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unsigned_ping_on_an_established_connection_is_SERVED(
+        self, server_peer: Peer
+    ) -> None:
+        """Arch's Q2, ruled against `entity-core-rust` and in go's favour.
+
+        §3.2 excepts *"requests targeting the connection path (§4)"* from the
+        `author`/`capability` MUST **with no state qualifier**, and §5.1 is
+        scoped to *"every **authenticated** EXECUTE"* — a class §3.2 defines by
+        **excluding** the connection path. rust read §5.1 as the general rule
+        with §4.2 as its exception; it is the other way round, so go's
+        `pingServedOnceEstablished` is correct as written and was explicitly
+        told not to change.
+
+        .. rubric:: Which "unauthenticated" this row means, because the first
+           draft got it wrong
+
+        Written first against a socket that completed **`hello` only**. That
+        peer answers `409 connection_sequence_error`, and reading the commit
+        summaries it looked like a defect. Reading the ruling itself does not
+        support that: its security leg is *"by the time the connection is
+        established **both peers have authenticated** (§4.6) and the frame
+        arrives on that authenticated connection"*, and the objection it
+        answers is that per-frame author/capability would re-prove *"at every
+        keepalive, an identity the connection already carries."*
+
+        So the ruled subject is a **frame-level** unauthenticated ping on a
+        **fully established** connection — not a ping on a half-open handshake,
+        which is §4.7 row 10's ordering rule and stays `409`. Two different
+        senses of "unauthenticated", and the routed one-line summary
+        (*"unauthenticated post-handshake ping → must be served"*) is true under
+        both. The standing *"open the ruling, not the packet that tabulates
+        it"* rule, reaching a summary arch wrote about its own ruling.
+        """
+        client = await Connection.connect("127.0.0.1", PORT, Keypair.generate())
+        try:
+            assert client.remote_peer_id == server_peer.peer_id, (
+                "control: `Connection.connect` completes hello AND "
+                "authenticate, so a session exists — without it this row is "
+                "the half-open 409 case below, not Q2's"
+            )
+            ping = Execute.create(
+                uri=f"entity://{server_peer.peer_id}/system/protocol/connect",
+                operation="ping",
+                params=Entity(
+                    type="system/network/ping",
+                    data={"timestamp": 1, "sequence": 1},
+                ).to_dict(),
+            )
+            # Sent as a bare envelope rather than through `client.execute`, so
+            # the frame carries **no** `author`, `capability` or signature.
+            # That is the whole input: a signed ping would measure nothing,
+            # because §5.1 is satisfied and the exception never fires.
+            assert "author" not in ping.to_entity()["data"]
+            await client.send(Envelope(root=ping.to_entity()))
+            response = ExecuteResponse.from_entity((await client.recv()).root)
+        finally:
+            client.close()
+            await client.wait_closed()
+
+        assert int(response.status) == 200, (
+            "§3.2 excepts the connection path from author/capability with no "
+            "state qualifier, and §5.1 binds only the *authenticated* EXECUTE "
+            "class. An unsigned ping on an established connection MUST be "
+            f"served; got {int(response.status)} "
+            f"{(response.result or {}).get('data', {}).get('code', '')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_post_hello_pre_authenticate_ping_is_still_409(
+        self, server_peer: Peer
+    ) -> None:
+        """The state the ruling does NOT cover, pinned so it stays deliberate.
+
+        Between `hello` and `authenticate` the connection is half-open: §4.7
+        row 10's ordering rule applies and `ping` *"requires an established
+        connection"*. This peer answers `409 connection_sequence_error`, which
+        is the same answer it gives pre-hello and is consistent with the row.
+
+        Recorded because it is the state the routed summary's wording reaches
+        and the ruling's argument does not, and because a later reader
+        "completing" Q2 could sweep it to 200 on the strength of that summary —
+        which would serve a keepalive on a connection whose peer has not proved
+        anything. **Routed to arch as the arm 0.8.2.6 leaves unstated.**
+        """
+        reader, writer = await asyncio.open_connection("127.0.0.1", PORT)
+        try:
+            keypair = Keypair.generate()
+            hello = Execute.create(
+                uri=f"entity://{server_peer.peer_id}/system/protocol/connect",
+                operation="hello",
+                params=Entity(
+                    type="system/protocol/connect/hello",
+                    data={
+                        "peer_id": keypair.peer_id,
+                        "nonce": b"\x11" * 32,
+                        "protocols": list(ADVERTISED_PROTOCOLS),
+                        "hash_formats": default_advertised_hash_formats(),
+                        "key_types": list(DEFAULT_ADVERTISED_KEY_TYPES),
+                    },
+                ).to_dict(),
+            )
+            await send_envelope(writer, Envelope(root=hello.to_entity()))
+            hello_response = ExecuteResponse.from_entity(
+                (await asyncio.wait_for(recv_envelope(reader), timeout=5.0)).root
+            )
+            assert int(hello_response.status) == 200, (
+                "control: the hello must succeed, or this is the pre-hello "
+                f"state and the row below measures nothing new ({hello_response.status})"
+            )
+
+            ping = Execute.create(
+                uri=f"entity://{server_peer.peer_id}/system/protocol/connect",
+                operation="ping",
+                params=Entity(
+                    type="system/network/ping",
+                    data={"timestamp": 1, "sequence": 1},
+                ).to_dict(),
+            )
+            await send_envelope(writer, Envelope(root=ping.to_entity()))
+            response = ExecuteResponse.from_entity(
+                (await asyncio.wait_for(recv_envelope(reader), timeout=5.0)).root
+            )
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+        assert _pair(response) == (409, "connection_sequence_error"), (
+            "the half-open state is §4.7 row 10's ordering rule, not Q2's "
+            f"pre-authorization rule; got {_pair(response)}"
         )

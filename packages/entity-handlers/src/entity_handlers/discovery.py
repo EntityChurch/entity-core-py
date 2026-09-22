@@ -652,8 +652,11 @@ class DiscoveryExtension(Extension):
                 return await ext._handle_announce_stop(ctx, params)
             if operation == _OP_DECIDE:
                 return await ext._handle_decide(ctx, params)
+            # §3.3's 501 row + §6.2 — see the matching site in `registry.py`.
+            # The status was the `no handler registered` row and the code was
+            # the forbidden synonym; both move together.
             return _error(
-                404, "unknown_operation",
+                501, "unsupported_operation",
                 f"system/discovery has no operation {operation!r}",
             )
 

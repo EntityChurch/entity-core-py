@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from entity_core.handlers.context import HandlerContext
+from entity_handlers._common import error_response
 
 
 async def storage_handler(
@@ -39,6 +40,17 @@ async def storage_handler(
 
     Returns:
         Response dictionary with status and result.
+
+    .. note:: The three ``if not result.ok`` arms below forward an upstream
+       status with a bare ``{"error": message}`` body and **no** ``code``.
+       They are left as-is deliberately: ``ExecuteResult`` (``handlers/
+       context.py``) carries ``status``, ``result`` and ``error`` and **drops
+       ``result.data.code``**, so an in-process sub-dispatch cannot forward the
+       code the sub-handler emitted. Minting one here would fabricate a claim
+       about a refusal this handler did not make — the ``connect_refusal``
+       lesson (*a default is a decision; the correct decision is not always the
+       correct value*). Filed as SA-PY-34; the fix is to plumb ``code`` through
+       ``ExecuteResult``, which is 13 construction sites and a separate change.
     """
     # Per §3.4, params arrives as an entity envelope on the wire. Extract
     # the payload (same shim all handlers use).
@@ -54,7 +66,9 @@ async def storage_handler(
     if operation == "write" or operation == "put":
         entity_data = params.get("entity")
         if not entity_data:
-            return {"status": 400, "result": {"error": "Missing entity in params"}}
+            return error_response(
+                400, "invalid_params", "Missing entity in params",
+            )
 
         # Delegate to tree handler
         result = await ctx.execute("system/tree", "put", {"path": path, "entity": entity_data})
@@ -92,7 +106,11 @@ async def storage_handler(
         # First get the entity to return it
         get_result = await ctx.execute("system/tree", "get", {"path": path})
         if not get_result.ok:
-            return {"status": 404, "result": {"error": "Not found"}}
+            # An entity-absent 404 raised *inside* a registered handler. Per
+            # §3.3's 404 row (0.8.2.7) that is a domain outcome and explicitly
+            # NOT the `handler_not_found` row, so it keeps this tier's
+            # `not_found` spelling rather than taking the row's default.
+            return error_response(404, "not_found", f"Not found: {path}")
 
         removed_entity = get_result.result
 
@@ -103,4 +121,15 @@ async def storage_handler(
 
         return {"status": 200, "result": {"removed": removed_entity}}
 
-    return {"status": 400, "result": {"error": f"Unknown operation: {operation}"}}
+    # §3.3's 501 row, §6.2: a handler IS registered at this path — this one,
+    # the `*` catch-all — and does not implement the named operation. That is
+    # the row's input, so it is `501 unsupported_operation` regardless of how
+    # the site is spelled. It read `400` with **no `code` at all** and a
+    # `{"error": str}` body that is not a `system/protocol/error`, which is why
+    # no census of the 501 slot could see it: a slot is keyed by status, and
+    # this site had the status wrong.
+    return error_response(
+        501,
+        "unsupported_operation",
+        f"storage handler does not support operation: {operation}",
+    )

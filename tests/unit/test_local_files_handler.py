@@ -714,16 +714,25 @@ def test_edit_stability_retains_most_chunks(tmp_path):
 # -----------------------------------------------------------------------------
 
 
-def test_watch_returns_unknown_operation_when_not_implemented(tmp_path):
-    """Per v1.3 §10.1 L2 MUST: a handler that exposes `watch` in its
-    manifest MUST monitor the filesystem; a handler that doesn't
-    implement the watcher MUST omit `watch` from the manifest and
-    return ``unknown_operation`` to callers.
+def test_watch_returns_unsupported_operation_when_not_implemented(tmp_path):
+    """Per `DOMAIN-LOCAL-FILES` §10.1 L2 MUST: a handler that exposes `watch`
+    in its manifest MUST monitor the filesystem; one that doesn't implement the
+    watcher MUST omit `watch` from the manifest, so callers receive **`501
+    unsupported_operation` per `ENTITY-CORE-PROTOCOL` §3.3 / §6.2** — the
+    domain spec names the core row rather than a code of its own.
 
     Our impl is in the "omit + reject" state until the platform-native
     watcher (inotify/FSEvents/ReadDirectoryChangesW) lands. The
     deliberate visible signal here is the V2 behavioral gate's
     skip-with-WARN path.
+
+    **This row asserted `unknown_operation` until 0.8.2.7 and its docstring
+    attributed that spelling to the domain spec.** The domain spec never said
+    it — it has cited §3.3's row all along, and `d377a95` only tightened the
+    wording. So the citation was the thing that was wrong, and a wrong citation
+    is worse than a wrong assertion: it makes the defect read as compliance,
+    and a reader checking the row against its stated authority stops at the
+    docstring.
     """
     env = _make_env(tmp_path)
     resp = _run(
@@ -735,7 +744,7 @@ def test_watch_returns_unknown_operation_when_not_implemented(tmp_path):
         )
     )
     assert resp["status"] == 501
-    assert resp["result"]["data"]["code"] == "unknown_operation"
+    assert resp["result"]["data"]["code"] == "unsupported_operation"
 
 
 def test_watch_not_in_manifest(tmp_path):

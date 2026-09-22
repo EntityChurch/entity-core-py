@@ -13,6 +13,7 @@ from typing import Any
 from entity_core.handlers.connect import ADVERTISED_PROTOCOLS
 from entity_core.handlers.context import HandlerContext
 from entity_core.types.registry import list_handler_names, get_handler_manifest
+from entity_handlers._common import error_response
 
 
 async def system_handler(
@@ -128,10 +129,29 @@ async def system_handler(
             if entity is not None:
                 return {"status": 200, "result": entity.to_dict()}
 
-    return {
-        "status": 404,
-        "result": {
-            "type": "system/protocol/error",
-            "data": {"code": "not_found", "message": f"Unknown system path: {path}"},
-        },
-    }
+    # Two different failures were collapsed into this one 404 until 0.8.2.7,
+    # and the collapse is §3.3's 404/501 boundary drawn in the wrong place.
+    #
+    # `SYSTEM_HANDLER_MANIFEST` declares exactly ONE operation: `get`. So an
+    # operation that is not `get` is *"an operation absent from a registered
+    # handler's manifest"* — §3.3's **501** row, verbatim — and answering 404
+    # for it asserts that no handler is registered at the path, which is false
+    # of a path this handler was dispatched to.
+    #
+    # Found by `entity-core-go`'s `handler_not_found_on_unregistered_path`,
+    # which dispatches a bogus operation at `system/no-such-handler-…`. It
+    # reports us FAIL either way — see SA-PY-36 — but the 501 is the answer
+    # §3.3 actually names for that input, and the previous 404 was wrong on
+    # both halves of the pair rather than on one.
+    if operation != "get":
+        return error_response(
+            501,
+            "unsupported_operation",
+            f"system handler does not support operation: {operation}",
+        )
+
+    # `get` IS implemented and the path carries no entity: an entity-absent
+    # 404 raised inside a registered handler, which §3.3's 404 row (0.8.2.7)
+    # explicitly excludes from the `handler_not_found` row — *"a domain outcome
+    # carrying the domain's own code"*. Stays `not_found`.
+    return error_response(404, "not_found", f"Unknown system path: {path}")

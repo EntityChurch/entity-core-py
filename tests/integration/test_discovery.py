@@ -574,6 +574,16 @@ def test_capability_surface_is_exactly_two():
     assert not any("admit" in c or "grant-access" in c for c in DISCOVERY_CAPS)
 
 
-async def test_unknown_operation_404(ext, peer):
+async def test_unknown_operation_is_501_unsupported_operation(ext, peer):
+    """§3.3's 501 row: the discovery handler IS registered and does not
+    implement `bogus`.
+
+    Asserted `404` and nothing else until 0.8.2.7 — a status-only row, which is
+    why it survived: it was pinning the *wrong row* while looking like coverage
+    of this one. The pair is asserted now, because a half-fix that satisfies
+    one of the two is how a non-conformant peer ships wearing a green diff.
+    """
     resp = await _call(ext, peer, "bogus", {})
-    assert resp["status"] == 404
+    assert (resp["status"], resp["result"]["data"]["code"]) == (
+        501, "unsupported_operation",
+    )

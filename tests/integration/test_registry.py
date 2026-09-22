@@ -867,14 +867,36 @@ async def test_reg_register_stale_request(peer):
 @pytest.mark.asyncio
 async def test_reg_register_domain_control_unsupported(peer):
     """`domain-control` mode is deferred (§6a.9.1) — a v1 registry returns a
-    clear 501 rather than inventing a second domain-proof scheme."""
+    clear 501 rather than inventing a second domain-proof scheme.
+
+    **The code is `unsupported_mode`, and §6a.9.2 pins it as a `[MUST]`:** *"The
+    registry MUST answer live registration `501 unsupported_mode` and MUST NOT
+    fall back to `open`, `manual`, or an unset-style `404` … This is a
+    cross-impl-observable answer with four plausible codes, so it is pinned
+    rather than left to converge."*
+
+    This row asserted `domain_control_unsupported` — a **fifth** spelling, ours
+    — until 2026-09-03, and then briefly `unsupported_operation`, on the
+    reading that §9.1's 501 synonym list forbade `unsupported_mode`. It does
+    not: 0.8.2.7 ruling 2's escape clause is *"defined … in the owning domain
+    handler's own table"*, and §6a.9.2 is that table. §9.1's list enumerates
+    spellings seats were **emitting**, not spellings the corpus leaves
+    undefined. SA-PY-37.
+
+    Both wrong answers had the same cause and it is worth naming: the sweep was
+    justified by *"no extension in this tree declares an error-code table"* —
+    arch's sentence, true of the ~90 held 500 sites, inherited without being
+    re-checked against the extension actually in front of us. **A sweep
+    justified by "nothing defines a better code" is a negative claim about the
+    corpus**, and the cheap check is one grep of the extension.
+    """
     _emit_issuer_policy(peer, "domain-control")
     reg_kp = Keypair.generate()
     data = _register_data(reg_kp.peer_id, "billslab.com")
     _sign_into_store(peer, reg_kp, "system/registry/register-request", data)
     r = await _call(peer, "register-request", data)
-    assert r["status"] == 501
-    assert r["result"]["data"]["code"] == "domain_control_unsupported"
+    assert (r["status"], r["result"]["data"]["code"]) == (501, "unsupported_mode")
+    assert "domain-control" in r["result"]["data"]["message"]
 
 
 @pytest.mark.asyncio
@@ -1378,10 +1400,26 @@ async def test_reg_get_issuer_policy_unset_is_404(peer):
 async def test_reg_set_issuer_policy_domain_control_400(peer):
     """§6a.9.2 [MUST] — `domain-control` is deferred until the challenge format
     lands (§6a.9.1), so `set` refuses to *store* a policy the registry could not
-    enforce. The registry stays curated-only: nothing was written."""
+    enforce. The registry stays curated-only: nothing was written.
+
+    **`400 unsupported_mode` is pinned by §6a.9.2 `[MUST]`** and this row
+    briefly asserted `invalid_params` instead (2026-09-03), on the reading that
+    core §9.1's 501 synonym list forbade the spelling. It does not — see the
+    sibling row `test_reg_register_domain_control_unsupported` and SA-PY-37 —
+    and `entity-core-go`'s `registry_issuer.set_issuer_policy_domain_control_
+    rejected` is what caught it, which is the argument for running the
+    validator on a code sweep even when the unit suite is green.
+
+    The two `domain-control` refusals in this handler share a code and differ
+    in status on purpose: `400` refuses to **store** the mode; `501` fails
+    closed when a policy is already stored (seeded out-of-band or predating the
+    refusal). §6a.9.2 gates them separately because the `set` refusal *"cannot
+    be the only thing standing between a stored unenforceable mode and an open
+    registry."*
+    """
     r = await _call(peer, "set-issuer-policy", {"mode": "domain-control"})
-    assert r["status"] == 400
-    assert r["result"]["data"]["code"] == "unsupported_mode"
+    assert (r["status"], r["result"]["data"]["code"]) == (400, "unsupported_mode")
+    assert "domain-control" in r["result"]["data"]["message"]
     assert (await _call(peer, "get-issuer-policy", {}))["status"] == 404
 
 

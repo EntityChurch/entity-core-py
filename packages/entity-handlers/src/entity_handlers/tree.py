@@ -990,7 +990,9 @@ async def _handle_create(
         Response dict with tree config.
     """
     if ctx.tree_registry is None:
-        return _error_response(501, "not_implemented", "Tree registry not available")
+        return _error_response(
+            501, "unsupported_operation", "Tree registry not available",
+        )
 
     tree_id = params.get("tree_id")
     if not tree_id:
@@ -1056,7 +1058,9 @@ async def _handle_destroy(
         return _error_response(400, "default_tree", "Cannot destroy default tree")
 
     if ctx.tree_registry is None:
-        return _error_response(501, "not_implemented", "Tree registry not available")
+        return _error_response(
+            501, "unsupported_operation", "Tree registry not available",
+        )
 
     if not ctx.tree_registry.exists(tree_id):
         return _error_response(404, "tree_not_found", f"Tree not found: {tree_id}")

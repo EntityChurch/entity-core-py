@@ -1450,6 +1450,170 @@ fails the gates rather than slipping past them.
   map key is the sender's claim, so `_bundled` returns nothing unless the entity hashes to
   the key it arrived under.
 
+- **A code SLOT is the unit for auditing a CODE; the row's INPUT is the unit for auditing a
+  ROW — and a slot is keyed by a status, so it cannot see a site that got the status wrong.**
+  ***RATIFIED 2026-09-03*** *— the "walk every row of a table when a sibling reports N" law
+  with the **census method** as the subject, and the third turn of arch's own AP-21.*
+  Arch ruled §3.3's default-code force (0.8.2.7) on the finding that *a count of the token is
+  not a census of the slot*: 0.8.2.6 swept `unknown_operation` and reported the 501 class
+  closed while `not_implemented` survived in all three trees. They then censused **by slot**
+  — every code emitted at status 501 — across six trees and routed us four spellings.
+  **Censusing instead by the row's INPUT** (*a handler is registered at this path and does not
+  implement the named operation*) **found four more at this seat, every one outside status
+  501**: two at `404 unknown_operation`, one at `400` with **no `code` field at all**, and one
+  at `400 invalid_request`.
+  **The last is the shape to remember, because it is invisible twice over.**
+  `invalid_request` is the *correct* default for status 400, so the pair reads conformant at
+  every glance short of asking what the input was. It carried a written argument for the 400 —
+  `reflect` is the unwrapped listener's verb, so answering "not implemented" would imply a
+  surface where it could be — which is an *intent* distinction, and §3.3's rows are defined by
+  **inputs**. §6.2 says so outright and arch had ruled the identical distinction out at
+  keystone's `pd` in the same packet. **And `storage.py`'s was the handler registered at `*`**,
+  i.e. the most reachable refusal in the peer, answering with no code.
+  **A slot census is a grep with better manners: it still starts from what you emit.** The
+  spec's *input* is the only starting point that reaches a site whose status is wrong, and
+  those are exactly the sites no cross-impl probe keyed on status can report.
+  **Two corollaries earned building the gate, both from mutations that behaved unexpectedly:**
+  1. **A gate whose search key is part of what the defect removes reports clean.** Reverting
+     `storage.py` left the structural fallthrough row **green** — that row locates sites by a
+     message convention, and the mutation deleted the message along with the fix, so the site
+     dropped out of the population rather than failing. A count with any slack cannot fire for
+     the same reason. Remedies: enumerate from the **registration list** (`handlers.
+     list_handlers()`) — the one inventory a defect cannot edit, since a handler that stops
+     answering the row is still registered — and make the marker guard a **ledger of modules**,
+     not a floor.
+  2. **A handler with no fallthrough is not a handler with nothing to audit.** `system.py`
+     had *one* 404 serving both *"I do not implement that operation"* and *"that path holds no
+     entity"*, so it was absent from every census in the file until the arm was split out. The
+     ledger is what reported it joining.
+  Enforcement point: `tests/integration/test_status_code_slot_3_3.py` — three complementary
+  rows, each stating its own blind spot, plus the 404 row's reachability finding and the 500
+  row's *deliberately assert-they-are-still-here* ratchet (arch **held** the ~16 specific 500
+  spellings under §3a; a later reader of the 501 sweep must not infer the 500 slot was missed).
+  Six mutations, six correct predictions after the two corrections above.
+
+- **A sweep justified by "nothing defines a better code" is a NEGATIVE claim about the corpus,
+  and your own tests will agree with you because you moved them.** ***RATIFIED 2026-09-03***
+  *— SA-PY-37, and it is AP-21's own shape arriving inside AP-21's own remedy.* §9.1 (0.8.2.7)
+  lists five *"non-conformant spellings"* of the 501 row. **`EXTENSION-REGISTRY` §6a.9.2 pins
+  one of them, `unsupported_mode`, twice, both `[MUST]`** — and the second pins it *"because
+  this is a cross-impl-observable answer with four plausible codes."* We swept both registry
+  sites from the list; 0.8.2.7's own escape clause (*defined … in the owning domain handler's
+  own table*) says §6a.9.2 wins.
+  **Why the list is persuasive and wrong:** it enumerates spellings seats were **emitting** and
+  reads as an enumeration of spellings the corpus leaves **undefined**. AP-21 is *a count of
+  the token is not a census of the slot*; this is *a census of emissions is not a census of
+  definitions*. Both are positive-sounding sentences whose truth condition is a negative, so
+  `AGENTS-STANDARD`'s **prove a negative** rule never fires — the sentence reads as measured,
+  and it cites five real spellings.
+  **The unit suite could not catch it and the reason is the standing one.** We moved the
+  assertions with the code — *our constant against our constant*, the exact configuration that
+  hid `entity-core/7.0` and `bad_request`. **3854 green, and only a peer that does not share
+  our constant could see it**: `entity-core-go`'s `registry_issuer.set_issuer_policy_domain_
+  control_rejected`. **So: run the validator on a code sweep even when the unit suite is
+  green** — a sweep is precisely the change whose tests move with it.
+  **The checks, in the order they are cheap:** before retiring a spelling on a corpus-wide
+  list, **grep the owning extension for it** — one command, and it reframes the task. And when
+  a ruling hands you a list of forbidden values, treat the list as *evidence about
+  implementations* and the ruling's escape clause as *the rule*; implement the rule.
+  Enforcement point: the gate's `DEFINED_ELSEWHERE`, whose entries each **name the section that
+  pins them** so a later seat cannot widen it by assertion, plus a row asserting each exemption
+  is still emitted — an exemption that stops matching anything is cover for nothing while
+  reading as a live carve-out.
+  *Our own separate defect in the same pass, recorded because it is the funnier half: the 501
+  site emitted `domain_control_unsupported` — a **fifth** spelling for the answer §6a.9.2
+  pinned specifically because it had four plausible ones.*
+
+- **A new gate on an argument that gets normalized is a gate on the wrong side of the
+  conversion — and your fixtures are all on the arm where the conversion is a no-op.**
+  ***RATIFIED 2026-09-03*** *— second instance of the §5.2 `target_peer` shape, and both were
+  caught by a sibling's probe rather than by us.* Building row 4's refusal for
+  `system/type:compare`, `_unresolvable` resolved the **raw** `type_a`/`type_b`, while
+  `op_compare` resolves through `_normalize_type_lookup` — which accepts a bare name
+  (`app/user`), a peer-relative path (`system/type/app/user`) and an absolute one. So every
+  prefixed form read as unresolvable and answered `404` for a type that exists.
+  **The two instances are the same defect in two languages of itself:** there, a new
+  authorization check derived `target_peer` *inside* `_resolve_for_dispatch`, after
+  `extract_handler_path` had stripped the peer segment. One parameter name, two
+  representations, and the check standing before the conversion instead of after it.
+  **And in both cases the local test passed because it handed the function a value production
+  never gives it.** Here every fixture in the class used a bare name — *including the teeth
+  control*, which passes `system/type` — so the whole class sat on the arm the normalizer does
+  not change and could not fail. That is the *"two readings that agree everywhere your fixtures
+  live"* law with a **normalizer** as the thing being agreed about, and the direction is not
+  random: **a fixture author already holds one representation, and it is always the short one.**
+  **The check:** when you add a gate to a function, find the conversions between the parameter
+  and the value the *existing* logic reads, and write a row per representation — starting with
+  the one you did not type. `git grep` the parameter name for a `_normalize`/`extract`/`canon`
+  call on the path between the two. Enforcement point:
+  `test_type_operation_error_taxonomy.py::test_a_resolvable_type_in_the_PREFIXED_form_still_answers_200`
+  plus its absent-type mirror, so a fix that stops checking cannot pass the first.
+
+- **Read pass 1 before you read the verdict — and a PASS read from the wrong pass is the same
+  error wearing the opposite costume.** *Candidate, 2026-09-03.* The standing rule says a
+  two-order-of-magnitude shortfall in pass 1's **total** is a harness fact, so read the count
+  before the verdict. This is its mirror: `validate-complete.sh` runs seven passes against
+  differently-built peers, `tail`ing the log showed
+  `PASS connectivity.handler_not_found_on_unregistered_path`, and **pass 1 is a FAIL** — the
+  passing line belonged to a later pass with a different peer configuration. I nearly published
+  *"the cohort's 404 check passes against us"* on it, against a source read that said it could
+  not. **`grep -n` the check name and look at the line numbers, never `tail`** — a multi-pass
+  log has one line per pass per check and no two of them are claims about the same peer.
+  *And the reasoning was right: the measurement that "disagreed" with it was never a
+  measurement of the same thing.*
+
+- **A routed report's claims about our repo are hearsay — seventh axis: our BUILD STATE, and it
+  is the flattering direction.** *Candidate, 2026-09-03.*
+  `PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §1 records *"`entity-core-go` and `entity-core-py`
+  have not built these handlers, searched at the commits above"*, §4 concludes *"rust has the
+  only implementation"*, and the relay asked us whether §2 matches what we **would** build.
+  **We had built all six**, at `system/type`, against `EXTENSION-TYPE` v1.1 §7.1 — so the fold
+  was sized on one build when it has two, and the ask was a hypothetical about a tree that
+  already answers it.
+  Same terminates-in-no-work direction as the §8.3 instance (*a premise saying you already
+  comply*), one axis over: **a premise saying you have nothing to check produces no task at
+  all.** Same one-grep check. And it changes what you can send back — an intention becomes a
+  **measurement**, which is exactly what §4 says the fold needs (*"a derived failure set is a
+  claim about what these operations can fail on — the kind of claim that is checked in a tree,
+  not in a document"*).
+  **What the measurement found:** §2 holds here unprompted (third seat); row 4's `validate` arm
+  was already implemented and derived independently; row 4's `compare`/`compatible` arm
+  diverged, and worse than the row says — an unresolvable type resolved to an **empty field
+  set**, so `compatible("no/such/a","no/such/b")` reported two nonexistent types **compatible**.
+  Fixed rather than held for the fold: the ruling decides whether the refusal is a `404`, and
+  never licensed inventing an empty type. Enforcement point:
+  `tests/integration/test_type_operation_error_taxonomy.py`, whose first class asserts the
+  premise itself against the handler's source.
+
+- **The control that makes a measurement attributable is also what stops it covering the
+  neighbour.** *Candidate, 2026-09-03 — 0.8.2.6 Q1, and it is the row rust asked for on exactly
+  this ground.* CE-1's rows target the responder's **own** namespace deliberately, so §1.4's
+  address gate cannot be the refusing mechanism and the 401 attributes. go's probe carries the
+  same precaution for the same reason. **Consequence: nothing in the cohort drove the foreign
+  arm, and this peer answered `401 authentication_failed` for every pre-establishment address**
+  — which is precisely the *"a peer that fixes CE-1 by relabelling its catch-all passes every
+  own-namespace row and fails only this one"* shape, live in our tree one commit after landing
+  CE-1. **When a test documents a control as protecting attribution, the case it excludes is
+  owed a row of its own**, and the two must be asserted as *different* answers (ours is
+  `test_the_foreign_arm_and_the_local_arm_do_not_collapse`) — a peer answering one code to both
+  inputs has one gate, not two.
+  **And the mutation run found the same asymmetry in the test file itself:** disarming the
+  address gate reddened two rows; removing `uri=` from the **HTTP** call site reddened nothing,
+  because the foreign rows were TCP-only. The refusal was shared and the *coverage* of it was
+  not — the two-hand-rolled-copies shape reappearing on the test side one commit after the code
+  side closed it, on the boundary no cohort probe dials.
+  **Second half, and it is a correction of mine:** the other routed row —
+  *"unauthenticated post-handshake `ping` must be served"* — is **not** a defect here, and the
+  first draft of its test said it was. Driven against a **hello-only** socket it gets `409`,
+  which looked wrong against the summary. The ruling's own argument is *"by the time the
+  connection is established **both peers have authenticated** (§4.6)"*: the subject is a
+  **frame-level** unsigned ping on a **fully established** connection, which we already serve.
+  **Two senses of *unauthenticated*, and the one-line summary is true under both** — the
+  standing *"open the ruling, not the packet that tabulates it"* rule, this time reaching a
+  summary **arch wrote about its own ruling**. Both arms are pinned now, the half-open one with
+  its reasoning and filed as SA-PY-35, because a later reader "completing" Q2 from the summary
+  would serve a keepalive to a peer that has proved nothing.
+
 - **A cross-impl probe that reads one field of a result says nothing about the others — and
   two implementations agreeing is not a majority verdict.** *Candidate, 2026-08-17 — found
   by building the `entity_sdk.revision` wrapper against §4.5.* `checkout` must answer

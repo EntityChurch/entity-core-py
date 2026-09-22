@@ -614,14 +614,28 @@ class TestSetResolverConfigPinDeltaRequiresPinCap:
         a new wire surface"*: an operation name that is **checkable but not
         callable** is unusual enough that a seat could reasonably wire it up, and
         doing so adds an undeclared operation to the registry handler. We satisfy
-        it today by falling through to `404 unknown_operation` — which is
-        **correct by accident**, since nothing stops a later refactor from adding
-        a route beside the two §4.3 operations it sits next to. That is exactly
-        the shape this row exists to catch.
+        it by falling through to the handler's unknown-operation arm — which is
+        still **correct by accident**, since nothing stops a later refactor from
+        adding a route beside the two §4.3 operations it sits next to. That is
+        exactly the shape this row exists to catch.
+
+        **The pair moved at 0.8.2.7 and the clause did not.** The fallthrough
+        answered `404 unknown_operation`; it now answers `501
+        unsupported_operation` per §3.3's 501 row. Worth stating why the old
+        pair was wrong *on its own terms* rather than only by the code sweep:
+        `404` is the row for *no handler is registered at this path*, and the
+        registry handler **is** registered — so the old answer was a true
+        conclusion ("not dispatchable") reached by asserting a false fact. The
+        new pair says the true one. This row's subject is unchanged: R-27
+        clause 2 is about `pin-bindings` not being routed, and it is not.
         """
         r = await _call(peer, "pin-bindings", {})
-        assert r["status"] == 404
-        assert r["result"]["data"]["code"] == "unknown_operation"
+        assert r["status"] == 501, (
+            "R-27 clause 2 holds via the unknown-operation fallthrough, which "
+            "§3.3's 501 row governs — a 404 here would mean the registry "
+            "handler is not registered, which is false"
+        )
+        assert r["result"]["data"]["code"] == "unsupported_operation"
 
     @pytest.mark.asyncio
     async def test_the_delta_survives_an_unmodelled_key_on_a_pin(self, peer):  # noqa: F811

@@ -1897,8 +1897,25 @@ async def _handle_register_request(ctx: HandlerContext, params: dict[str, Any]) 
     if mode not in ISSUER_MODES:
         return _error(500, "policy_invalid", f"unknown issuer-policy mode {mode!r}")
     if mode == "domain-control":
+        # `EXTENSION-REGISTRY` §6a.9.2 `[MUST]`, and it is pinned for exactly
+        # the reason this site kept getting it wrong: *"The registry MUST
+        # answer live registration `501 unsupported_mode` and MUST NOT fall
+        # back to `open`, `manual`, or an unset-style `404` … This is a
+        # cross-impl-observable answer with four plausible codes, so it is
+        # pinned rather than left to converge."*
+        #
+        # We emitted a fifth: `domain_control_unsupported`, minted here. The
+        # status was right and the code was ours. It briefly became
+        # `unsupported_operation` (2026-09-03) on the reading that §6a.9.2
+        # declared no code — it declares this one, two paragraphs from the
+        # `400` sibling above. §9.1's synonym list does not reach it; see
+        # SA-PY-37 and the note at that sibling.
+        #
+        # The two sites answer different statuses on purpose: `400` refuses to
+        # STORE the mode, `501` fails closed when a policy is already stored
+        # (seeded out-of-band or predating the refusal). Same code, two rows.
         return _error(
-            501, "domain_control_unsupported",
+            501, "unsupported_mode",
             "domain-control mode is deferred (§6a.9.1) — registry runs open/allowlist/manual",
         )
 
@@ -2262,6 +2279,23 @@ async def _handle_set_issuer_policy(ctx: HandlerContext, params: dict[str, Any])
         # §6a.9.2 [MUST]: the challenge format is deferred to the web-native
         # domain-proof co-design (§6a.9.1), so refuse to *store* a policy the
         # registry could not enforce rather than accept it and reject later.
+        # `400 unsupported_mode` is PINNED by `EXTENSION-REGISTRY` §6a.9.2
+        # `[MUST]`: *"set-issuer-policy MUST reject mode: "domain-control" with
+        # 400 unsupported_mode until the challenge format lands, rather than
+        # storing a policy it cannot enforce."*
+        #
+        # Core §9.1 (0.8.2.7) lists `unsupported_mode` among the 501 row's
+        # non-conformant synonyms, which reads as forbidding this — it does
+        # not. 0.8.2.7 ruling 2's escape clause is *"a more-specific code is
+        # permitted only where one is DEFINED for the operation in a spec code
+        # set … or the owning domain handler's own table"*, and §6a.9.2 IS that
+        # definition. §9.1's list enumerates spellings seats were **emitting**,
+        # not spellings the corpus leaves undefined. Filed as SA-PY-37.
+        #
+        # This site briefly read `invalid_params` (2026-09-03) on exactly the
+        # §9.1 misreading, and `entity-core-go`'s
+        # `registry_issuer.set_issuer_policy_domain_control_rejected` is what
+        # caught it. Do not "harmonise" it again without re-reading §6a.9.2.
         return _error(
             400, "unsupported_mode",
             "domain-control is deferred (§6a.9.1) until the challenge format lands "
@@ -2529,7 +2563,11 @@ async def registry_handler(
         return await _handle_set_resolver_config(ctx, params)
     if operation == _OP_GET_RESOLVER_CONFIG:
         return await _handle_get_resolver_config(ctx, params)
+    # §3.3's 501 row + §6.2: a handler IS registered here and does not
+    # implement this operation. Both halves were wrong — `404` is the row for
+    # *no handler registered*, and `unknown_operation` is the synonym §3.3
+    # (0.8.2.6) forbids. Mutating either alone still leaves a pair in no row.
     return _error(
-        404, "unknown_operation",
+        501, "unsupported_operation",
         f"system/registry has no operation {operation!r}",
     )

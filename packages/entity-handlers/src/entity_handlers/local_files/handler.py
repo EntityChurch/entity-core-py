@@ -76,9 +76,10 @@ def build_handler(extension: "LocalFilesExtension") -> HandlerFn:
         # watcher lands (inotify on Linux, FSEvents on macOS,
         # ReadDirectoryChangesW on Windows) re-route `watch` here.
 
+        # §3.3's 501 row: the default, never the `unknown_operation` synonym.
         return error_response(
             501,
-            "unknown_operation",
+            "unsupported_operation",
             f"local/files handler does not support operation: {operation}",
         )
 
@@ -100,9 +101,13 @@ async def local_files_handler(  # type: ignore[misc]
     this stub returns a 501 if called without the extension, surfacing
     the misconfiguration loudly instead of silently 404-ing.
     """
+    # `extension_not_bound` was a spelling this seat minted; `EXTENSION-
+    # LOCAL-FILES` declares no error-code table, so under 0.8.2.7 ruling 2
+    # there is no defined more-specific code to escape to and the row's
+    # default is mandatory. The message carries the diagnosis the code used to.
     return error_response(
         501,
-        "extension_not_bound",
+        "unsupported_operation",
         "local/files handler invoked without a LocalFilesExtension; "
         "use LocalFilesExtension.handler() to build a bound dispatcher",
     )

@@ -3268,7 +3268,13 @@ async def _handle_push(
         return _error_response(400, "invalid_params", "remote required")
 
     if ctx._execute_dispatcher is None:
-        return _error_response(501, "not_available", "Remote operations require execute dispatcher")
+        # `not_available` is named in §9.1 (0.8.2.7) as a non-conformant
+        # spelling of the 501 row's default.
+        return _error_response(
+            501,
+            "unsupported_operation",
+            "Remote operations require execute dispatcher",
+        )
 
     # Get local HEAD
     head_entity = _get_entity_at_path(ctx, _head_path(ph))

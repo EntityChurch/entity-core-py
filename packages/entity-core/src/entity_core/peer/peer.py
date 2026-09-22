@@ -164,8 +164,43 @@ class _DispatchDenied:
     message: str
 
 
-def _pre_establishment_refusal(request_id: str) -> "ExecuteResponse":
+def _pre_establishment_refusal(
+    request_id: str, *, uri: str = "", local_peer_id: str = "",
+) -> "ExecuteResponse":
     """The §4.2 third-bullet refusal: a non-connect EXECUTE before the handshake.
+
+    .. rubric:: Address before authentication (0.8.2.6 Q1)
+
+    ``uri``/``local_peer_id`` are read **first**. A pre-establishment EXECUTE
+    naming a **foreign** namespace is `400 invalid_request` — §1.4's
+    canonicalization gate — and never reaches the 401 below. The ruling's own
+    argument is remedy-selection, which is the same argument 0.8.2.4 used to
+    split `connection_sequence_error` out of `invalid_request`: **a 401 says
+    *authenticate and retry*, and for a foreign address that retry is
+    guaranteed to fail at every authentication state**, so the 401 invites a
+    caller into a loop that cannot terminate. `400` says *this frame is not a
+    request to me*, which is true and actionable. §6.5 step 3 calls the address
+    refusal *"a gate, not an ordering preference"* — it is a property of the
+    frame, not of the sender, so authentication state cannot change the answer
+    and evaluating it first can only mislead.
+
+    **This is the row that tells a real CE-1 fix from a rename**, which is why
+    rust asked for it to be written down: a peer that "fixes" CE-1 by
+    relabelling its pre-establishment catch-all to `authentication_failed`
+    passes every own-namespace row and fails only this one. This peer was
+    exactly that shape — the catch-all below answered 401 for every address —
+    and no row here could see it, because CE-1's own rows deliberately target
+    the responder's **own** namespace so their measurement attributes. *The
+    control that makes a measurement attributable is also what stops it
+    covering the neighbour.*
+
+    Both parameters are keyword-only and default to empty, which is a
+    deliberate narrow exception to this file's own *"a default argument is a
+    wire decision with no call site to review it"* rule: an absent ``uri``
+    means *the caller could not determine an address*, and the only safe answer
+    to that is the 401 — a `400 invalid_request` would claim the address was
+    foreign, which is a fact we do not have. The two live call sites both pass
+    them.
 
     **401 `authentication_failed`**, and the status is the half that carries the
     meaning. §4.2 bullet 3 routes this input to §5.2a: *"a missing/unverifiable
@@ -192,6 +227,21 @@ def _pre_establishment_refusal(request_id: str) -> "ExecuteResponse":
     two boundaries in this same file; the fix there was one shared set, and this
     is the same fix applied before the divergence rather than after it.
     """
+    if uri and local_peer_id:
+        from entity_core.capability.checking import extract_peer
+
+        target_peer = extract_peer(uri, local_peer_id)
+        if target_peer != local_peer_id:
+            return ExecuteResponse.bad_request(
+                request_id=request_id,
+                message=(
+                    f"EXECUTE targets peer {target_peer}, not this peer "
+                    f"{local_peer_id} (§1.4 inbound dispatch; address is "
+                    "evaluated before authentication per 0.8.2.6)"
+                ),
+                code="invalid_request",
+            )
+
     return ExecuteResponse.unauthorized(
         request_id=request_id,
         message=(
@@ -1721,7 +1771,11 @@ class Peer:
             # probe can reach this boundary (they all dial TCP), which is
             # exactly why it shares the TCP one's refusal rather than its own.
             request_id = data.get("request_id", "")
-            response = _pre_establishment_refusal(request_id)
+            response = _pre_establishment_refusal(
+                request_id,
+                uri=data.get("uri", ""),
+                local_peer_id=self.peer_id,
+            )
             await send_envelope(writer, Envelope(root=response.to_entity()))
             return
 
@@ -2348,9 +2402,14 @@ class Peer:
                             # three-way on the wire by `entity-core-go` and
                             # ruled at 0.8.2.5; see
                             # `_pre_establishment_refusal` for why the status
-                            # is the half that moves.
+                            # is the half that moves — and for why the ADDRESS
+                            # is read first (0.8.2.6 Q1).
                             request_id = data.get("request_id", "")
-                            response = _pre_establishment_refusal(request_id)
+                            response = _pre_establishment_refusal(
+                                request_id,
+                                uri=uri,
+                                local_peer_id=self.peer_id,
+                            )
                             await send_envelope(
                                 writer, Envelope(root=response.to_entity())
                             )
@@ -4059,8 +4118,15 @@ class Peer:
         )
         if isinstance(resolved, _DispatchDenied):
             if resolved.status == 404:
-                logger.debug("[dispatch] -> response status=404 code=not_found")
-                response = ExecuteResponse.not_found(
+                # §3.3 / §6.2's 404 row: no handler is registered at the
+                # resolved path, on a path targeting the local peer. This is
+                # the ONE call site of the row in this tree; the three
+                # `ExecuteResponse.not_found` sites in `_handle_get` are
+                # entity-level and stay as they are.
+                logger.debug(
+                    "[dispatch] -> response status=404 code=handler_not_found"
+                )
+                response = ExecuteResponse.handler_not_found(
                     request_id=request_id, message=resolved.message,
                 )
             else:

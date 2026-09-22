@@ -350,8 +350,46 @@ class ExecuteResponse:
 
     @classmethod
     def not_found(cls, request_id: str, message: str = "Not found") -> ExecuteResponse:
-        """Create a 404 not found response."""
+        """A 404 raised **inside** a registered handler — the entity is absent.
+
+        §3.3's 404 row (0.8.2.7) draws the line explicitly: this is *"a domain
+        outcome carrying the domain's own code, not this row"*, and it stays
+        `not_found`. The row's default `handler_not_found` belongs to the
+        dispatch boundary and is :meth:`handler_not_found` below.
+        """
         return cls(request_id=request_id, status=Uint(404), result={"code": "not_found", "message": message})
+
+    @classmethod
+    def handler_not_found(
+        cls, request_id: str, message: str = "No handler registered"
+    ) -> ExecuteResponse:
+        """The §3.3 / §6.2 404 row: **no handler is registered** at the path.
+
+        Named for its **input**, not for its status, and that is the whole
+        point of it being a second constructor rather than a `code=` parameter
+        on :meth:`not_found`. Two lessons converge here:
+
+        * *A default argument is a wire decision with no call site to review
+          it* — `bad_request` and CE-1's `forbidden()` both hid a spec value
+          behind a construct the call site does not write. A `code=` default on
+          `not_found` would have rebuilt that hiding place at the third site in
+          three weeks.
+        * *A helper named for a status silently enrolls every caller in a
+          class.* `not_found` had four call sites: **one** is this row and
+          three are entity-level domain 404s. They are indistinguishable at a
+          status-named factory and self-evident at an input-named one.
+
+        `handler_not_found` was already normative in five homes before §3.3
+        tabulated it (§6.2 twice, §5.2a's MUST NOT, §6.7 RT-8, §9.1), and
+        `entity-core-rust` — which holds two tests pinning the string —
+        `entity-core-keystone`'s 46 peers and `entity-browser-rust` all emit
+        it. py emitted `not_found` and was, with go, the divergence.
+        """
+        return cls(
+            request_id=request_id,
+            status=Uint(404),
+            result={"code": "handler_not_found", "message": message},
+        )
 
     @classmethod
     def forbidden(cls, request_id: str, message: str = "Forbidden") -> ExecuteResponse:

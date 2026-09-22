@@ -392,11 +392,25 @@ class SignalingNodeExtension(Extension):
             return self._handle_collect(data, ctx)
         if operation == OP_ADVERTISE:
             return self._handle_advertise()
-        # `reflect` lands here too: it is the UNWRAPPED listener's verb (§9.3
-        # is plain STUN), so asking a wrapped node for it is an ordinary
-        # unknown operation, not a 501-shaped "not implemented yet".
+        # `reflect` lands here too, and this used to answer `400
+        # invalid_request` on the argument that reflect is the UNWRAPPED
+        # listener's verb (§9.3 is plain STUN), so asking a *wrapped* node for
+        # it is "an ordinary unknown operation, not a 501-shaped not-
+        # implemented-yet".
+        #
+        # That distinction is not one the corpus draws. §3.3's 501 row is
+        # defined by an **input** — a handler IS registered at the path and
+        # does not implement the named operation — not by whether the
+        # implementer intends to add it later; §6.2 (0.8.2.6) says so
+        # explicitly and names emitting a 400 here as the defect. Arch ruled
+        # the identical distinction out at `entity-core-keystone` (`pd`'s
+        # "unauthored pattern → not_implemented" vs "op outside the ladder →
+        # unsupported_operation").
+        #
+        # §4.3's wrapped-surface code list (v1.2) enumerates `offer`'s errors
+        # and says nothing about an unknown operation, so the core row governs.
         return error_response(
-            400, CODE_INVALID_REQUEST,
+            501, "unsupported_operation",
             f"unknown signaling operation: {operation}",
         )
 

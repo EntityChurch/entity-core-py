@@ -42,6 +42,7 @@ from entity_handlers.type_analysis import (
     COMPATIBILITY_REPORT_TYPE,
     RECONCILE_RESULT_TYPE,
     TYPE_ENTITY_TYPE,
+    _normalize_type_lookup,
     op_adopt,
     op_compare,
     op_compatible,
@@ -132,6 +133,57 @@ async def type_handler(
 # ---------------------------------------------------------------------------
 
 
+def _unresolvable(
+    ctx: "HandlerContext", *names: str,
+) -> dict[str, Any] | None:
+    """`404 not_found` when any named type does not resolve, else None.
+
+    ``PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY`` row 4, on the criterion arch
+    adopted from ``entity-core-rust`` and which replaced its own flat `404`:
+    ***can the declared result type carry the outcome?*** On ``validate`` it
+    can — ``validate-result.violations`` expresses *"I could not resolve that
+    type"*, so :func:`_op_validate` answers `200`, `valid: false` and always
+    has. On ``compare``/``compatible`` the declared ``compatibility-report``
+    has nowhere to put it, so an unresolved path is a lookup miss and nothing
+    else.
+
+    **The half that was not waiting on the ruling.** Before this, an
+    unresolvable path fell through to ``_effective_fields(None) -> {}`` and
+    entered the diff as *a type with no fields*. The status was the visible
+    disagreement; the invisible one is that ``compatible`` then reported two
+    **nonexistent** types as compatible, because ``missing_required_a`` and
+    ``missing_required_b`` are both empty and nothing is incompatible. A caller
+    doing schema exploration got ``compatible: true`` for a typo. Row 4 decides
+    whether the refusal is a `404`; it never licensed inventing an empty type,
+    so that part is a defect under either reading.
+    """
+    # `_normalize_type_lookup` FIRST, and this line is the whole bug the first
+    # version of this helper shipped. `op_compare`/`op_compatible` resolve
+    # through it — a caller may pass a bare name (`app/user`), a peer-relative
+    # tree path (`system/type/app/user`) or an absolute one — and this gate
+    # resolved the **raw** argument, so every prefixed form read as
+    # unresolvable and answered 404. `entity-core-go`'s `type.op_compare_
+    # roundtrip` / `op_compatible_roundtrip` caught it; they pass the prefixed
+    # form, which is the form a probe naturally writes and our fixtures did not.
+    #
+    # This is the standing *"verify the value the check reads is the value at
+    # THAT point in the pipeline, not the one the caller had"* rule — the same
+    # shape as the §5.2 `target_peer` fix, where a new check read a path
+    # `extract_handler_path` had already stripped. One parameter name, two
+    # representations, and a gate on the wrong side of the conversion.
+    missing = [
+        n for n in names
+        if _resolve_type(_normalize_type_lookup(n), ctx) is None
+    ]
+    if not missing:
+        return None
+    return _error(
+        404,
+        "not_found",
+        "type not present in the type system: " + ", ".join(sorted(missing)),
+    )
+
+
 def _op_compare_dispatch(
     params: dict[str, Any], ctx: "HandlerContext",
 ) -> dict[str, Any]:
@@ -144,6 +196,9 @@ def _op_compare_dispatch(
             "invalid_request",
             "system/type:compare requires `type_a` and `type_b` paths",
         )
+    missing = _unresolvable(ctx, a, b)
+    if missing is not None:
+        return missing
     data = op_compare(a, b, resolve=lambda n: _resolve_type(n, ctx))
     return {"status": 200, "result": {"type": COMPARE_RESULT_TYPE, "data": data}}
 
@@ -167,6 +222,9 @@ def _op_compatible_dispatch(
             "invalid_request",
             "system/type:compatible `direction` must be forward/backward/bidirectional",
         )
+    missing = _unresolvable(ctx, a, b)
+    if missing is not None:
+        return missing
     data = op_compatible(a, b, direction, resolve=lambda n: _resolve_type(n, ctx))
     return {
         "status": 200,

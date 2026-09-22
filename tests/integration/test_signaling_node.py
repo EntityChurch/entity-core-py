@@ -355,19 +355,37 @@ class TestWrappedSurface:
 
         asyncio.run(run())
 
-    def test_unknown_operation_is_invalid_request_not_501(self):
+    def test_unknown_operation_is_501_unsupported_operation(self):
+        """§3.3's 501 row reaches the signaling node like any other handler.
+
+        **This row asserted `400 invalid_request` until 0.8.2.7, and it is the
+        reason no census in the cohort could see the defect.** Arch censused
+        the 501 *slot* — every code emitted at status 501 — across six trees.
+        A slot is keyed by status, so a site that gets the **status** wrong is
+        structurally invisible to it, and this one was doubly hidden: the code
+        it carried (`invalid_request`) is the correct default for the status it
+        carried, so the pair reads conformant at every glance short of asking
+        what the input was.
+
+        The argument the old row encoded was that `reflect` is the *unwrapped*
+        listener's verb (§1.4), so a wrapped node answering "not implemented"
+        would imply a surface where it could be. §3.3's 501 row does not turn
+        on that: its input is *a handler is registered at the path and does not
+        implement the named operation*, and §6.2 (0.8.2.6) says the sentence is
+        general. Arch ruled the same intent-flavoured distinction out at
+        `entity-core-keystone` (`pd`: "unauthored pattern" vs "op outside the
+        ladder"), which is the corroboration, not the argument.
+        """
         async def run():
             node_kp, client_kp = Keypair.generate(), Keypair.generate()
             node = _build_node(node_kp)
             await node.start("127.0.0.1", 0)
             client = _build_client(client_kp, node, node_kp, _bound_port(node))
             try:
-                # `reflect` is the UNWRAPPED listener's verb (§9.3 is plain
-                # STUN), so asking a wrapped node for it is an ordinary
-                # unknown operation, not "not implemented yet".
                 result = await _sig(client, node, "reflect", empty_params())
-                assert result.status == 400
-                assert result.result["data"]["code"] == "invalid_request"
+                assert (result.status, result.result["data"]["code"]) == (
+                    501, "unsupported_operation",
+                )
             finally:
                 await client.stop()
                 await node.stop()

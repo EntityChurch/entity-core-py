@@ -135,8 +135,14 @@ class DispatchOutboundHandler:
             )
         # The §6.13(b) seam must be wired for any reentry to be possible.
         if getattr(ctx, "_execute_dispatcher", None) is None:
+            # §3.3's 500 row default (0.8.2.6). `internal` was a bare
+            # abbreviation in no spec code set; the row names `internal_error`
+            # and this site carries no more-specific *defined* code, so the
+            # default is mandatory. This is py's only bare-`internal` site —
+            # the ~16 specific 500 spellings elsewhere are **held** pending
+            # arch's per-extension error-code tables (OP-3), not swept.
             return _error(
-                500, "internal",
+                500, "internal_error",
                 "dispatcher did not wire the outbound seam (§6.13(b))",
             )
 
