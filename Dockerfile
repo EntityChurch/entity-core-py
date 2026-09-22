@@ -35,7 +35,7 @@ COPY packages/ packages/
 # --no-editable: install workspace packages as real wheels into the venv so
 # the runtime stage doesn't need /app/packages on disk (uv's default is
 # editable installs that .pth-link back to the source tree).
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=entity-core-py-uv,target=/root/.cache/uv \
     uv sync --frozen --no-dev --all-packages --no-editable
 
 # ---------- runtime ----------
@@ -84,7 +84,7 @@ COPY test-vectors/ test-vectors/
 # so the canonical entry point was red and the convenience one was not.
 COPY scripts/ scripts/
 
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=entity-core-py-uv,target=/root/.cache/uv \
     uv sync --frozen
 
 WORKDIR /app

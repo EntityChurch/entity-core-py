@@ -545,6 +545,88 @@ fails the gates rather than slipping past them.
   predicted row — because the prediction is the finding, and here it was right for the first time in
   four attempts across this file's history.
 
+- **A detector is only mutation-verified on the peer you mutated — on every other seat it is an
+  unarmed claim.** ***RATIFIED 2026-08-30*** *— the "a control-only fixture is not coverage" law with
+  a **cross-impl oracle** as the subject, and the first instance where the blind gate was a
+  **sibling's** and we were the seat it read as green.* `entity-core-go`'s
+  `auto_version.burst_convergence_no_capture_loss` is the wire detector for the last-burst-write
+  loss. It is impl-agnostic **by construction** — its oracle is REVISION §6.1 `status.pending`, a
+  spec field — and go verified its teeth honestly, by reverting the go fix and watching it go RED.
+  It then reported **py PASS** and **rust FAIL**. Measured here: **the check cannot see a capture
+  loss on a py peer at all.** With auto-version capture stopped outright by mutation, py still
+  reported **16/16 PASS**; with the `pending` fix below, the identical mutation FAILs at the 8s
+  settle window. Six clean runs PASS either way, so nothing about the green was suspicious.
+  **The mechanism, and it is the reusable half.** `pending` was computed under `if local_hash:` —
+  a guard that reads as a null-check and is a **ruling on the absent case**, so 0 meant two opposite
+  things: *fully captured* and *captured nothing*. The detector bursts at a **freshly generated
+  random prefix**, so a peer that captures nothing for that prefix never mints a head, answers 0,
+  and passes the check whose entire purpose is that loss. This is the same shape as the
+  `min(binding.ttl, local_max)` entry — a binary operator with no arm for the absent case — arriving
+  as an **oracle** rather than an authorization control, and our fixtures sat on the arm with an
+  answer exactly as they did there: `TestStatus` covered *(empty tree, no head)* → 0 and
+  *(entities, head)* → >0, and never *(entities, no head)*, which is the only combination the guard
+  decides.
+  **`entity-core-go` carries the identical guard** (`if !headVal.IsZero()`, `ext/revision/status.go`)
+  — so this is a blind spot in the **shared** oracle, not a py-vs-go divergence, and go's own teeth
+  check could not reveal it because the go bug leaves a head behind. **A verified-RED mutation on
+  one implementation licenses a claim about that implementation and nothing else**; the oracle being
+  a spec field makes the check *portable*, which is not the same as *armed*.
+  **What this does NOT license, stated because it is the tempting over-read:** py's PASS still rules
+  out the *partial* shape (head exists, a later write uncaptured) — that arm was armed all along.
+  The unmeasured half was total capture failure. **And it reframes rust's FAIL rather than excusing
+  it:** a peer can only FAIL this check by having a head *and* uncaptured paths, so rust's
+  `pending=3` is not reachable by the blind path and their finding stands as measured.
+  **The checks, in the order they are cheap:**
+  1. **When a sibling's gate reports you green, mutate your own peer until it goes red before you
+     accept the row.** One mutation, one rebuild. A cross-impl check is a claim about your peer that
+     someone else armed against theirs.
+  2. **When a check's oracle is a spec-defined count, ask what that count answers in the state where
+     the subject is absent** — and if the answer collides with the healthy value, the check is blind
+     in exactly the state it exists to detect.
+  Enforcement point: `tests/unit/test_revision_status_pending_oracle.py` —
+  `test_live_paths_with_no_head_are_uncaptured_but_pending_reports_zero` (the arm nothing drove),
+  the empty-tree control that keeps it a count rather than a flag, and the head-arm teeth row.
+  *The teeth row's first draft asserted `pending == 0` right after `commit` and was wrong (measured
+  1: commit writes the head pointer into the live tree, which the new version does not contain) —
+  recorded because `test_status_after_commit` had already skipped that count for the same reason,
+  and the prediction being wrong is the finding.*
+
+- **The canonical build trusts a host cache it does not own, and a partially-reaped cache entry
+  fails as a bug in an unrelated package.** *Candidate, 2026-08-30 — cost: `make build` red on this
+  box, and a sibling seat reporting our repo as unbuildable.* `entity-core-go` could not measure a
+  python peer at all and routed it as *"python's `uv.lock` / build backend needs fixing"*. **It was
+  neither.** The identical `uv sync --frozen --no-dev --all-packages --no-editable` succeeds in a
+  clean container with no cache mount — that control is what proves the manifests were never the
+  problem. The failure is that buildah puts `--mount=type=cache` under **`/var/tmp`**, which Fedora
+  reaps at 30 days (`q /var/tmp 1777 root root 30d`, `/usr/lib/tmpfiles.d/tmp.conf`), and the reap is
+  **partial**: it removed `trove_classifiers/__init__.py` (43 577 bytes, still listed in the entry's
+  own `RECORD`) while leaving the package directory, `py.typed` and the whole `dist-info` in place.
+  uv re-uses the archive entry without validating it, and **an empty package directory imports
+  cleanly as a PEP 420 namespace package** — so hatchling got a module with zero attributes and died
+  on `AttributeError: module 'trove_classifiers' has no attribute 'classifiers'`, a message that
+  names a third-party package and points nowhere near the cause. Measured: 99 of 1232 archive
+  entries were damaged, every one on the far side of the 30-day line and every intact one inside it.
+  **Two things to carry, and the second is the one with teeth:**
+  1. **A dependency floats unless the lockfile contains it.** `uv.lock` has **zero** occurrences of
+     `hatchling` or `trove-classifiers`: `--frozen` freezes *runtime* deps, while the build backend
+     is resolved fresh in an isolated build env. The Dockerfile already documents this class getting
+     us once (uv 0.9.30, hatchling's build venv missing `packaging`) and the fix then was to pin
+     **uv** — which addressed that instance's proximate cause and left the floating surface open.
+     Second instance, different package, same surface.
+  2. **A shared cache is shared blast radius.** The mount was keyed only by target path, so every
+     podman build by this user shared one cache and inherited one reaping. The mount now carries an
+     explicit `id=entity-core-py-uv`, which is the fix that made `make build` green — *and it is
+     isolation, not immunity: the new namespace is still under `/var/tmp` and will age out the same
+     way.* **The durable check is the diagnostic one:** when a container build fails inside a package
+     you do not depend on directly, re-run the same command in a clean container with **no cache
+     mount** before believing anything about your manifests. That control costs one command and
+     inverts the diagnosis.
+  **And the routed claim about us was wrong in the flattering-to-nobody direction** — the standing
+  *"a routed report's claims about our repo are hearsay"* rule, with our **build** as the subject
+  rather than our architecture, coverage, version, or filing record. Their measurement (*the peer
+  does not build here*) was correct and reproducible; their **attribution** was not, and it named a
+  file that is fine.
+
 - **A gate that skips when its dependency is absent has never told you it passes.** *Candidate,
   2026-08-21 — found incidentally, and it had been red since the initial public release.*
   `tests/integration/test_cross_impl_publish_fetch.py` is the headline Go-publishes→Python-consumes
@@ -560,10 +642,21 @@ fails the gates rather than slipping past them.
   the *conditional* skip, which is the one that looks principled. **The check:** for every
   `skipif` on an external dependency, ask *when did this last actually run?* — and if the answer is
   "unknown", run it once on a host that has the dependency before trusting anything it guards.
-  **Not fixed here, deliberately.** The correct pin is not derivable from either tree (neither hash
-  appears in any `.md` in `entity-core-go`), and **updating a pin to whatever the code currently
-  emits is how a pin stops meaning anything** — that would convert a loud placeholder into a silent
-  tautology. Routed to core-go with the measured value instead.
+  **Was deliberately left unfixed at filing:** the correct pin is not derivable from either tree
+  (neither hash appears in any `.md` in `entity-core-go`), and **updating a pin to whatever the code
+  currently emits is how a pin stops meaning anything** — that would convert a loud placeholder into
+  a silent tautology. Routed to core-go with the measured value instead.
+  ***CLOSED at `c27b07b`.*** `PINNED_ROOT_HASH` is now `af1c9f6b…cdd9ab` and the row **passes on a
+  host that has the Go toolchain and the sibling checkout** — re-measured 2026-08-30, 2 passed. The
+  resolution is the part worth keeping: the pin was *not* set by copying what our code emits. go's
+  own consumer (`cmd/fetch-published-fixture/main.go`) verifies the signature and then only
+  **prints** the root, so there was no upstream table row to mirror and never will be — which is
+  why the slot was stubbed in the first place. Ours is the stricter of the two checks and the only
+  one that would notice Go's tree-root computation moving under a fixture whose content did not
+  change, so the pin is load-bearing *here and nowhere else in the cohort*, and the call-site
+  comment says so. **A pin with no upstream mirror is not thereby a tautology — it is a pin whose
+  justification has to live at the call site**, and that is the distinction the original entry
+  could not yet draw.
 
 - **A ruling routed to you carries an assumed baseline, and the baseline is the claim to check
   first.** ***RATIFIED 2026-08-21*** *— second instance of "a routed report's claims about our repo

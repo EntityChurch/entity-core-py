@@ -1627,9 +1627,28 @@ async def _handle_status(
     full_conflicts_prefix = tree.normalize_uri(conflicts_prefix)
     conflict_count = len(list(tree.list_prefix(full_conflicts_prefix)))
 
-    # Count pending changes (compare HEAD trie root against current tree)
+    # Count pending changes (compare HEAD trie root against current tree).
+    #
+    # The no-head arm is a ruling, not type hygiene. §6.1 defines `pending` as
+    # the count of live-tree paths the head version has not captured; with no
+    # head, *every* live path under the prefix is uncaptured, so the answer is
+    # their count and not 0. Guarding the whole computation on `if local_hash:`
+    # makes 0 mean two opposite things — "fully captured" and "captured
+    # nothing" — which silently disarms any consumer using `pending` as a
+    # capture oracle. Measured: entity-core-go's wire detector
+    # `auto_version.burst_convergence_no_capture_loss` bursts writes at a
+    # freshly-generated random prefix, so a peer that captures NOTHING for that
+    # prefix never mints a head, answers pending=0, and PASSES the check whose
+    # entire purpose is to catch that loss. Verified against this peer on
+    # 2026-08-30 by mutation: with capture stopped outright, the detector still
+    # reported 16/16 PASS.
     pending = 0
-    if local_hash:
+    if not local_hash:
+        # Filtered, for the same reason the head arm filters: the count is
+        # about paths a version could have captured, so excluded paths are not
+        # pending against a version that would never have contained them.
+        pending = len(_get_snapshot_bindings(ctx, prefix, _get_config(ctx, ph)))
+    else:
         head_bindings = _get_version_bindings(ctx, local_hash)
         if head_bindings is not None:
             # Filtered, because this count is compared against a version's
