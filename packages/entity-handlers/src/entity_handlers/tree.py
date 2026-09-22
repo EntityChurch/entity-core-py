@@ -43,6 +43,58 @@ logger = logging.getLogger(__name__)
 TREE_HANDLER_PATTERN = "system/tree"
 
 
+def caller_can_read(ctx: HandlerContext, request_prefix: str, relative: str) -> bool:
+    """§6.3's per-entry read check — *one* derivation, three bulk readers.
+
+    .. rubric:: The rule is CORE and unconditional
+
+        *"**Listing filter.** When the tree handler returns a listing, each
+        entry MUST be individually checked against the request's capability
+        using ``check_path_permission``. Entries for which
+        ``check_path_permission`` returns DENY MUST be omitted from the
+        listing. The listing's ``count`` field MUST reflect the filtered entry
+        count… Pagination applies to the filtered result set."*
+        — `ENTITY-CORE-PROTOCOL` §6.3
+
+    `entity-core-go` and `entity-core-rust` both close this citing
+    `EXTENSION-TREE` §8.2 (View Trees). **That citation does not reach this
+    peer**: §12.2 files view trees under SHOULD and this tree implements none,
+    so read that way the obligation is out of scope — which is exactly the
+    reading a seat without view trees arrives at, and exactly the seat whose
+    listings are unfiltered. §6.3 is an obligation on *the tree handler*.
+
+    .. rubric:: Why a named function rather than an inline check per operation
+
+    The three bulk readers derive their subjects independently — a listing
+    expands child names, ``snapshot`` and ``extract`` walk ``list_prefix`` —
+    and the prefix check they each already run authorizes **the prefix**, not
+    the entries. `F68`'s law: where a gate narrows a set and a consumer
+    re-widens it, the enforcement has to be one derivation, not two agreeing
+    ones. A fourth bulk reader added later inherits this by calling it.
+
+    .. rubric:: The authority is the CALLER's — SA-PY-55
+
+    §6.3's paragraph and §6.7's refusal of a read carve-out both say *"the
+    request's capability"*. §6.8's authority table names *"a listing entry"*
+    among the **handler-derived** paths, whose authority is the handler's own
+    grant — under which this filter would remove nothing, the tree handler's
+    grant covering what it serves. Routed rather than settled; the reading is
+    pinned by a test so it is a decision and not an accident.
+
+    Args:
+        ctx: The handler context (its ``caller_capability`` is the authority).
+        request_prefix: The prefix **as the caller spelled it**, so the entry
+            path canonicalizes in the caller's frame. Deriving it from the
+            normalized absolute prefix instead would hand
+            ``check_path_permission`` a value the caller never wrote.
+        relative: The entry's path relative to that prefix.
+
+    Returns:
+        True if the caller's capability grants ``get`` on the entry.
+    """
+    return ctx.check_caller_permission("get", request_prefix + relative)
+
+
 async def tree_handler(
     path: str,
     operation: str,
@@ -270,6 +322,16 @@ def _handle_tree_listing(
             info["hash"] = None
             if not info["has_children"]:
                 del entries[child_name]
+
+    # §6.3's listing filter — every entry checked individually against the
+    # CALLER's capability, and the check runs BEFORE `count` is taken and
+    # before the page is cut. Both of those orderings are their own MUST:
+    # a `count` over the unfiltered set leaks the hidden entries' existence
+    # once their names are gone, and paginating first hands the caller a
+    # short page whose missing rows are exactly the hidden ones.
+    for child_name in list(entries.keys()):
+        if not caller_can_read(ctx, path, child_name):
+            del entries[child_name]
 
     # Apply offset and limit
     sorted_entries = sorted(entries.items())
@@ -581,6 +643,17 @@ async def _handle_snapshot(
         if h:
             # Extract relative path
             relative = uri[len(full_prefix):]
+            # §6.3's per-entry filter, and `EXTENSION-TREE` §8.4's row
+            # *"snapshot — captures only bindings visible through the
+            # filter."* This is the row neither sibling closed, and it is the
+            # one that subsumes the other two: §11 exempts `diff` from path
+            # checks outright, so a root committing to an excluded binding
+            # makes the filtered listing and the filtered extract both
+            # reachable around via an operation that needs no authority. The
+            # trie nodes also ride out in `envelope_included` below, so an
+            # unfiltered root is a *delivered* key, not merely a committed one.
+            if not caller_can_read(ctx, prefix, relative):
+                continue
             bindings[relative] = h
 
     # Build content-addressed trie per EXTENSION-TREE v3.2 §3
@@ -1046,6 +1119,13 @@ async def _handle_extract(
             invalid = _unresolvable_tree_path(path, ctx.local_peer_id)
             if invalid is not None:
                 return invalid
+            # §6.3's per-entry filter. An excluded path is treated as ABSENT
+            # rather than refused: §6.1's table already makes a well-formed
+            # path that binds nothing a silent omission, and answering 403
+            # here would tell the caller that a path it may not read exists —
+            # the disclosure the filter is for, arriving as a status code.
+            if not caller_can_read(ctx, prefix, path):
+                continue
             uri = full_prefix + path
             h = tree.get(uri)
             if h:
@@ -1056,6 +1136,8 @@ async def _handle_extract(
             h = tree.get(uri)
             if h:
                 relative = uri[len(full_prefix):]
+                if not caller_can_read(ctx, prefix, relative):
+                    continue
                 bindings[relative] = h
 
     from entity_core.storage.trie import build_trie

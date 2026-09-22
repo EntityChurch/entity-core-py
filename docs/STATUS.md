@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-11 · public: v0.8.0 (master)_
+_Updated: 2026-09-12 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -49,25 +49,61 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-> ⚠ **0.8.2.21 landed after the number below was taken, and it moved the authorization path
-> at five sites. The conformance number is therefore STALE by construction and a re-run is
-> OWED** — see `docs/status/ROUTING-2026-09-11-c-…`. It was not taken because the pre-flight
-> found another session's `validate-complete.sh` mid-run on this box's fixed ports, where a
-> concurrent run makes *neither* result citable. What **is** measured on the current tree is
-> the canonical containerized suite: **`make test` → 4579 passed, 58 skipped, 0 failed.**
+> **The owed validator run was taken.** `validate-complete.sh python`, **all seven passes exit
+> 0**, on ports below the ephemeral floor — see the note under the number. The two-session-old
+> debt from `ROUTING-2026-09-11-c` is discharged and the `0 F` covers `0.8.2.21`'s five
+> authorization-path sites plus this session's three.
 >
-> **Absorbed at `0.8.2.21`, all four security-relevant and all four measured live first:**
-> the fail-**OPEN** `exclude` (`H1`) at **four** sites — one more than the ruling enumerates,
-> the extra being §6.3's handler-level check, which `0.8.2.20` had promoted to *the*
-> enforcement; the authoring refusal at mint / delegate / **chain-verify**; `H3`'s
-> boundary path validation, where `validate_path_chars` had **one** call site in the repo and
-> `tree:merge` was binding a control character as a tree key under a `200`; and §5.2's
-> **pattern arm**, which was absent outright — a grant `exclude` was neutralized by
-> re-spelling the target as a pattern. `H2` was already correct (arch ruled it in our shape,
-> SA-PY-50), `H4` is not ours, `H5` landed at `d7d6a9b`. Filed: **SA-PY-52 / -53 / -54**.
+> **This session (2026-09-12) swept the `H1` exclude matrix past the five coordinates
+> `entity-core-go` reports closed**, after their correction that *"nothing owed back"* had been
+> a whole-matrix claim made from one seat's view. Their five confirmed against this tree; three
+> findings past them, two measured in **go's and rust's** trees:
+>
+> - **§6.3's listing filter — three MUSTs, none of them done here.** Each entry checked
+>   individually, `count` over the filtered set, pagination **after** the filter. Measured: a
+>   grant excluding one child listed it anyway, `count` 2, and `limit: 1` returned **the
+>   excluded child**. `extract` bundled its entity verbatim. Both siblings closed this citing
+>   `EXTENSION-TREE` §8.2 — which §12.2 scopes to peers that **implement view trees**, and this
+>   peer implements none, so through that citation the item reads *out of scope*. The
+>   unconditional statement is in the core protocol. Ratcheted as the tenth axis of the
+>   *"a routed report's claims about our repo are hearsay"* law and the first where the routed
+>   claim is entirely **true**.
+> - **`snapshot` is the unswept row of §8.4, and it subsumes the two that were swept.** §11
+>   exempts `diff` from path checks outright; that exemption is sound only while a snapshot
+>   cannot commit to bindings the caller may not see. Driven: snapshot the prefix, diff against
+>   an empty one, read the excluded key **and its content hash** out of `added`. Unfiltered in
+>   **both** siblings, read first-hand; filtered here now.
+> - **`check_path_permission` had no PATTERN arm, and `EXTENSION-SUBSCRIPTION` §2.3 routes a
+>   pattern into it by name.** A grant reading *"everything under data except `data/secret`"*
+>   was **accepted** for an `include_payload` subscription on `data/*`, and delivery re-checks
+>   nothing — so the excluded entity's **body** is pushed on every write to it. A push channel
+>   carrying bodies, which is worse than the read leak above it. No seat has the arm at this
+>   site; the cohort's vector drives the *neither* arm and cannot see it.
+>
+> Also: a third `G-3`-shaped site (the advertisement filter read `include` and dropped
+> `exclude`) — **unreachable here** and landed with a reachability row rather than a behavioural
+> one. Verified already-closed: `merge`'s per-path `put`, delegation exclude inheritance on all
+> four axes, and `query`, which was the only bulk reader that already had the rule.
+> Filed: **SA-PY-55 / -56**. Routed: `ROUTING-2026-09-12-a`.
 
-**The citable number is `1644 · 1628 P · 15 W · 0 F · 1 S @ core-go `c3eaa82`` (2026-09-11)** —
-all seven `validate-complete.sh` passes exit 0 on `80a54e7`. The `+6` over the previous sample
+**The citable number is `1644 · 1627 P · 16 W · 0 F · 1 S @ core-go `b8ee9e5`` (2026-09-12)** —
+all seven `validate-complete.sh` passes exit 0, read from each pass's own summary. **The `0 F`
+is the load-bearing part**: this session moved the handler-level authorization check and all
+three tree bulk readers, and a change to the authorization path is a change *no local run at
+this seat can measure*. Against the prior sample the delta is one check `P → W`, and it is
+`concurrency.t1_1_concurrent_demux` — the documented timing warn that flips run to run. Total
+unchanged at 1644, so it is a warn flip, not a check leaving the set.
+
+⚠ **Pick harness ports below 32768.** The first attempt at this run died at pass 2 with
+`[Errno 98]` on `NS_PORT`, after a clean pre-flight *and* the script's own probe — the port was
+inside `/proc/sys/net/ipv4/ip_local_port_range` (`32768 60999`) and the suite's own
+`t2_1_sustained_load` traffic took it as an outbound source port mid-run. It presents as *"the
+namespace-scoped peer will not come up"*, one pass after an authorization change. Sixth instance
+of the fixed-port class and the first that is **self-inflicted and invisible to a pre-flight**;
+routed to go as a one-line harness guard.
+
+*(Prior sample: `1644 · 1628 P · 15 W · 0 F · 1 S @ core-go `c3eaa82`` (2026-09-11) — all
+seven passes exit 0 on `80a54e7`.)* The `+6` recorded at that sample over the one before it
 is go's new **`resource_effective`** category (`CORE-RESOURCE-EFFECTIVE-1`, six arms), and it
 fires **6/6 against a py peer on its first drive**, with no harness change at either end —
 **two seats of the three-way on the resources dimension, which had never been driven

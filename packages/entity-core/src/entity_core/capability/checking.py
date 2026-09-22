@@ -963,6 +963,35 @@ def check_path_permission(
                 if canonical_exclude == NEVER_MATCH:
                     excluded = True
                     break
+
+                if is_pattern(canonical_path):
+                    # §5.2's PATTERN arm, at the §6.3 site — the cell
+                    # 0.8.2.21's `G-4` does not reach, because §6.3 describes
+                    # its subject as *"the path this handler is ABOUT TO
+                    # TOUCH"* and that reads as concrete by construction.
+                    #
+                    # It is not. `EXTENSION-SUBSCRIPTION` §2.3 requires this
+                    # exact call on the **subscription pattern** — so the
+                    # corpus itself routes a pattern in here, and the concrete
+                    # test below then compares a concrete exclude against the
+                    # pattern *string*, which no concrete path can equal. A
+                    # grant reading *"everything under data except
+                    # data/secret"* authorized an `include_payload`
+                    # subscription on `data/*`, and delivery re-checks
+                    # nothing: the excluded entity's BODY is pushed on every
+                    # write to it, for the life of the subscription.
+                    #
+                    # **No new rule is invented here.** §5.2's arm is *for
+                    # each grant exclude overlapping the target, the caller
+                    # must also exclude it, else DENY*; §6.3 has no
+                    # caller-exclude channel, so `is_covered_by(cge, [])` is
+                    # vacuously false and the arm reduces to overlap → DENY.
+                    # The missing SENTENCE is still owed — routed as SA-PY-56.
+                    if patterns_overlap(canonical_path, canonical_exclude):
+                        excluded = True
+                        break
+                    continue
+
                 if matches_pattern(canonical_exclude, canonical_path):
                     excluded = True
                     break

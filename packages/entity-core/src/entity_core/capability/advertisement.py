@@ -76,7 +76,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from entity_core.capability.checking import canonicalize, matches_pattern
+from entity_core.capability.checking import (
+    canonicalize,
+    matches_pattern,
+    patterns_overlap,
+)
 from entity_core.capability.token import CapabilityScope, Grant
 
 
@@ -84,15 +88,48 @@ def _scope_include(scope: CapabilityScope | None) -> list[str]:
     return list(scope.include) if scope is not None else []
 
 
+def _scope_exclude(scope: CapabilityScope | None) -> list[str]:
+    return list(scope.exclude or []) if scope is not None else []
+
+
 def _scope_covered(
     claimed: list[str],
     offered: list[str],
+    excluded: list[str] | None = None,
     canon: Callable[[str], str] | None = None,
 ) -> bool:
-    """Is every pattern the entry claims matched by one the advertisement offers?
+    """Is every pattern the entry claims matched by one the advertisement offers
+    and carved out by none it withholds?
 
     ``canon`` canonicalizes both sides before matching when the axis is a
     path axis (resources); handlers and operations are not paths.
+
+    .. rubric:: The ``excluded`` arm is INERT today, and that is stated rather
+       than left to be discovered
+
+    This function read ``include`` alone until 2026-09-12 — the `G-3` shape
+    (*a site that reads a scope's include and drops its exclude*) at a third
+    site, found sweeping the H1 matrix past the four coordinates 0.8.2.21
+    enumerates. An advertisement reading *"I serve everything except
+    ``system/network``"* retained an assembled entry claiming
+    ``system/network``, so the **minted** reciprocal grant handed a
+    counterparty authority this peer advertises it does not serve — which is
+    the one thing this module's own docstring exists to prevent.
+
+    It was never reachable: :meth:`Peer.advertised_served_scope` builds one
+    include-only entry per registered handler and has no channel for an
+    exclude at all. So the arm changes no behaviour, no mutation of it
+    reddens anything, and a reader would be right to ask why it is here.
+    It is here because the absence is **somebody else's** invariant — an
+    operator policy withholding a handler is the obvious next feature, and
+    the failure mode is silent widening at mint time. Reachability is pinned
+    by ``test_advertisement_filter.py::TestTheExcludeArmIsInertToday``, which
+    goes red the day the scope can carry one.
+
+    The overlap rule matches §6.3's pattern arm rather than
+    :func:`matches_pattern`: a **claim** is itself a pattern, so a concrete
+    withholding compared against it by string equality would carve out
+    nothing — the same defect one module over.
     """
     for claim in claimed:
         if canon is not None:
@@ -108,6 +145,13 @@ def _scope_covered(
                 break
         if not matched:
             return False
+        for withheld in excluded or []:
+            if canon is not None:
+                withheld = canon(withheld)
+            # Drop, not narrow (the ruling's own disposition): a claim that
+            # reaches into withheld space is not covered.
+            if patterns_overlap(claim, withheld):
+                return False
     return True
 
 
@@ -134,11 +178,15 @@ def covers_four_axes(
     granters (§PR-8).
     """
     if not _scope_covered(
-        _scope_include(entry.handlers), _scope_include(advertised.handlers),
+        _scope_include(entry.handlers),
+        _scope_include(advertised.handlers),
+        _scope_exclude(advertised.handlers),
     ):
         return False
     if not _scope_covered(
-        _scope_include(entry.operations), _scope_include(advertised.operations),
+        _scope_include(entry.operations),
+        _scope_include(advertised.operations),
+        _scope_exclude(advertised.operations),
     ):
         return False
 
@@ -148,6 +196,7 @@ def covers_four_axes(
     if not _scope_covered(
         _scope_include(entry.resources),
         _scope_include(advertised.resources),
+        _scope_exclude(advertised.resources),
         canon,
     ):
         return False
@@ -155,7 +204,9 @@ def covers_four_axes(
     # peer scope constrains none; an entry naming none claims none.
     if entry.peers is not None and advertised.peers is not None:
         if not _scope_covered(
-            _scope_include(entry.peers), _scope_include(advertised.peers),
+            _scope_include(entry.peers),
+            _scope_include(advertised.peers),
+            _scope_exclude(advertised.peers),
         ):
             return False
     return True

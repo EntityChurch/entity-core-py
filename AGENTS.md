@@ -268,6 +268,102 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A sibling's CITATION is scoped by a surface THEY have — and the seat the citation does not
+  reach is the seat with the defect.** ***RATIFIED 2026-09-12*** *— tenth axis of the "a routed
+  report's claims about our repo are hearsay" law (after our architecture, coverage, version,
+  behaviour, filing record, remedy, build state, schedule and count), and the first where the
+  routed claim is **entirely true** and still routes you to the wrong disposition.*
+  `entity-core-go` and `entity-core-rust` both closed the bulk-read disclosure — *"listings and
+  extracts shipped every entry under a folder regardless of the exclude"* — citing
+  **`EXTENSION-TREE` §8.2 (View Trees, Read Behavior)**. §8.2 says exactly what they say it says.
+  It is also scoped by **§12.2**, which files view trees under **SHOULD**: *"View trees for
+  handler isolation (§8). **When view trees are implemented**, the following are MUST."* This
+  peer implements none — `view_tree` has **zero** occurrences in the tree — so read through that
+  citation the obligation does not bind us at all, and a seat that checks the citation before the
+  behaviour closes the item as out of scope in one grep.
+  **`ENTITY-CORE-PROTOCOL` §6.3 states it unconditionally**, about *the tree handler* rather than
+  about a projection: *"each entry MUST be individually checked… `count` MUST reflect the filtered
+  entry count… Pagination applies to the filtered result set."* Three MUSTs, none of which this
+  peer did.
+  **Why this axis is worse than the nine before it.** Every other axis fails the moment you look —
+  the tree disagrees with the claim. Here the claim is *correct*, the section exists, the quote is
+  accurate, and the only thing wrong is that the obligation has **two homes** and the sibling cited
+  the one their own architecture made salient. go has view trees in view; we do not; the sentence
+  that binds us is in the document neither of us was reading. And the disposition it produces is
+  *"not applicable"*, which terminates in **no work** — the same flattering-direction failure as a
+  premise saying you already comply.
+  **The check, and it is one grep:** when a routed finding names the section, **grep the CORE
+  protocol for the behaviour**, not for the section — here `grep -n "listing" ENTITY-CORE-PROTOCOL.md`
+  lands on the paragraph directly. A conditional section (`SHOULD`, "when X is implemented",
+  "for peers that offer Y") is the tell: an obligation that real is rarely *only* conditional, and
+  if it is, ask why the unconditional peer is exempt from a disclosure rule. Enforcement point:
+  `tests/integration/test_bulk_read_per_entry_filter_6_3.py`, whose module docstring states the
+  citation correction first and the behaviour second, because a later reader arriving from go's
+  packet will otherwise re-derive the out-of-scope conclusion.
+
+- **When a spec EXEMPTS an operation from a check, the exemption rests on a property of some
+  OTHER operation — and that property is the row a sweep skips.** *Candidate, 2026-09-12 — found
+  auditing go's completed H1 sweep; the unswept row did not merely leave a gap, it re-opened the
+  two that were swept.* `EXTENSION-TREE` §8.4's table has **four** rows — `snapshot`, `diff`,
+  `merge`, `extract`. go's `77da7ea` filtered `handleListing` and `handleExtract`;
+  `handleSnapshot` still builds its trie from `LocationIndex.List(prefix)` unfiltered, checked at
+  the prefix alone. So did ours.
+  **The composition, driven rather than argued.** §11's table says *"`diff` — operates on stored
+  snapshots; **no path-level check**."* That exemption is correct **only while a snapshot cannot
+  commit to bindings the caller may not see.** With an unfiltered snapshot: snapshot the prefix,
+  diff it against an empty one, and read the excluded keys — and their content hashes — out of
+  `added`. Measured here. The filtered listing and the filtered extract are both reachable around,
+  using the one operation the corpus says needs no authority at all. *And this peer hoists the trie
+  **nodes** into `envelope_included`, so the excluded key is **delivered** in the response body; no
+  second request is needed to walk it.*
+  **Why a sweep skips it, and this is the generalizable half.** A sweep enumerates the sites that
+  **perform the check**. An exempt operation performs none, so it is *structurally absent from the
+  enumeration* — and its exemption is the reason it is absent. The check whose absence matters is
+  then in a **third** operation (`snapshot`), which the sweeper has no reason to visit because
+  nothing about it names the code being swept.
+  **The check:** when a spec exempts an operation from an authorization check, write down the
+  sentence that makes the exemption safe — it will name a *different* operation — and put that
+  operation on the sweep. *"No path-level check"* is never a property of the exempt operation; it
+  is a bet on its inputs. Enforcement point:
+  `test_bulk_read_per_entry_filter_6_3.py::TestSnapshotIsTheRowThatSubsumes::
+  test_diff_against_the_snapshot_enumerates_nothing_excluded`, which drives the composition rather
+  than asserting the snapshot row alone — the snapshot row passes on a peer that filters snapshot
+  and nothing else, and says nothing about why it matters.
+
+- **A predicate's subject SHAPE is chosen by the CALL SITE, so fixing a matcher at one site says
+  nothing about the same matcher at another — and the prose is what stops you looking.**
+  *Candidate, 2026-09-12 — `SA-PY-56`, the `G-4` pattern arm at the site all three seats skipped.*
+  0.8.2.21 gave §5.2's `check_resource_scope` a pattern arm (`patterns_overlap` / `is_covered_by`)
+  because a **pattern** target spanning a grant `exclude` was re-spellable past it. go landed it at
+  `CheckResourceScope`; we landed it at `check_resource_scope`. **Neither seat landed it at
+  `check_path_permission`**, and both had the same reason available in the text: §6.3 describes its
+  subject as *"the path this handler is ABOUT TO TOUCH"*, which reads as concrete **by
+  construction**, so the arm looks inapplicable rather than missing.
+  **The corpus itself supplies the pattern.** `EXTENSION-SUBSCRIPTION` §2.3 requires, verbatim,
+  `check_path_permission("get", resource_path, …)` when `include_payload` is set — and a
+  subscription's resource **is a pattern** (§3.1). The exclude loop then evaluates
+  `matches_pattern(concrete_exclude, pattern_string)`, an exact-string comparison no concrete path
+  can satisfy. Measured: a grant reading *"everything under data except `data/secret`"* was
+  **accepted** for a payload subscription on `data/*`, and delivery re-checks nothing — so the
+  excluded entity's **body** is pushed on every write to it, for the life of the subscription. A
+  push channel carrying bodies, which is strictly worse than the read leak above it.
+  **This is the SA-PY-12 law (*a matcher gains a call site, the rejection rule gains it in the
+  same commit*) inverted:** there a matcher moved and its validator did not follow; here the
+  matcher never moved and a **caller with a different value shape** was added to it by a *different
+  specification*. Nothing in §6.3 changed, nothing in §5.2's ruling names §6.3, and no grep for
+  either identifier crosses the two documents.
+  **The check:** when a rule is fixed at one matcher, `grep` every **call site** of that matcher
+  and ask *what SHAPE of value does this one supply* — concrete or pattern, caller-authored or
+  derived — rather than whether the site exists. A site that supplies a shape the fixed site never
+  sees has not been fixed; it has been counted. And the fix itself needed no invention, which is
+  the tell that it was owed: §5.2's arm with `caller_exclude = []` reduces to *overlap → DENY*.
+  **And the cohort's vector cannot see it, for the standing reason.** go's
+  `include_payload_unauthorized` mints a subscribe-only cap with **no** `system/tree` grant —
+  the *neither* arm; the *both* arm is the other one everyone writes. The discriminator is where
+  include and exclude **disagree**, and it belongs to both arms at once. That row is kept in our
+  class and **labelled as the non-discriminator**, mutation-confirmed: removing the pattern arm
+  leaves it green.
+
 - **An ENUMERATION of the sites a rule binds is a claim about YOUR call graph, and the ruling
   that writes it cannot see yours.** ***RATIFIED 2026-09-11*** *— eighth axis of the "a routed
   report's claims about our repo are hearsay" law (after our architecture, coverage, version,
@@ -661,6 +757,41 @@ fails the gates rather than slipping past them.
   exactly the predicted rows (four mutations: race unarmed, env fail-open, env unwired, handlers
   uninstalled). The teeth control holds an *unbounded* peer up across the same window, so the
   headline row's exit is attributable to the flag rather than to a peer falling over on boot.
+  **Sixth instance, 2026-09-12, and the collision was created BY MY OWN RUN, AFTER the
+  pre-flight, on a port the pre-flight correctly reported free.** Every instance above is
+  *somebody else's leftover* — the remedy each time was detection (`ss -ltnp` first, re-measure
+  on a free port, check `podman ps`). This one is not a leftover at all, and no detection step
+  could have found it.
+  `validate-complete.sh python` was run on *"free"* ports `POLL_PORT=39451 PI_PORT=39401`. The
+  pre-flight was clean, the script's **own** probe of `POLL_PORT` and `POLL_PORT+1` passed, and
+  passes 0 / 0b / 1 / 1b all completed — `1644 total, 1627 P, 16 W, 0 F, 1 S`. **Pass 2 then
+  died bringing up the namespace-scoped peer:** `OSError: [Errno 98] … bind on address
+  ('127.0.0.1', 39452)`, which is `NS_PORT = POLL_PORT + 1`.
+  **`cat /proc/sys/net/ipv4/ip_local_port_range` → `32768 60999`.** 39452 is **inside the
+  ephemeral range**. Passes 1 and 1b drive `concurrency.t2_1_sustained_load` — C workers ×
+  10 000 requests — so the run's own outbound connections are being handed source ports out of
+  that range, and one of them took 39452 in the window between the probe and pass 2's bind.
+  Nothing was listening on it before the run and nothing was after it; measured both times.
+  **Why it presents as something else, which is the whole reason it is worth an entry.** The
+  failure lands on the *namespace-scoped* peer — the one configuration that differs from every
+  other pass — one pass after an authorization-path change, in a session whose whole subject was
+  authorization. The peer log's **last line** is the bind error, but the forty lines above it are
+  a healthy boot (every extension initialized, `Listening on 127.0.0.1:41763`), so a `tail -5`
+  shows a peer that came up and then died, which reads as *"the scoped configuration is broken by
+  your diff."* It is the *"is this the peer I started?"* discipline with the question moved:
+  **the peer is right and the port is wrong, and the port was stolen by the harness itself.**
+  **The rule, and it is a one-line change to how ports are chosen:** pick harness ports **below
+  32 768** — outside the ephemeral range *and* outside the harness's fixed set
+  (`9000`, `9401`, `9451`, `9452`). A port in the ephemeral range is not *free*, it is
+  *unclaimed*, and under a load-driving suite those are different things. Re-measured at
+  `POLL_PORT=19451 PI_PORT=19401`. *(The other session's concurrent run this session pre-flighted
+  around used `41953`/`41954`/`51919` — all three inside the range, so the same trap is live for
+  whoever reads its result.)*
+  **And the standing ordering held and is worth restating:** pass 1's **total** was read before
+  its verdict. `1644 total` is the full check set, not a shortfall, so the `0 F` is a real
+  conformance result and pass 2's death is a separate, later, harness fact. Had the rule been
+  skipped, *"the validator failed"* was the available summary — and it would have been wrong
+  about the only number anyone cites.
 
 - **The Bash tool's working directory persists between calls, and a relative `rm -rf` is where
   that becomes destructive.** *Candidate, 2026-08-22 — cost: the entire `docs/` tree, recovered

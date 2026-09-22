@@ -240,3 +240,78 @@ def test_open_access_assembly_keeps_the_query_constraint_entry() -> None:
     assert entry.allowances is not None
     assert entry.constraints["type_scope"]["include"] == ["*"]
     assert entry.allowances["scope"] == "content_store"
+
+
+class TestTheExcludeArmIsInertToday:
+    """The `G-3` shape at a third site — a reader of a scope's ``include``
+    that dropped its ``exclude`` — and the reachability row that keeps the fix
+    honest.
+
+    Found sweeping the H1 exclude matrix past the four coordinates 0.8.2.21
+    enumerates (`entity-core-go`'s ``ROUTING-2026-09-11-f``). ``_scope_covered``
+    read ``include`` alone on all four axes, so an advertisement withholding a
+    handler retained an assembled entry claiming it, and the **minted**
+    reciprocal grant carried authority this peer advertises it does not serve.
+
+    .. rubric:: Why there is no behavioural row above this one
+
+    There cannot be. :meth:`Peer.advertised_served_scope` mints one
+    include-only entry per registered handler and has no channel for an
+    exclude, so the fixed arm is **unreachable** and a mutation of it reddens
+    nothing — the standing *a mutation that reddens NOTHING is a finding about
+    the code* law, in its third shape: the rule is neither redundant nor
+    under-fixtured, it is fail-closed by an absence somewhere else. The
+    prescribed artifact is this reachability row, so the day an operator
+    policy gains a withhold list the arm becomes live **and someone is told**,
+    rather than the widening returning with nothing watching it.
+    """
+
+    def test_nothing_in_the_advertised_scope_carries_an_exclude_today(self):
+        from entity_core.crypto.identity import Keypair
+        from entity_core.peer.builder import PeerBuilder
+
+        peer = (
+            PeerBuilder()
+            .with_keypair(Keypair.generate())
+            .with_all_handlers()
+            .debug_mode(True)
+            .build()
+        )
+        carrying = [
+            (entry, axis)
+            for entry in peer.advertised_served_scope()
+            for axis in ("handlers", "operations", "resources", "peers")
+            if getattr(entry, axis) is not None and getattr(entry, axis).exclude
+        ]
+        assert carrying == [], (
+            "the advertised served-scope now carries an exclude, so "
+            "`_scope_covered`'s withhold arm has become REACHABLE. It is "
+            "believed correct and has never been exercised by a behavioural "
+            "row — drive it before trusting it, and replace this row with one"
+        )
+
+    def test_the_arm_exists_and_withholds_when_it_is_given_something(self):
+        """The arm's own unit, driven directly — the only way to exercise it
+        while the production scope cannot produce its input.
+
+        Labelled for what it is: this is **not** evidence that the filter
+        withholds anything in this peer. It is evidence that the code is
+        there and does the right thing when reached.
+        """
+        from entity_core.capability.advertisement import advertised_covers
+        from entity_core.capability.token import Grant
+
+        advertised = [Grant.create(
+            handlers=["*"], operations=["*"], resources=["*", "/*/*"],
+            handler_exclude=["system/network"],
+        )]
+        withheld = Grant.create(
+            handlers=["system/network"], operations=["get"], resources=["*"],
+        )
+        allowed = Grant.create(
+            handlers=["system/tree"], operations=["get"], resources=["*"],
+        )
+        peer_id = "2KTestAdvertisementExcludePeerJdaaaaaaaaaaaaaa"
+
+        assert advertised_covers(advertised, withheld, peer_id) is False
+        assert advertised_covers(advertised, allowed, peer_id) is True
