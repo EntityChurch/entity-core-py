@@ -49,7 +49,36 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1622 · 1607 P · 15 W · 0 F · 0 S @ core-go `00261f3`` (2026-09-02)** —
+**The citable number is `1624 · 1610 P · 14 W · 0 F · 0 S @ core-go `d42752b`` (2026-09-02)** —
+all seven `validate-complete.sh` passes exit 0 against a committed tree, `connectivity`
+**36/36**. The count moved 1622 → 1624 on two checks core-go added for CE-1 and row 10's
+established arm; both PASS. The warn count moved 15 → 14 and **the drop is not attributed** —
+the previous run's warn list is not in this session's records, and a one-warn delta explained
+from memory is the shape this repo's own flaky-gate rule forbids. This run's 14 are the standing
+set, enumerated: 10 × `type_system` (open-type census), 2 × `local_files` (a go-only extension),
+`resource_bounds.r3_connection_flood`, `peer_issued.v6_offline_not_found`. None is new.
+
+**Two relayed rulings landed, and the interesting one is that CE-1 was never unruled.** core-go
+measured a pre-establishment non-connect EXECUTE on all three live peers — `403
+connection_required` · `400 handshake_failed` · `403 capability_denied`, no two alike, none in
+any spec code set — and routed it by the divergence rule as *tighten the spec*. **§4.2's third
+pre-authorization bullet had ruled it at 0.8.1**, where F32 replaced that bullet's blanket 403
+with the auth/authz discriminator; §5.2a gives the code. All three seats were reading §4.7,
+which declares itself the MUST-emit contract for that surface and had no row, while §4.2 states
+the rule in the vocabulary of *pre-authorization*. 0.8.2.5 adds the pointer and names both
+minted codes non-conformant.
+
+Ours is now `401 authentication_failed` at **both** wire boundaries — the relay named the TCP
+one; grepping the *gate* rather than the site found the HTTP transport carrying its own copy,
+which no probe in the cohort can reach. The sharpest statement of the defect needed no
+cross-impl run at all: this peer already answered `401 authentication_failed` for the identical
+frame one state later, so it was disagreeing with itself. **SIGNALING v1.2** ruled SA-PY-33 our
+way with one correction — the wrong line was **§4.3** (the wrapped handler section), not §9.2's
+unwrapped enum, which is unchanged — and the `bad_request` ratchet's one exemption retired on
+the condition it had written down, to a hard zero. Routed in
+`docs/status/ROUTING-2026-09-02-c-…`.
+
+**The previous citable number was `1622 · 1607 P · 15 W · 0 F · 0 S @ core-go `00261f3`` (2026-09-02)** —
 all seven `validate-complete.sh` passes exit 0 against a committed tree, `connectivity`
 **34/34**. The count moved 1619 → 1622 on three checks core-go added for the fold's other half
 (`connect_second_hello_mid_handshake`, `connect_ping_before_hello`,

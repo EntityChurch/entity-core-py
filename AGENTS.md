@@ -1591,6 +1591,79 @@ fails the gates rather than slipping past them.
   **remote** said, so filling an absent code with the plausible generic would fabricate a claim
   about a peer that made none. It carries `""`. *A default is a decision; the correct decision
   is not always the correct value.*
+  **Second construct, next day (2026-09-02, CE-1), and it generalizes the rule past `=`.** The
+  pre-establishment refusal answered **`403 capability_denied`** where §4.2/§5.2a pin `401
+  authentication_failed`, at both of its call sites, and neither site named a status or a code:
+  both read `ExecuteResponse.forbidden(request_id, message)`, a **named constructor that
+  hardcodes the whole pair**. So the general form is not *"grep your default arguments"* — it is
+  **any construct that supplies a wire value the call site does not write**: a default argument,
+  a status-named constructor, a `getattr` fallback. All three have now bitten in eight days, and
+  all three are invisible to the same review, because reviewing call sites is how you find wrong
+  values and none of these has a wrong value *at a call site*.
+  **Two things this shape adds that the `=` shape could not.** (1) The wrong value was **a real
+  code from a real table** — `capability_denied` is §5.2a's authz default — so nothing looked
+  minted, which is the cover `bad_request` never had. A code is only right *relative to an
+  input*, and a helper named for a status cannot know the input. (2) It carried the **status**
+  too, and the status is what encodes §5.2a's auth/authz class, so the same construct that hid a
+  code hid a *classification*. **When a helper is named for a status (`forbidden`,
+  `not_found`, `conflict`), every caller has silently agreed with its class** — grep those
+  helpers' call sites and ask, at each, which spec sentence assigns that class.
+  Enforcement point: `test_pre_establishment_execute_ce1.py::TestBothBoundariesShareOneRefusal`
+  — but note what it pins, because it is the opposite of the ratchet above: the fix is a
+  **shared** refusal (`_pre_establishment_refusal`) reached from both boundaries, i.e. one more
+  construct supplying a value no call site writes. That is deliberate and it is the trade: a
+  value stated in one place is reviewable, a value stated in zero places is not. What makes the
+  difference is that the helper is named for the **input** rather than for the status, and that
+  the structural row asserts both gates reach it.
+
+- **"Unruled" is a claim about the corpus, and three peers disagreeing is evidence about three
+  peers.** *Candidate, 2026-09-02 — CE-1. Cost: a routing packet, a proposal, and three seats'
+  design attention on a question the spec answered two releases earlier.* `entity-core-go`
+  measured the pre-establishment non-connect EXECUTE on all three live peers, found
+  `403 connection_required` · `400 handshake_failed` · `403 capability_denied` — no two alike,
+  none in any spec code set — and routed it by the divergence rule as *all-three-differ ⇒ spec
+  ambiguity, tighten the spec*. Arch's first read agreed and argued a **401** lean on semantics.
+  **§4.2's third pre-authorization bullet had ruled it at 0.8.1**, where F32 replaced that
+  bullet's blanket 403 with the auth/authz discriminator, and §5.2a's table gives the code.
+  **The mechanism, and it is why nobody was careless.** Every seat was reading **§4.7**, which
+  declares itself the MUST-emit contract for that surface and had no row for this input. §4.2
+  states the rule in the vocabulary of *pre-authorization*; the implementer is holding the
+  vocabulary of *connection state*. **A rule stated in a vocabulary you are not searching in is
+  indistinguishable from an absent rule** — and the missing cross-reference is exactly the
+  SA-PY-32 defect (§4.5's `protocols` row, whose literal lived in §8.4) recurring one section
+  over, which is the standing shape, not a coincidence.
+  **Why divergence-by-measurement is the dangerous evidence:** it is the most convincing
+  possible demonstration that a question is open, and it is **not evidence about the text at
+  all**. It measures what implementers found, and every implementer read the same wrong section.
+  This is *"two readings that agree everywhere your fixtures live"* inverted: there a shared
+  corpus manufactured false agreement, here a shared **blind spot** manufactured false
+  disagreement, and both are sustained by the cohort rather than caught by it.
+  **And the two branches cost wildly different amounts, in the wrong direction.** *Unruled*
+  terminates in a proposal, a routing packet and a design conversation — the expensive branch,
+  and the one that feels careful and collaborative. *Ruled* terminates in a one-line fix. So the
+  cheap check has to run first: **before accepting "unruled", grep the normative sections for
+  the INPUT, not for the code.** Restate the input in the other vocabulary — *"an EXECUTE with
+  no verified signer"* as well as *"a frame before the handshake"* — and search both. Two greps.
+  **Two corollaries earned in the same pass:**
+  1. **When you file a corpus conflict, name the section that governs your surface, not the
+     section your constant transcribes.** SA-PY-33 filed §9.2-vs-§4.7 because §9.2 was the enum
+     our constant copied; the ruling put the defect in **§4.3**, which is the section governing
+     the surface we actually serve, and left §9.2 untouched. Same remedy, different sentence —
+     and only one of the two tells the next person which line to grep.
+  2. **A test that describes itself by reference to another surface makes no independent
+     claim.** The HTTP pre-connect row asserted the old `403` under the docstring *"mirrors the
+     TCP path's pre-connect reject"* — and what it mirrored was the TCP path's bug. It sat on
+     the one boundary **no cohort probe reaches** (they all dial TCP), so it was the only thing
+     that could ever have caught the divergence, and it was pinning the defect. The seam-move
+     rule says grep the old status; this adds that a row asserting the defect and a row
+     asserting the contract are textually identical, and the tell is a docstring that names a
+     sibling instead of a spec sentence.
+  Enforcement point: `tests/integration/test_pre_establishment_execute_ce1.py` — the ruled pair
+  at both boundaries, an AST ratchet on the two codes 0.8.2.5 names non-conformant, and
+  `test_the_two_states_now_agree_on_the_same_frame`, which is the row that states the defect:
+  this peer already answered `401 authentication_failed` for the identical frame one state
+  later, so it had been disagreeing with **itself** the whole time. *A cross-impl divergence
+  that is also an internal one was never a spec question.*
 
 - **A cohort-consistency argument is only as good as the census behind it — and the generated
   family is the one a ground-up seat forgets it is in a cohort with.** *Candidate, 2026-09-02 —

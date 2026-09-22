@@ -104,11 +104,27 @@ DEFAULT_TTL_SECONDS = 60
 DEFAULT_MAX_KEYS = 4096
 
 # ---------------------------------------------------------------------------
-# §9.2's closed error enum. A node MUST NOT invent codes outside this set.
+# The error codes. This node serves the **wrapped** surface only, so the set
+# that governs is §4.3's — the EXECUTE `result.data.code` list — and NOT §9.2's
+# closed `error: tstr` enum, which belongs to the §9 unwrapped listener we do
+# not build. The two sets partition the same failure classes; they differ in
+# spelling and envelope, and §2.2 binds the three *verbs* to be identical, not
+# their error encodings.
 # ---------------------------------------------------------------------------
 
 #: Malformed input, unknown op, wrong key length, missing field — 400.
-CODE_BAD_REQUEST = "bad_request"
+#:
+#: **This was ``"bad_request"`` until SIGNALING v1.2** (2026-09-02, SA-PY-33).
+#: Both this seat and `entity-core-go` emitted the synonym here, correctly:
+#: §4.3 *listed* it, and §4.3 is the wrapped section, so the code landed exactly
+#: where core §4.7's *"MUST NOT mint a synonym"* applies. The corpus contradicted
+#: itself and the spec was the thing that was wrong — which is why this was filed
+#: rather than fixed locally, and why the fix names the ruling. **§9.2 still says
+#: `bad_request` and is unchanged**; a future §9 listener spells it that way and
+#: re-argues the ratchet's exemption from scratch. The name moved with the value:
+#: a constant called ``CODE_INVALID_REQUEST`` holding ``"invalid_request"`` is a name
+#: that lies to the next reader about which set it transcribes.
+CODE_INVALID_REQUEST = "invalid_request"
 #: Blob exceeds `max_blob_bytes` — refused, never truncated.
 CODE_MESSAGE_TOO_LARGE = "message_too_large"
 #: Bucket at `max_bucket_blobs` — refused, never evicted.
@@ -306,8 +322,11 @@ class SignalingNode:
 
 def _key_from_params(params: dict[str, Any]) -> bytes | None:
     """The 33 opaque bytes, or ``None`` if the field is missing or the wrong
-    width. §4.3: "33 opaque bytes compared byte-wise"; §9.2: any other length
-    is `bad_request`."""
+    width. §4.3: "33 opaque bytes compared byte-wise". Any other length is
+    refused — ``invalid_request`` here on the wrapped surface, which is the
+    spelling §9.2's own scope note (v1.2) gives for the unwrapped enum's
+    counterpart. This docstring cited §9.2 for the code, which is how a
+    wrapped-surface site came to carry an unwrapped-surface enum."""
     raw = params.get("rendezvous_key")
     if not isinstance(raw, (bytes, bytearray)):
         return None
@@ -377,7 +396,7 @@ class SignalingNodeExtension(Extension):
         # is plain STUN), so asking a wrapped node for it is an ordinary
         # unknown operation, not a 501-shaped "not implemented yet".
         return error_response(
-            400, CODE_BAD_REQUEST,
+            400, CODE_INVALID_REQUEST,
             f"unknown signaling operation: {operation}",
         )
 
@@ -388,13 +407,13 @@ class SignalingNodeExtension(Extension):
         key = _key_from_params(data)
         if key is None:
             return error_response(
-                400, CODE_BAD_REQUEST,
+                400, CODE_INVALID_REQUEST,
                 f"rendezvous_key must be exactly {RENDEZVOUS_KEY_LEN} bytes",
             )
         message = data.get("message")
         if not isinstance(message, (bytes, bytearray)):
             return error_response(
-                400, CODE_BAD_REQUEST, "message must be a byte string",
+                400, CODE_INVALID_REQUEST, "message must be a byte string",
             )
         if not self._limiter.allow(self._source(ctx), key):
             return error_response(
@@ -407,14 +426,14 @@ class SignalingNodeExtension(Extension):
             # "refuse, don't evict", surfaced so the offerer can retry rather
             # than believe it is at the key.
             status = 400 if code == CODE_MESSAGE_TOO_LARGE else 429
-            return error_response(status, code or CODE_BAD_REQUEST, _refusal_text(code))
+            return error_response(status, code or CODE_INVALID_REQUEST, _refusal_text(code))
         return ok_response(TYPE_OFFER_RESULT, {"ok": True})
 
     def _handle_collect(self, data: dict[str, Any], ctx: HandlerContext) -> dict[str, Any]:
         key = _key_from_params(data)
         if key is None:
             return error_response(
-                400, CODE_BAD_REQUEST,
+                400, CODE_INVALID_REQUEST,
                 f"rendezvous_key must be exactly {RENDEZVOUS_KEY_LEN} bytes",
             )
         if not self._limiter.allow(self._source(ctx), key):

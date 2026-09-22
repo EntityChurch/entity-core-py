@@ -105,8 +105,22 @@ async def test_http_two_executes_share_one_session_id(http_server_peer):
 
 @pytest.mark.asyncio
 async def test_unauthenticated_execute_before_connect_rejected(http_server_peer):
-    """Sending an EXECUTE before completing the connect handshake yields
-    a 403/Forbidden response (mirrors the TCP path's pre-connect reject)."""
+    """Sending an EXECUTE before completing the connect handshake is refused —
+    `401 authentication_failed` (CE-1, ruled 0.8.2.5).
+
+    This row asserted a bare `403` and is worth reading as more than a status
+    update: **the HTTP boundary was covered all along, by a test asserting the
+    wrong answer.** No cohort probe reaches this boundary (they all dial TCP),
+    so the only thing that could have caught the divergence here was this row,
+    and it was pinning the defect rather than the contract. That is what a
+    status-only assertion buys — it cannot distinguish "mirrors the TCP path"
+    from "mirrors the TCP path's bug", which is exactly what its own docstring
+    claimed it was for.
+
+    The pair, the TCP half, and the controls live in
+    `test_pre_establishment_execute_ce1.py`; this row stays where an HTTP
+    reader will find it.
+    """
     from entity_core.protocol.auth import create_authenticated_request
     from entity_core.protocol.messages import Execute
     from entity_core.peer.http_client import HttpConnection
@@ -133,8 +147,11 @@ async def test_unauthenticated_execute_before_connect_rejected(http_server_peer)
     )
     from entity_core.protocol.messages import ExecuteResponse
     response = ExecuteResponse.from_entity(response_env.root)
-    assert response.status == 403, (
-        f"expected 403 Forbidden pre-connect, got {response.status}"
+    assert response.status == 401, (
+        f"expected 401 auth-class pre-connect (§4.2/§5.2a), got {response.status}"
+    )
+    assert response.result["data"]["code"] == "authentication_failed", (
+        "the code half: a 401 `capability_denied` is a pair in no table"
     )
 
 

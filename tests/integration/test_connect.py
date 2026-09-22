@@ -232,7 +232,20 @@ async def test_dialer_refusal_carries_the_remotes_code_not_just_prose():
 
 @pytest.mark.asyncio
 async def test_pre_connect_execute_rejected(server_peer: Peer):
-    """EXECUTE before connect is rejected with 403."""
+    """EXECUTE before connect is refused — `401 authentication_failed` (CE-1).
+
+    This row asserted a bare `403` and is re-pointed rather than deleted, so a
+    reader arriving from the old status learns where the refusal went. §4.2's
+    third pre-authorization bullet routes an EXECUTE with no verified signer to
+    §5.2a's **auth** class; F32 replaced this bullet's blanket 403 at 0.8.1 and
+    0.8.2.5 restates it under §4.7. The full row set, both wire boundaries, and
+    the controls that keep the authz class alive are in
+    `test_pre_establishment_execute_ce1.py` — this one stays because it is what
+    `test_connect.py` drives on the way past.
+
+    Asserting the **pair**: a status-only row is what let the code half sit
+    unexamined here for the life of the file.
+    """
     reader, writer = await asyncio.open_connection("127.0.0.1", 19000)
 
     try:
@@ -245,7 +258,8 @@ async def test_pre_connect_execute_rejected(server_peer: Peer):
 
         response_env = await recv_envelope(reader)
         response = ExecuteResponse.from_entity(response_env.root)
-        assert response.status == 403
+        assert response.status == 401
+        assert response.result["data"]["code"] == "authentication_failed"
     finally:
         writer.close()
         await writer.wait_closed()

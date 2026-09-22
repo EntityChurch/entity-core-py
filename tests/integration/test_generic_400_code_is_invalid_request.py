@@ -241,14 +241,20 @@ class TestTheSynonymIsRatchetedAtZero:
         is for: it found `peer.py`'s `getattr(e, "code", "bad_request")` — a
         fallback on an exception that always carries a code, so it was invisible
         to the read that fixed the constructor default — and the signaling
-        exemption below, which is not a miss but a corpus conflict.
+        exemption, which was not a miss but a corpus conflict.
+
+        **The exemption is gone and this is a hard zero across every package**
+        (2026-09-02). SIGNALING v1.2 ruled SA-PY-33 in the shape the row below
+        wrote down as its first branch: §4.7's MUST NOT is scoped to the wrapped
+        EXECUTE surface, §4.3 named `bad_request` there and was the thing that
+        was wrong, and §9.2's unwrapped enum is unchanged. Our node serves the
+        wrapped surface only — there is no §9 listener in this tree — so the
+        directory-wide hole closes to nothing rather than narrowing.
         """
         root = Path(__file__).resolve().parents[2] / "packages"
         offenders: list[str] = []
 
         for path in root.rglob("*.py"):
-            if path.match("*/entity_handlers/signaling/*"):
-                continue  # SA-PY-33 — see EXEMPT_BY_A_LANDED_EXTENSION below.
             for node in ast.walk(ast.parse(path.read_text())):
                 if isinstance(node, ast.Constant) and node.value == "bad_request":
                     offenders.append(f"{path.relative_to(root)}:{node.lineno}")
@@ -259,42 +265,63 @@ class TestTheSynonymIsRatchetedAtZero:
             f"synonym. New literals: {offenders}"
         )
 
-    def test_the_signaling_exemption_is_a_corpus_conflict_not_an_oversight(
+    def test_the_signaling_exemption_retired_on_the_condition_it_wrote_down(
         self,
     ) -> None:
-        """The one exemption, pinned so it cannot become a habit. SA-PY-33.
+        """SA-PY-33, closed — and the row is re-pointed rather than deleted.
 
-        `EXTENSION-SIGNALING` §9.2 pins a **closed** error enum — *"a node MUST
-        NOT invent codes outside this set"* — and `bad_request` is in it, for
-        the same class core §4.7 (0.8.2.4) now says must be `invalid_request`
-        and MUST NOT be given a synonym. Both sentences are landed and
-        normative, and our node serves the **wrapped** surface (a
-        `system/signaling` handler returning an EXECUTE_RESPONSE), so the code
-        lands exactly where §3.3's set governs. `entity-core-go` carries the
-        identical string at the matching site (`ext/signaling/node/node.go`),
-        which is the evidence that this is the corpus disagreeing with itself
-        rather than one seat being sloppy.
+        This row used to hold the ratchet's one exemption open. `EXTENSION-
+        SIGNALING` §9.2 pinned a **closed** enum containing `bad_request` for
+        the same class core §4.7 (0.8.2.4) says must be `invalid_request` and
+        MUST NOT be given a synonym; both sentences were landed and normative,
+        so it was **filed, not fixed** — changing it unilaterally would have
+        broken a pinned enum and manufactured a cross-impl divergence out of a
+        spec conflict, which is the error this repo exists to find in other
+        stacks. `entity-core-go` carried the identical string at the matching
+        site, which is what made it a corpus conflict rather than one seat being
+        sloppy.
 
-        So it is **filed, not fixed**: changing it unilaterally would break a
-        pinned enum and manufacture a cross-impl divergence out of a spec
-        conflict — the error this repo exists to find in other stacks.
+        **The written retirement condition was:** *"upstream rules which
+        sentence wins. If §4.7's MUST NOT is scoped to the EXECUTE surface,
+        signaling's enum moves and this exemption goes with it."* SIGNALING
+        **v1.2** ruled exactly that. The defect was one line and it was not in
+        §9.2 at all: **§4.3** — which sits in §4 *Handler and Operations*, the
+        wrapped section — listed `bad_request` as an EXECUTE error, so both
+        seats implemented the spec correctly and the spec was wrong. §4.3 now
+        reads `invalid_request`; §9.2 is untouched and still says `bad_request`
+        for the `error: tstr` values of the §9 non-entity protocol, which §4.7
+        does not reach.
 
-        **Retirement condition:** upstream rules which sentence wins. If §4.7's
-        MUST NOT is scoped to the EXECUTE surface, signaling's enum moves and
-        this exemption goes with it; if the enum stands, §4.7 owes the carve-out
-        and this row records why the ratchet has a hole. Either way the hole is
-        one directory wide and this row fails the moment it is wider.
+        So this row now asserts the **wrapped** side, which is the only side
+        this tree serves: signaling emits the core code and holds no copy of the
+        unwrapped enum. A reader who found the class simply deleted would have
+        no way to learn that the two surfaces legitimately spell one class two
+        ways — and the next person to build the §9 listener needs to know the
+        exemption is re-arguable *for that file only*, not that it was a mistake.
+
+        Third recorded instance of a deferral's forward half executing as
+        written (after the §8.2 arg-order skip and the §4.5 absent-arm row).
         """
         root = Path(__file__).resolve().parents[2] / "packages"
-        exempt = sorted(
+        signaling = [p for p in root.rglob("*.py") if p.match("*/signaling/*")]
+        assert signaling, "the signaling package moved; this row is measuring nothing"
+
+        residue = sorted(
             f"{path.relative_to(root)}:{node.lineno}"
-            for path in root.rglob("*.py")
-            if path.match("*/entity_handlers/signaling/*")
+            for path in signaling
             for node in ast.walk(ast.parse(path.read_text()))
             if isinstance(node, ast.Constant) and node.value == "bad_request"
         )
-        assert exempt == ["entity-handlers/src/entity_handlers/signaling/node.py:111"], (
-            "the exemption is ONE definition site (`CODE_BAD_REQUEST`), which is "
-            "what keeps it a transcription of §9.2's enum rather than a licence "
-            f"to spell the code freely inside signaling; found {exempt}"
+        assert residue == [], (
+            "SIGNALING v1.2 moved §4.3 to `invalid_request` and this node serves "
+            "the wrapped surface only, so the exemption is retired. A `bad_request` "
+            "here again is either the §9 unwrapped listener arriving — in which "
+            f"case re-open the exemption for that file deliberately — or a relapse: {residue}"
+        )
+
+        from entity_handlers.signaling.node import CODE_INVALID_REQUEST
+
+        assert CODE_INVALID_REQUEST == "invalid_request", (
+            "§4.3 (v1.2) is the wrapped surface's code list and it names the "
+            "core's generic 400"
         )

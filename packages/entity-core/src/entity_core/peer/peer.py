@@ -164,6 +164,44 @@ class _DispatchDenied:
     message: str
 
 
+def _pre_establishment_refusal(request_id: str) -> "ExecuteResponse":
+    """The §4.2 third-bullet refusal: a non-connect EXECUTE before the handshake.
+
+    **401 `authentication_failed`**, and the status is the half that carries the
+    meaning. §4.2 bullet 3 routes this input to §5.2a: *"a missing/unverifiable
+    `author` or signature is auth-class **401**; an authenticated request lacking
+    a covering capability is authz-class **403**"*. A frame arriving before the
+    handshake has no verified signer at all, so it is the first arm — §5.2a's
+    *"Author absent → 401 `authentication_failed`"* row. 0.8.2.5 restates this
+    under §4.7 and names the codes two seats were minting in its place
+    (`connection_required`, `handshake_failed`) **non-conformant**.
+
+    This peer answered **403 `capability_denied`** — the blanket 403 F32 retired
+    at **0.8.1**, so the gap is two releases old — and it was not a chosen wrong
+    answer but an *unchosen* one: both call sites reached
+    ``ExecuteResponse.forbidden``, which hardcodes both halves, so nothing at
+    either site named a status or a code. The same shape as the
+    ``bad_request`` default one commit ago, in a helper rather than a default
+    argument. A 403 here is a false claim about the input: it asserts the caller
+    authenticated and then lacked authority, when the caller never authenticated.
+
+    Shared by **both** boundaries deliberately. There are two — the TCP frame
+    loop and the HTTP transport — and a conformance probe dials TCP, so the HTTP
+    one is not reachable by any check in the cohort. Two hand-rolled copies of
+    one refusal is how §4.7 row 10 came to be classified two different ways at
+    two boundaries in this same file; the fix there was one shared set, and this
+    is the same fix applied before the divergence rather than after it.
+    """
+    return ExecuteResponse.unauthorized(
+        request_id=request_id,
+        message=(
+            "Connect required before sending requests: no verified signer "
+            "(V7 §4.2 pre-authorization, §5.2a auth-class)"
+        ),
+        code="authentication_failed",
+    )
+
+
 def _forbidden_with_rejected_marker(
     request_id: str,
     message: str,
@@ -1678,11 +1716,12 @@ class Peer:
             return
 
         if not conn_state.is_connected:
+            # V7 §4.2 bullet 3 / §5.2a — 401 `authentication_failed`. The HTTP
+            # half of the pair; see `_pre_establishment_refusal`. No cohort
+            # probe can reach this boundary (they all dial TCP), which is
+            # exactly why it shares the TCP one's refusal rather than its own.
             request_id = data.get("request_id", "")
-            response = ExecuteResponse.forbidden(
-                request_id=request_id,
-                message="Connect required before sending requests",
-            )
+            response = _pre_establishment_refusal(request_id)
             await send_envelope(writer, Envelope(root=response.to_entity()))
             return
 
@@ -2303,11 +2342,15 @@ class Peer:
                             # Not connected yet - reject (inline; nothing
                             # in flight, write is safe without the lock
                             # because the loop hasn't spawned yet).
+                            #
+                            # V7 §4.2 bullet 3 / §5.2a — 401
+                            # `authentication_failed`. This is CE-1, measured
+                            # three-way on the wire by `entity-core-go` and
+                            # ruled at 0.8.2.5; see
+                            # `_pre_establishment_refusal` for why the status
+                            # is the half that moves.
                             request_id = data.get("request_id", "")
-                            response = ExecuteResponse.forbidden(
-                                request_id=request_id,
-                                message="Connect required before sending requests",
-                            )
+                            response = _pre_establishment_refusal(request_id)
                             await send_envelope(
                                 writer, Envelope(root=response.to_entity())
                             )

@@ -40,7 +40,6 @@ from entity_handlers.signaling.data import (
 )
 from entity_handlers.signaling.key import lobby_key, pair_key, secret_key, tag_key
 from entity_handlers.signaling.node import (
-    CODE_BAD_REQUEST,
     CODE_BUCKET_FULL,
     CODE_MESSAGE_TOO_LARGE,
     DEFAULT_MAX_BLOB_BYTES,
@@ -326,16 +325,22 @@ class TestWrappedSurface:
 
         asyncio.run(run())
 
-    def test_wrong_width_key_is_bad_request(self):
+    def test_wrong_width_key_is_invalid_request(self):
         async def run():
             node_kp, client_kp = Keypair.generate(), Keypair.generate()
             node = _build_node(node_kp)
             await node.start("127.0.0.1", 0)
             client = _build_client(client_kp, node, node_kp, _bound_port(node))
             try:
-                # §9.2: "The key is exactly 33 bytes … Any other length is
-                # bad_request." Built by hand — the client codec refuses to
-                # send one, which is the point of checking the node too.
+                # §4.3: "The key is exactly 33 bytes"; any other length is
+                # refused. Built by hand — the client codec refuses to send
+                # one, which is the point of checking the node too.
+                #
+                # Asserted against the SPEC's literal rather than against our
+                # own `CODE_INVALID_REQUEST`: this row read
+                # `== CODE_BAD_REQUEST` for the life of the synonym, so both
+                # sides of it spelled the wrong code our way and it could not
+                # fail. That is the version-string shape, in a test.
                 for bad in (b"", bytes(32), bytes(34)):
                     result = await _sig(
                         client, node, "collect",
@@ -343,14 +348,14 @@ class TestWrappedSurface:
                          "data": {"rendezvous_key": bad}},
                     )
                     assert result.status == 400, bad
-                    assert result.result["data"]["code"] == CODE_BAD_REQUEST
+                    assert result.result["data"]["code"] == "invalid_request", bad
             finally:
                 await client.stop()
                 await node.stop()
 
         asyncio.run(run())
 
-    def test_unknown_operation_is_bad_request_not_501(self):
+    def test_unknown_operation_is_invalid_request_not_501(self):
         async def run():
             node_kp, client_kp = Keypair.generate(), Keypair.generate()
             node = _build_node(node_kp)
@@ -362,7 +367,7 @@ class TestWrappedSurface:
                 # unknown operation, not "not implemented yet".
                 result = await _sig(client, node, "reflect", empty_params())
                 assert result.status == 400
-                assert result.result["data"]["code"] == CODE_BAD_REQUEST
+                assert result.result["data"]["code"] == "invalid_request"
             finally:
                 await client.stop()
                 await node.stop()
