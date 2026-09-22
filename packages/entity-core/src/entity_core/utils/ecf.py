@@ -28,6 +28,7 @@ import threading
 
 import cbor2
 import cbor2._decoder as _cbor2_dec
+import cbor2._types as _cbor2_types
 # cbor2's C extension (the default backing of cbor2.dumps) does NOT minimize
 # float16-representable values at |x| >= 2**15 (e.g. 32768.0, 65504.0) — it
 # emits float32. That violates RFC 8949 §4.2 Rule 4 ("shortest float encoding
@@ -147,6 +148,80 @@ def ecf_decode(data: bytes) -> Any:
             return _cbor2_dec.loads(data)
         finally:
             _cbor2_dec.semantic_decoders = original
+
+
+#: BOTH spellings of ``CBORTag``, and the public name is NOT the one that
+#: matters here.
+#:
+#: ⛔ ``cbor2.CBORTag`` **is** ``_cbor2.CBORTag`` — the C extension's class.
+#: :func:`ecf_decode` deliberately goes through the **pure-Python** decoder
+#: (the C extension's tag dispatch cannot be intercepted), and that decoder
+#: mints ``cbor2._types.CBORTag``, a *distinct class*. So a detector written
+#: against the public, obvious, documented name is blind on **exactly the
+#: path it exists to guard**, and correct-looking everywhere else.
+#:
+#: The first draft of :func:`contains_cbor_tag` was ``(cbor2.CBORTag,
+#: _cext_types.CBORTag)`` — which names one class twice. It was caught by the
+#: row asserting the byte-walker and the object-walker agree, not by the wire
+#: rows, which a blind detector leaves looking exactly like an unfixed peer.
+#:
+#: This is the same hazard ``_register_cext_type_adapters`` above was written
+#: for, arriving from the decode side: the two classes share a public shape
+#: and nothing about either name says which one your codec produces.
+_CBOR_TAG_TYPES: tuple[type, ...] = (_cbor2_types.CBORTag, _cext_types.CBORTag)
+
+
+def contains_cbor_tag(obj: Any) -> bool:
+    """True iff ``obj`` carries a CBOR major-type-6 item at any depth.
+
+    ``ENTITY-CBOR-ENCODING`` §5.4 / §6.3: **no tags in a data-field
+    position**, at any depth. The refusal is ``400 non_canonical_ecf``, and
+    ``ENTITY-CORE-PROTOCOL`` §4.11 row (5a) (0.8.2.26) makes it a
+    **pre-admission refusal** — a coded frame is owed before any close.
+
+    .. rubric:: Why this is a walk of the DECODED object and not of the bytes
+
+    This repo already owns a byte-level strict validator,
+    :func:`entity_core.conformance.is_canonical_ecf`, and it carries this
+    exact arm. It is the wrong instrument *here* for two reasons, and both
+    are worth stating because the tempting fix is to call it:
+
+    * it answers **canonical-or-not**, folding six independent rules into one
+      bool, so a frame refused by it could not name its own cause — and
+      §4.11's whole content is that *the code belongs to the cause*. Only the
+      tag arm is a `non_canonical_ecf` refusal;
+    * it re-parses the payload from bytes, a second full walk of every
+      inbound frame on the hot path, where the decode has already built the
+      structure this function reads.
+
+    The two derivations are pinned against each other by
+    ``test_tag_policy_preadmission_5a.py::TestTheTwoDerivationsAgree`` — the
+    standing two-representations discipline, since a rule with two
+    implementations in one process is one refactor from disagreeing.
+
+    .. rubric:: Scope
+
+    Deliberately **only** the tag arm. The other five canonical-form rules
+    (indefinite lengths, non-minimal arguments, float minimization, map key
+    order, ``undefined``) are not enforced on receipt: §1.8 requires storing
+    and forwarding the original bytes, and a peer that refuses them has no
+    corpus row telling it which code to use. Adding an arm here is a wire
+    decision and needs its own §4.11 row first.
+    """
+    stack: list[Any] = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, _CBOR_TAG_TYPES):
+            return True
+        if isinstance(cur, dict):
+            # Keys as well as values: a tagged map KEY is still a
+            # major-type-6 item in a data-field position, and it is the one
+            # a value-only walk would miss.
+            stack.extend(cur.keys())
+            stack.extend(cur.values())
+        elif isinstance(cur, (list, tuple, set, frozenset)):
+            stack.extend(cur)
+    return False
 
 
 class UnsupportedContentHashFormatError(ValueError):

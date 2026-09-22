@@ -33,7 +33,7 @@ from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.framing import (
     MAX_MESSAGE_SIZE,
     FramingError,
-    validate_entity_hash,
+    admit_decoded_frame,
 )
 from entity_core.utils.ecf import ecf_decode, ecf_encode, validate_hash
 
@@ -250,9 +250,9 @@ async def _send_http_response(
 def _decode_envelope_body(body: bytes) -> Envelope:
     """Decode a raw CBOR envelope from an HTTP request body.
 
-    Validates hashes the same way ``recv_envelope`` does. Unlike TCP
-    framing, there is no 4-byte length prefix — Content-Length carries
-    the framing.
+    Shares ``recv_envelope``'s admission checks by calling the same
+    function, rather than mirroring them. Unlike TCP framing there is no
+    4-byte length prefix — Content-Length carries the framing.
     """
     if not body:
         raise FramingError("empty request body")
@@ -261,21 +261,19 @@ def _decode_envelope_body(body: bytes) -> Envelope:
     except Exception as exc:
         raise FramingError(f"invalid CBOR payload: {exc}") from exc
 
-    # Mirror recv_envelope's hash validation (root + included).
-    root = data.get("root", {})
-    if isinstance(root, dict) and root.get("content_hash"):
-        validate_entity_hash(root)
-    included = data.get("included", {})
-    if isinstance(included, dict):
-        for ent in included.values():
-            if isinstance(ent, dict) and ent.get("content_hash"):
-                validate_entity_hash(ent)
-    elif isinstance(included, list):
-        for ent in included:
-            if isinstance(ent, dict) and ent.get("content_hash"):
-                validate_entity_hash(ent)
-
-    return Envelope.from_dict(data)
+    # ⛔ THIS USED TO BE A HAND-ROLLED COPY, under the docstring above, and
+    # the docstring was true when written and false by the time anyone read
+    # it. It had drifted from `recv_envelope` twice:
+    #
+    #   * 0.8.2.25's non-map arm — it went straight to `data.get("root")`, so
+    #     a body decoding to CBOR `null` raised a bare `AttributeError` here
+    #     instead of a coded refusal;
+    #   * 0.8.2.26 row (5a) — no tag-policy check at all.
+    #
+    # And it is the boundary NO cohort probe reaches: every prober in this
+    # ecosystem dials TCP, so a defect here stays green indefinitely. One
+    # derivation, both ingresses — see `admit_decoded_frame`.
+    return admit_decoded_frame(data)
 
 
 class HttpServer:

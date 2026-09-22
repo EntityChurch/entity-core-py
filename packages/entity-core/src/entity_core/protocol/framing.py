@@ -18,6 +18,7 @@ from entity_core.utils.ecf import (
     Hash,
     UnsupportedContentHashFormatError,
     compute_ecf_hash,
+    contains_cbor_tag,
     ecf_decode,
     ecf_encode,
     get_hash_algorithm,
@@ -131,6 +132,53 @@ class FrameTruncatedError(FramingError):
     status = 400
     code = "invalid_request"
     stream_synchronized = False
+
+
+class NonCanonicalEcfError(FramingError):
+    """The frame DECODED and carries a CBOR tag in a data-field position.
+
+    **400** ``non_canonical_ecf`` (``ENTITY-CBOR-ENCODING`` §5.4), and the
+    close is a **choice**: the length prefix completed and the payload was
+    consumed whole, so the next read starts on a frame boundary and §9 arm
+    (f) binds this member. ``stream_synchronized = True``.
+
+    .. rubric:: 0.8.2.26 ``DR-3`` — this is not the framing arm, and the
+       partition is the whole ruling
+
+    Before `.26` §4.11's framing row read *"un-parseable, truncated or
+    **non-canonical** CBOR"*, and a tag satisfied that row and §5.4's MUST
+    simultaneously and incompatibly. `.26` removes the word and partitions
+    the input::
+
+        bytes that do NOT decode at all   -> 400 invalid_request   (framing)
+        bytes that DO decode, with a tag  -> 400 non_canonical_ecf (§5.4)
+
+    **The code selects the caller's remedy.** *"Re-encode without the tag"*
+    is precisely the fix here, and it is not *"your bytes are truncated"* —
+    which is the same argument 0.8.2.24 used, in the opposite direction, to
+    refuse ``non_canonical_ecf`` on the truncated arm. Both halves of that
+    argument are now live in this class.
+
+    .. rubric:: ⛔ The measured pre-state, because it is the finding
+
+    This peer had **no receive-path tag check at all**. ``ecf_decode``
+    deliberately preserves tags as ``CBORTag`` (byte fidelity, §1.8), the
+    envelope decoded, the root was a map, and the request was **admitted** —
+    a tagged EXECUTE and its untagged twin answered *identically*. The code
+    ``non_canonical_ecf`` had **zero emission sites** in the tree.
+
+    And the rule was not un-implemented, it was **unreached**:
+    :func:`entity_core.conformance.is_canonical_ecf` has carried an explicit
+    *"tag encountered (major type 6 forbidden in ECF)"* arm since the initial
+    release, with its only call site in the conformance *emitter*. A
+    validator with no consumer on the path the rule governs — §2.4
+    ``exclude``, the ``peers`` dimension and the resolver ceiling, a fourth
+    time.
+    """
+
+    status = 400
+    code = "non_canonical_ecf"
+    stream_synchronized = True
 
 
 class HashValidationError(Exception):
@@ -533,95 +581,173 @@ async def recv_envelope(
                      e, len(payload), payload.hex()[:64])
         raise FramingError(f"Invalid CBOR payload: {e}") from e
 
-    # §4.11 — "NEVER BECOMES AN ENVELOPE" IS WIDER THAN "DOES NOT DECODE".
-    #
-    # A payload can decode perfectly and still not be an envelope: `\xf6` is
-    # a valid CBOR null, `\xff` decodes to a break marker, `42` is an integer.
-    # None of them is a map, so none of them has a `root`.
-    #
-    # ⛔ This check was absent, and its absence was invisible because the
-    # NEXT line is `data.get("root")` — so a non-map payload raised a bare
-    # `AttributeError: 'BreakMarkerType' object has no attribute 'get'` out of
-    # the framing layer. It still reached the serve loop's catch-all and still
-    # produced a coded 400, which is why no row noticed; what it did not carry
-    # was `stream_synchronized`, so the peer closed a connection it could have
-    # kept — §9 arm (f) — and the refusal's code came from a fallback rather
-    # than from the cause.
-    #
-    # It also means the pre-existing N4 row named
-    # `test_undecodable_cbor_still_gets_a_coded_frame` was driving an
-    # AttributeError on a payload that DOES decode, not un-parseable CBOR:
-    # `b"\xff\xff\xff\xff not cbor"` is a break marker followed by bytes the
-    # decoder never reaches. The standing law — *your fixture is not the
-    # discriminating configuration* — with the decoder as the filter.
-    if not isinstance(data, dict):
-        raise FramingError(
-            "frame decoded but is not an envelope map: "
-            f"{type(data).__name__}",
-        )
-
     # Debug logging similar to Go/Rust peers
     if logger.isEnabledFor(logging.DEBUG):
-        root = data.get("root", {})
+        root = data.get("root", {}) if isinstance(data, dict) else {}
         root_type = root.get("type", "unknown") if isinstance(root, dict) else "unknown"
         root_hash = root.get("content_hash") if isinstance(root, dict) else None
         hash_display = hash_to_display(root_hash)[:16] + ".." if root_hash else "none"
-        included = data.get("included", {})
+        included = data.get("included", {}) if isinstance(data, dict) else {}
         included_count = len(included) if isinstance(included, (dict, list)) else 0
         logger.debug(
             "[wire] <- recv root_type=%s content_hash=%s included_count=%d size=%d",
             root_type, hash_display, included_count, len(payload)
         )
 
-    # Validate all entity hashes before accepting
+    # §4.11 — the pre-admission checks, shared with the HTTP ingress. ONE
+    # derivation: this peer has two boundaries for the same bytes and the
+    # second was a hand-rolled copy that had drifted twice. See
+    # `admit_decoded_frame`.
+    return admit_decoded_frame(data, validate_hashes=validate_hashes)
+
+
+def admit_decoded_frame(
+    data: Any,
+    *,
+    validate_hashes: bool = True,
+) -> Envelope:
+    """The pre-admission checks a decoded frame owes, at EVERY boundary.
+
+    ``data`` is the already-decoded CBOR of one frame. Returns the
+    :class:`Envelope` if the frame is admissible; raises the refusal carrying
+    its own ``(status, code, stream_synchronized)`` otherwise.
+
+    .. rubric:: ⛔ Why this is a function and not two correct-looking copies
+
+    This peer has **two** ingresses for the same bytes — TCP
+    (:func:`recv_envelope`) and HTTP (``http_server._decode_envelope_body``)
+    — and the HTTP one was a hand-rolled copy under the docstring *"Validates
+    hashes the same way ``recv_envelope`` does."* That sentence was true when
+    it was written and had since become false **twice**:
+
+    * **0.8.2.25's non-map arm** — *"never becomes an Envelope"* is wider than
+      *"does not decode"*. The TCP side gained an ``isinstance(data, dict)``
+      refusal; the HTTP side still went straight to ``data.get("root")``, so
+      a payload decoding to CBOR ``null`` raised a bare ``AttributeError``
+      out of the decode boundary rather than a coded refusal.
+    * **0.8.2.26 row (5a)** — the tag policy. Adding it to the TCP side alone
+      would have made this the *third* drift in the same pair.
+
+    It is also the boundary **no cohort probe reaches**: every conformance
+    prober in this ecosystem dials TCP, so the HTTP copy can be arbitrarily
+    wrong and stay green forever. That is the standing *"a probe family's
+    blind spot is the seat the prober sits in"* law, and the reason the
+    remedy is one derivation rather than a second careful edit.
+
+    The order is the ruling and it is **structural**, not incidental — see
+    the source comments; two adjacent correct-looking checks read fine in
+    either sequence.
+    """
+    # §4.11 row (5a) / `ENTITY-CBOR-ENCODING` §5.4 (0.8.2.26 DR-3) — the tag
+    # policy, FIRST. The order is a ruling in BOTH directions and neither is
+    # incidental:
+    #
+    # * before the non-map arm below, because a payload wrapped in **tag
+    #   55799** (the CBOR self-describe marker — the one tag real encoders
+    #   emit by accident) decodes to a `CBORTag`, which is not a dict. Ordered
+    #   the other way it takes the framing arm and answers `400
+    #   invalid_request` — *"your bytes are un-parseable"* — about bytes that
+    #   parsed perfectly. That is DR-3's own defect, re-created by the row
+    #   DR-3 produced. Measured: this WAS the behaviour until the ordering
+    #   was fixed (SA-PY-66).
+    # * before the hash validation below, because a tagged entity's hash may
+    #   be perfectly VALID — the sender computed it over the same tagged
+    #   bytes — so a hash-first order admits it. The two rules overlap on
+    #   exactly one input and the code it owes is this one: "re-encode
+    #   without the tag" is the caller's remedy, and "your hash is wrong" is
+    #   not even true.
+    #
+    # ⚠ §4.11's row says *"in a data-field position"* and ECF §6.3 says *"at
+    # any depth"*. py implements the WIDER reading; routed as SA-PY-66.
+    if contains_cbor_tag(data):
+        raise NonCanonicalEcfError(
+            "frame decoded but carries a CBOR tag (ENTITY-CBOR-ENCODING "
+            "§5.4/§6.3; major type 6 is forbidden at any depth) — re-encode "
+            "without the tag",
+        )
+
+    # §4.11 (0.8.2.25) — "NEVER BECOMES AN ENVELOPE" IS WIDER THAN "DOES NOT
+    # DECODE". `\xf6` is a valid CBOR null, `\xff` a break marker, `42` an
+    # integer: all decode, none is a map, none has a `root`.
+    if not isinstance(data, dict):
+        raise FramingError(
+            "frame decoded but is not an envelope map: "
+            f"{type(data).__name__}",
+        )
+
     if validate_hashes:
-        # Validate root entity
-        root = data.get("root", {})
-        if root.get("content_hash"):  # Only validate if hash is present
+        _validate_envelope_hashes(data)
+
+    return Envelope.from_dict(data)
+
+
+def _validate_envelope_hashes(data: dict[str, Any]) -> None:
+    """§1.8 validate-on-receipt for the root and every ``included`` entry.
+
+    py is **mechanism (b)** under §1.8 item 1 (0.8.2.26): the wire ``included``
+    map's keys are discarded at decode (``Envelope.from_dict`` keeps a list),
+    so there is no wire key to inspect and an *unreferenced* mis-keyed entry
+    is not represented at all. `.26` blesses that and forbids a conformance
+    check from asserting a refusal on it.
+
+    ⚠ **`DR-5` is the cost of that choice and it lands on this seat alone.**
+    Mechanism (a) is one check at one site; (b) is a check at **N ingresses**,
+    and *"N−1 of N is wire-indistinguishable from N of N"* — no probe can
+    find the ingress you missed. §1.8 therefore says an implementation
+    adopting (b) SHOULD **enumerate its ingresses and assert the validation
+    pass at each**. That enumeration is
+    ``tests/integration/test_included_ingress_census_dr5.py``, and this
+    function existing as ONE callable is what makes the census assertable
+    rather than a re-read.
+    """
+    root = data.get("root", {})
+    if isinstance(root, dict) and root.get("content_hash"):
+        try:
+            validate_entity_hash(root)
+        except HashValidationError as e:
+            logger.error("Hash validation failed for ROOT entity")
+            # No correlation: the root is the thing that failed, so its
+            # `request_id` is not a value this peer may rely on (§4.10(a)).
+            raise HashValidationError(str(e), request_id=None) from e
+
+    # §5.2a/N4 (0.8.2.24): the id to correlate a decode-boundary refusal by.
+    # Read only AFTER the root has validated, so it is the id of a frame
+    # whose envelope really is what it says it is — which is the forgery
+    # shape: valid EXECUTE root, mis-stamped `included` entry.
+    request_id = None
+    if isinstance(root, dict):
+        root_data = root.get("data")
+        if isinstance(root_data, dict):
+            candidate = root_data.get("request_id")
+            if isinstance(candidate, str):
+                request_id = candidate
+
+    included = data.get("included", {})
+    if isinstance(included, dict):
+        for entity_hash, entity in included.items():
             try:
-                validate_entity_hash(root)
+                validate_entity_hash(entity)
             except HashValidationError as e:
-                logger.error("Hash validation failed for ROOT entity")
-                # No correlation: the root is the thing that failed, so its
-                # `request_id` is not a value this peer may rely on (§4.10(a)).
-                raise HashValidationError(str(e), request_id=None) from e
-
-        # §5.2a/N4 (0.8.2.24): the id to correlate a decode-boundary refusal
-        # by. Read only after the ROOT has validated, so it is the id of a
-        # frame whose envelope really is what it says it is — which is the
-        # forgery shape: valid EXECUTE root, mis-stamped `included` entry.
-        request_id = None
-        if isinstance(root, dict):
-            root_data = root.get("data")
-            if isinstance(root_data, dict):
-                candidate = root_data.get("request_id")
-                if isinstance(candidate, str):
-                    request_id = candidate
-
-        # Validate all included entities
-        included = data.get("included", {})
-        if isinstance(included, dict):
-            for entity_hash, entity in included.items():
+                key_display = (
+                    entity_hash.hex() if isinstance(entity_hash, bytes)
+                    else str(entity_hash)
+                )
+                logger.error(
+                    "Hash validation failed for INCLUDED entity at key=%s",
+                    key_display[:16] + "...",
+                )
+                raise HashValidationError(str(e), request_id=request_id) from e
+    elif isinstance(included, list):
+        for idx, entity in enumerate(included):
+            if isinstance(entity, dict) and entity.get("content_hash"):
                 try:
                     validate_entity_hash(entity)
                 except HashValidationError as e:
-                    key_display = entity_hash.hex() if isinstance(entity_hash, bytes) else str(entity_hash)
-                    logger.error("Hash validation failed for INCLUDED entity at key=%s", key_display[:16] + "...")
-                    raise HashValidationError(
-                        str(e), request_id=request_id,
-                    ) from e
-        elif isinstance(included, list):
-            for idx, entity in enumerate(included):
-                if entity.get("content_hash"):
-                    try:
-                        validate_entity_hash(entity)
-                    except HashValidationError as e:
-                        logger.error("Hash validation failed for INCLUDED entity at index=%d", idx)
-                        raise HashValidationError(
-                            str(e), request_id=request_id,
-                        ) from e
-
-    return Envelope.from_dict(data)
+                    logger.error(
+                        "Hash validation failed for INCLUDED entity at index=%d",
+                        idx,
+                    )
+                    raise HashValidationError(str(e), request_id=request_id) from e
 
 
 async def send_message(writer: asyncio.StreamWriter, message: dict[str, Any]) -> None:

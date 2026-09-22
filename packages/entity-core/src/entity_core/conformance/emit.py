@@ -125,11 +125,46 @@ def _emit_peer_id(input_val: dict) -> bytes:
 
 
 def _emit_signature(input_val: dict) -> bytes:
-    """Deterministic Ed25519 sign(ECF(entity)) under seed-derived key."""
+    """Deterministic Ed25519 ``sign(content_hash(entity))`` under a
+    seed-derived key — §7.3, CQ-22, ruled at ``0.8.2.26``.
+
+    The message is the target entity's **full `content_hash`** —
+    ``varint(format_code) ‖ SHA256(ECF({type, data}))`` — never the bare
+    digest and never the entity's canonical-ECF bytes.
+
+    .. rubric:: ⛔ This signed ``ecf_encode(entity)`` until 0.8.2.26 was
+       absorbed, and that made py a SECOND implementation of the losing
+       reading
+
+    Arch's `.26` packet states: *"Your peer is already right… **the sole
+    implementation of the losing reading is the conformance fixture.**"* True
+    of this peer — ``auth.create_signature_entity`` signs the full
+    ``target_hash`` and always has, which is why 8 of 8 live peers complete
+    the handshake. **False of this emitter.** Had py been used as the second
+    independent codec for `S-1`'s cross-bless, it would have **confirmed the
+    wrong bytes**, and two independent codecs agreeing is the most convincing
+    green there is — the standing *cohort agreement is evidence about the
+    reading implementers reach, not about the text* law.
+
+    .. rubric:: ⭐ And the correct input was one function above, unused
+
+    Arch's own finding about the artifact — *"it contains its own correct
+    input one category above: ``content_hash.1`` produces the exact value
+    §7.3 names as the message, and the ``signature`` category three rows down
+    does not use it"* — was true of **this file** in the identical shape:
+    :func:`_emit_content_hash` sat directly above and was never called. It is
+    called now, so the two categories cannot drift apart again without the
+    ``content_hash`` category moving too.
+    """
     seed = bytes(input_val["seed"])
     entity = input_val["entity"]
     keypair = Keypair.from_seed(seed)
-    msg = ecf_encode(entity)
+    msg = _emit_content_hash({
+        "type": entity["type"],
+        "data": entity["data"],
+        **({"format_code": entity["format_code"]}
+           if "format_code" in entity else {}),
+    })
     return keypair.sign(msg)
 
 

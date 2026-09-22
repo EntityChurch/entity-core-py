@@ -37,7 +37,7 @@ from entity_core.protocol.envelope import Envelope
 from entity_core.protocol.framing import (
     FramingError,
     MAX_MESSAGE_SIZE,
-    validate_entity_hash,
+    admit_decoded_frame,
 )
 from entity_core.protocol.messages import (
     Execute,
@@ -209,19 +209,17 @@ def _body_to_envelope(body: bytes) -> Envelope:
     except Exception as exc:
         raise FramingError(f"invalid CBOR payload: {exc}") from exc
 
-    root = data.get("root", {})
-    if isinstance(root, dict) and root.get("content_hash"):
-        validate_entity_hash(root)
-    included = data.get("included", {})
-    if isinstance(included, dict):
-        for ent in included.values():
-            if isinstance(ent, dict) and ent.get("content_hash"):
-                validate_entity_hash(ent)
-    elif isinstance(included, list):
-        for ent in included:
-            if isinstance(ent, dict) and ent.get("content_hash"):
-                validate_entity_hash(ent)
-    return Envelope.from_dict(data)
+    # THE THIRD COPY. §1.8 validate-on-receipt is symmetric — a RESPONSE
+    # from a remote peer is received bytes exactly as a request is, and this
+    # is the ingress where the remote is the one we did not authenticate as
+    # a caller. It carried the same hand-rolled mirror as the HTTP server
+    # side and had drifted the same two ways (no non-map arm, no tag policy).
+    #
+    # py is mechanism (b) under §1.8 item 1, and `DR-5` (0.8.2.26) is the
+    # cost of that: N ingresses, where "N−1 of N is wire-indistinguishable
+    # from N of N". One derivation is what makes N assertable —
+    # `tests/integration/test_included_ingress_census_dr5.py`.
+    return admit_decoded_frame(data)
 
 
 class HttpConnection:

@@ -268,6 +268,177 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **SEVENTH instance of the fixed-port class, and the port was chosen BY the documented rule —
+  because the documented set is the VALIDATOR's, and this repo binds its own.** *2026-09-16.*
+  The standing rule says: pick a debugging port **below 32 768** (outside the ephemeral range)
+  and **outside the harness's fixed set (`9000`, `9401`, `9451`, `9452`)**. Followed exactly:
+  `19501`. Ten errors on the next full run, every one `[Errno 98] address already in use` at
+  `127.0.0.1:19501` — because **`tests/integration/test_durability_contract.py` and
+  `test_subscription_burst_real_wire.py` bind `19501` as a fixed port**.
+  **The enumerated set was never the whole set.** It was assembled from the *cohort validator's*
+  ports, by sessions tripping over *the validator's* leftovers — so it names the ports another
+  repo's harness owns and is silent about the ones ours does. A rule stated as a list is only as
+  wide as the incidents that built it, and every incident here came from one direction.
+  **The rule, restated so it is closed:** before binding a long-lived debugging peer,
+  `grep -rn "<port>" tests/` **in this repo** as well as checking the documented set — or take
+  the port from `ss -ltnp` *plus* a grep, never from the list alone. The cheap general form:
+  **debug on a port the repo never mentions**, e.g. `18xxx`, and grep to confirm.
+  ⭐ **And the self-reaping worked, which is the half worth recording as a win.** The peer was
+  started with `ENTITY_PEER_MAX_LIFETIME=900` and reaped itself on schedule, on a box where an
+  agent cannot `kill` — the fifth-instance remedy (*a process an agent cannot reap must reap
+  itself*) doing exactly its job. The cost of this instance was one re-run, not a leftover that
+  outlives the session. **Set the lifetime even when you are sure the port is free**; it is what
+  turned a permanent collision into a ten-minute one.
+
+- **An exculpation names a COMPONENT, and you have two — the one it names and the one that
+  makes the artifact everyone else blesses against.** ***RATIFIED 2026-09-16*** *— fourteenth
+  axis of the hearsay law, and the second time a premise saying **you already comply** shipped
+  a live defect here (the first was §8.3's `_EVAL_LIMIT_CODES`). The new part is that the
+  premise was **true**, about the component it named.* `CQ-22` ruled the signature message is
+  the target's **full `content_hash`**, and arch's packet exculpates this seat: *"Your peer is
+  already right… **the sole implementation of the losing reading is the conformance
+  fixture.**"* Measured: py has **two** homes for that rule and they disagreed.
+  `auth.create_signature_entity` signs `target_hash` — §7.3, correct, which is why 8 of 8 live
+  peers handshake. **`conformance.emit._emit_signature` signed `ecf_encode(entity)`** — the
+  withdrawn reading, in the one component whose entire job is producing bytes other seats bless
+  against.
+  **Why that direction is the expensive one.** `S-1` item 4 asks for *"a second independent
+  codec"* to cross-bless the regenerated vectors, and py is an obvious candidate — independent
+  decoder, independent ECF encoder, RFC 8032 Ed25519. Offered as that codec, py would have
+  **confirmed the wrong bytes**, and *two independent codecs agreeing* is the strongest green
+  the cohort has. The exculpation removes the one prompt that would have sent anyone looking.
+  ⭐ **And the corpus's own defect had the identical shape in our source.** Arch's finding —
+  *"the artifact contains its own correct input one category above; the `signature` category
+  three rows down does not use it"* — was true of `emit.py`: `_emit_content_hash` sat
+  **directly above** `_emit_signature`, unused. *A defect you are reading about in someone
+  else's artifact is worth one grep in your own, in the same shape, before you file it as
+  theirs.*
+  **The check:** when a ruling exculpates *"your peer"*, enumerate every component in the repo
+  that implements the same rule — peer, SDK, conformance emitter, fixture builder, CLI — and
+  assert they produce the **same bytes**. Enforcement point:
+  `tests/unit/test_signature_message_is_the_content_hash_cq22.py::TestThePeerAndTheEmitterAGREE`,
+  whose oracle is §7.3 written out as code rather than a call to the function under test.
+  One mutation, one correct prediction (3 of 5 rows).
+
+- **A vector whose expected value is unfilled RUNS your code and measures nothing — and it is
+  green, every time, for the life of the corpus.** *Candidate, 2026-09-16.* Arch's `.26` note
+  is *"nobody had ever EXECUTED a Class-B category… reading a normative artifact and running it
+  are different acts, and only one of them is a measurement."* This seat is the sharper case:
+  py **executes** all three Class-B signature constructions on every suite run, via
+  `emit_canonical`, and `test_emit_canonical_no_errors` asserts `errors == {}` and the result
+  counts. The corpus it loads is the **pre-cross-bless STARTER** copy in which every
+  `encode_equal` vector's `canonical` is `h''`. **So the act was performed and still was not a
+  measurement** — an emission compared to nothing cannot disagree, and that is exactly how
+  `_emit_signature` carried the losing reading undetected.
+  **This is `AGENTS-STANDARD`'s *a skip counts as a failure* with an unfilled ORACLE instead of
+  a skip** — and it is worse, because a skip is reported and an empty expected value is
+  indistinguishable from a pass in every counter. The suite says *"64 encode_results, 0
+  errors"*, which reads as coverage and is a count of *emissions*.
+  **The check:** for any corpus-driven harness, assert that the expected values are **present**
+  before trusting the run — and where they are absent, the oracle has to be the rule itself.
+  Enforcement point: `tests/unit/test_corpus_provenance_s2.py`, which pins that the Class-B
+  canonicals are still `h''` **with the retirement condition in the assertion message**, so the
+  day the published corpus is adopted the row tells its reader to flip to byte equality.
+  *(Its own first run corrected its author — the draft asserted py's corpus had no Class-B
+  category at all; the categories are identical and 69-vs-71 is two extra `nested` vectors.)*
+
+- **A per-delta "does your tree move?" column is scoped by the ADDRESSEE'S MECHANISM, and the
+  delta written ABOUT your mechanism is the one it scores "no".** ***RATIFIED 2026-09-16***
+  *— thirteenth axis of the "a routed report's claims about our repo are hearsay" law, and the
+  second where the carrier is a table of `—`/`no` rows. The twelfth axis was a **compliment**
+  (a sibling saying we already conform); this is a **blessing** (a ruling deciding in our
+  favour), and it is the same terminates-in-no-work shape one step further from suspicion.*
+  0.8.2.26 blesses two mechanisms for §1.8's mis-keyed `included` entry. **`DR-4` rules in py's
+  favour** — our `included` is a **list**, wire keys discarded, so the probe's input does not
+  exist in our decoded form — and go's relay leads with it as a win. **`DR-5`, in the same
+  revision, is the COST of that same choice**: *"(a) is one check at one site and cannot be
+  partially adopted; (b) is a check at **N ingresses**, and **N−1 of N is wire-indistinguishable
+  from N of N**… an implementation adopting (b) SHOULD enumerate its ingresses and assert the
+  validation pass at each."*
+  **Both routing artifacts score `DR-5` "no".** arch's fold table is *correct for its addressee*
+  — go is mechanism (a), for which `DR-5` is not applicable — and go's relay §5 to py lists
+  `DR-2`/`DR-8`/`DR-9`/`DR-4` and **does not mention `DR-5` at all**, reasonably, since its own
+  column said no. So the one delta in the round written about the mechanism py chose arrived
+  marked as costing nothing.
+  **Measured: it cost three ingresses.** The census `DR-5` asks for — run over the inventory a
+  defect cannot edit, every `ecf_decode` call site — found `framing.recv_envelope` (TCP),
+  `http_server._decode_envelope_body` and `http_client._body_to_envelope`, and **both HTTP ones
+  were hand-rolled copies that had drifted twice**: no 0.8.2.25 non-map arm, no 0.8.2.26 tag
+  policy, under the docstring *"Validates hashes the same way `recv_envelope` does."* True when
+  written. ⭐ **And they are the boundary no cohort probe reaches** — every prober in this
+  ecosystem dials TCP — so `DR-5`'s *"wire-indistinguishable"* was the measured state of this
+  tree, not a hypothesis.
+  **The check:** when a ruling blesses a **choice** rather than fixing a defect, read the whole
+  round for the delta that prices that choice, and **do not read your own row's verdict as the
+  answer** — a per-seat column is computed from the addressee's implementation, and yours is the
+  one it cannot see. Remedy is the standing `F68` one: **one derivation, not N agreeing ones**.
+  Enforcement point: `tests/integration/test_included_ingress_census_dr5.py`, which enumerates
+  the ingresses from the call graph, asserts none keeps a private copy of the admission checks,
+  and is **monotone in both directions** — a ledgered exemption that stops decoding fails too.
+
+- **A validator can be complete, tested, corpus-backed — and never called on the path the rule
+  governs; and the thing that hides it is that the rule reads as UNIMPLEMENTED rather than
+  UNREACHED.** *Candidate, 2026-09-16 — fourth instance of the validator-vs-consumer law (§2.4
+  `exclude`, the `peers` dimension, the resolver ceiling), and the widest.* `.26`'s `DR-3` makes
+  the CBOR tag policy a §4.11 pre-admission refusal: bytes that DO decode and carry a
+  major-type-6 item → `400 non_canonical_ecf`. Measured here before any edit, a **tagged EXECUTE
+  and its untagged twin answered identically** (`401 authentication_failed`, CE-1) — the frame
+  was **admitted**, because `ecf_decode` preserves tags as `CBORTag` for §1.8 byte fidelity and
+  nothing downstream looked. `non_canonical_ecf` had **zero emission sites**.
+  **And `is_canonical_ecf` has carried an explicit *"tag encountered (major type 6 forbidden in
+  ECF)"* arm since the initial release** — with its only call site in `conformance/emit.py`,
+  scoring `decode_reject` **vectors**. A validator with a test suite *and a conformance
+  category* and no consumer on the wire path. The three earlier instances were a field with a
+  validator and no consumer; this one is a **whole rule** with a validator, and the extra cover
+  is that a grep for the concept returns hits, so the surface reads as done.
+  **The check:** for a rule your repo owns a validator for, grep the validator's **call sites**,
+  not the validator — and ask whether any of them is on the path the rule is about. A
+  conformance-emitter-only consumer means the rule is scored against *vectors* and enforced
+  **nowhere**. Enforcement point: `tests/integration/test_tag_policy_preadmission_5a.py`, two
+  mutations, two correct predictions.
+
+- **A detector must name the class YOUR codec mints, and the public name is the wrong one.**
+  *Candidate, 2026-09-16 — found by a discipline row, not by the wire rows.* `cbor2.CBORTag`
+  **is** `_cbor2.CBORTag`, the C extension's class. `ecf_decode` deliberately goes through the
+  **pure-Python** decoder (the C extension's tag dispatch cannot be intercepted), which mints
+  `cbor2._types.CBORTag` — *a distinct class*. The first draft of `_CBOR_TAG_TYPES` read
+  `(cbor2.CBORTag, _cext_types.CBORTag)`: **one class named twice**, blind on exactly the path
+  it guards and correct-looking everywhere else.
+  **What caught it is the entry.** Every wire row failed *identically to an unfixed peer*, so
+  the behavioural evidence pointed at the check being absent rather than blind — and the
+  diagnosis went to the wrong place. The row that separated them was the **two-derivations**
+  row (byte-walker vs object-walker), written as a two-representations discipline and not
+  expected to fail. *When a fix's rows fail exactly as the unfixed tree did, suspect the
+  fix is present and blind before suspecting it is missing.*
+  **The check:** when a guard tests `isinstance` against a library type, assert **structurally**
+  that the class your own decoder returns is in the tuple — `type(decode(encode(x)))` — because
+  no behavioural row can tell *"the detector is blind"* from *"the detector is absent"*.
+  Enforcement point:
+  `test_tag_policy_preadmission_5a.py::TestTheTwoDerivationsAgree::
+  test_the_detector_names_the_class_OUR_DECODER_MINTS`. This is `_register_cext_type_adapters`'s
+  own documented hazard, arriving from the decode side one function away from the comment
+  describing it.
+
+- **A FILING is a claim about your own tree, and it is the claim in a filing nobody checks —
+  because the filing is framed as not knowing the answer.** *Candidate, 2026-09-16 — caught
+  pre-routing, cost nothing, which is why it is recorded.* SA-PY-66 was drafted asserting *"py
+  implements the WIDER refusal (any depth)"* for §4.11 row (5a) vs ECF §6.3. Driven before
+  routing: a **tag-55799-wrapped envelope** — the one tag real encoders emit by accident —
+  decodes to a `CBORTag`, **which is not a dict**, so the non-map arm fired **first** and
+  answered `400 invalid_request`. py was on the **narrow** reading, not by choice but by the
+  order of two adjacent checks, with no line anywhere stating a position.
+  **The shape:** an SA's *"what we do in the meantime"* paragraph is written from the code you
+  just wrote, at the moment you are most certain of it, and it is the paragraph arch quotes back
+  as this seat's data point. Same family as the `test_resolution_integrity_k1` docstring that
+  routed a false claim to two seats — with a **filing** rather than a docstring as the carrier,
+  and the routing not yet sent.
+  **The check:** every sentence in a filing whose subject is *py* is a row you owe before the
+  packet goes out, especially the reassuring one. Enforcement point:
+  `test_included_ingress_census_dr5.py::
+  test_a_tag_55799_WRAPPING_the_envelope_is_the_tag_row_not_the_framing_row`, plus its `\xf6`
+  control pinning that an ordinary non-map payload still takes the framing code — the row the
+  ordering fix could have broken.
+
 - **A sibling's "you already do this" is scoped to the MEMBER they measured, and they will
   write it about the CLASS.** ***RATIFIED 2026-09-15*** *— twelfth axis of the "a routed
   report's claims about our repo are hearsay" law, and the first where the claim is that we

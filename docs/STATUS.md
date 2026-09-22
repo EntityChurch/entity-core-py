@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-12 · public: v0.8.0 (master)_
+_Updated: 2026-09-16 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -48,6 +48,77 @@ on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev u
 Python 3.11–3.13 and `uv`.
 
 ## Where we left off
+
+> **`0.8.2.26` is absorbed, and two of its nine `no` columns were work here
+> (2026-09-16).** The round was relayed as *"nothing in either of your trees moves for
+> `.26`"* — accurate for seven deltas, verified rather than accepted, and wrong for two.
+> Both are the same shape: **a per-delta "does your tree move?" column is scoped by the
+> addressee's implementation**, and the delta written about *our* mechanism is the one it
+> scores "no".
+>
+> - **`DR-3` — the tag policy.** py had **no receive-path tag check at all**: a tagged
+>   EXECUTE and its untagged twin answered **identically**, so the frame was *admitted*,
+>   and `non_canonical_ecf` had **zero emission sites**. The rule was not un-implemented,
+>   it was **unreached** — `is_canonical_ecf` has carried a `major type 6 forbidden` arm
+>   since the initial release, with its only call site in the conformance *emitter*.
+> - **`DR-5` — mechanism (b)'s bill.** `DR-4` rules in py's favour (our `included` is a
+>   list) and `DR-5`, in the same revision, prices that choice: *N ingresses, and N−1 of N
+>   is wire-indistinguishable from N of N.* py is the only ground-up seat that is
+>   mechanism (b), and the delta appears in **neither** routing artifact's py section. The
+>   census found **three** ingresses; the two HTTP ones were hand-rolled copies that had
+>   drifted twice, on the boundary **no cohort probe dials**.
+> - **`S-1` — the exculpation is half true.** arch: *"the sole implementation of the losing
+>   reading is the conformance fixture."* True of our **peer**; false of our **conformance
+>   emitter**, which signed `ecf_encode(entity)`. Offered as `S-1` item 4's *"second
+>   independent codec"*, py would have **confirmed the wrong bytes**.
+> - **`S-2` is a no-op here and that is the finding** — this repo pins no corpus digest and
+>   runs a local pre-cross-bless STARTER corpus whose `canonical` fields are all `h''`. py
+>   *computes* all three Class-B signature constructions every run and compares them to
+>   nothing. Deliberately not synced (go's gate + the known-divergent vectors), with the
+>   retirement condition pinned in `tests/unit/test_corpus_provenance_s2.py`.
+>
+> `SA-PY-62` / `-63` / `-64` all **ruled in py's shape** (`DR-2` / `DR-8` / `DR-9`); `-63`'s
+> shape-based preservation is named PREFERRED. **`SA-PY-66` filed**: §4.11 row (5a)'s *"in a
+> data-field position"* vs ECF §6.3's *"at any depth"*, which a tag-55799-wrapped envelope
+> separates. Routed as `ROUTING-2026-09-16-a`. Suite **4767 · 2 F**, both the documented
+> fixed-port class.
+>
+> ⛔ **The owed validator run was taken, and the cohort number is BAD — and it is not this
+> diff.** `validate-complete.sh python` on ports below the ephemeral floor: passes 0, 0b, 2,
+> 3, 4, 5 exit 0; **passes 1 and 1b exit 1**, pass 1 reporting `PARTIAL — 1615 total ran`
+> with **898 unique failures**.
+>
+> **Attribution measured, not argued.** The same run at **`11ad269`** — the commit before
+> this session's work — gives the **identical 898**; `comm` on the two failure sets returns
+> **zero new and zero fixed**. This session's diff causes no regression, and the whole 898 is
+> pre-existing.
+>
+> **Root cause is one request, and it cascades.** `tree_operations.
+> merge_noncanonical_byte_fidelity` answers `400` (want `200`) and **the connection dies
+> immediately after**: **554** checks report `blocked: depends on …` and **351** report `EOF`
+> / `broken pipe` on that same socket. Whole categories read `0 pass / all fail`
+> (`attestation`, `quorum`, `identity`, `role`, `authz`, …) purely because they run after it.
+> ⚠ The `extract` null-byte message that *looks* like the root — *"a remote DoS reachable by
+> any peer holding a normal grant"* — is downstream cascade: `validate_path_chars` already
+> refuses NUL and `extract` routes every `paths[]` entry through it. **A detail block is not
+> run order**; read the `RUN`/`FAIL` sequence.
+>
+> **It is an unabsorbed routed item, not a new discovery.** `entity-core-go`'s
+> `ROUTING-2026-09-15-a` built this oracle and wrote *"go PASSes; rust and **py are untested
+> by me** … rust and py very likely have the same defect,"* with a two-line cohort worklist
+> for us. Nothing in `docs/status/` or `SPEC-AMBIGUITIES.md` mentions it — the 2026-09-15
+> session landed `.25` and did not take it.
+>
+> ⭐ **And its second worklist line corrects this session's own `DR-5` census.** go asks for
+> *"every ingest of a wire-supplied `included` map that does NOT pass through the receive
+> boundary — merge is one."* Ours enumerated `ecf_decode` call sites, which is **a census of
+> decoders, not of §1.8 ingresses**: a nested `included` map inside a params field was
+> decoded with its parent frame and is structurally invisible to it. Pinned rather than
+> absorbed — `TestTheNestedIngestClassIsOpen`.
+>
+> **Next, in order:** (1) the §1.8 nested-ingest pass on `merge`'s `source_envelope` — that
+> is the 898; (2) the concept-keyed ingest census behind it; (3) re-measure and publish the
+> number with go's oracle commit attached.
 
 > **The owed validator run was taken.** `validate-complete.sh python`, **all seven passes exit
 > 0**, on ports below the ephemeral floor — see the note under the number. The two-session-old
