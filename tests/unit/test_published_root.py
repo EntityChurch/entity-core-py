@@ -407,3 +407,198 @@ def test_the_declared_prefix_describes_the_keys_actually_published():
             f"the published trie carries — the declared prefix maps keys onto the "
             f"wrong paths"
         )
+
+
+# ---------------------------------------------------------------------------
+# The verify cycle is two fetches, and a republish used to land between them
+# ---------------------------------------------------------------------------
+
+
+class TestSupersededAnchorsStayServable:
+    """The 404 `published_root.v5_outbound_dial` scored against this peer.
+
+    A cold consumer's handshake is `MANIFEST_GET` (→ root *N*) followed by a
+    content fetch of *N*'s signature, which it MUST verify before walking
+    anything (§1.1). `LivePublishedRootScope` recomputed the served set on
+    every root change, so any write landing between those two fetches
+    republished to *N+1* and took *N*'s signature out of scope: the consumer
+    got a 404 on the signature for a root this peer had **just handed it**,
+    for a root that was never invalid.
+
+    Long-standing and load-dependent — it needs a write inside a window a
+    few milliseconds wide, so it scored green on quieter runs and only
+    landed once the cohort check set grew. The unit suite could not see it
+    at all: `test_live_closure_scope_follows_the_republished_root` drives
+    the **payload** arm of exactly this recompute and asserts an entity
+    bound after startup is servable. The recompute it exercises is the one
+    that drops the anchors, and a row that only reads the payload arm
+    passes either way.
+    """
+
+    @staticmethod
+    def _live_scope(peer):
+        from entity_core.peer.published_root import closure_scope_for_published_root
+
+        return closure_scope_for_published_root(peer.entity_tree, peer.content_store)
+
+    @staticmethod
+    def _anchors(peer):
+        pr_hash = bytes(peer.entity_tree.get("system/peer/published-root"))
+        sig_hash = peer.entity_tree.get(published_root_signature_path(pr_hash))
+        assert sig_hash is not None, "publish_root binds a signature"
+        return pr_hash, bytes(sig_hash)
+
+    def test_the_signature_of_the_root_a_consumer_holds_survives_a_republish(self):
+        """The headline row — this is the wire 404, driven at the scope."""
+        kp = Keypair.generate()
+        peer = PeerBuilder().with_keypair(kp).with_all_handlers().build()
+        peer.publish_root()
+        scope = self._live_scope(peer)
+        peer.enable_root_republish()
+
+        # MANIFEST_GET lands here: the consumer now holds root N.
+        pr_n, sig_n = self._anchors(peer)
+        assert scope.in_scope(sig_n), "precondition: N's signature is servable"
+
+        # An unrelated write republishes to N+1 — the window.
+        peer.emit_pathway.emit(
+            "system/content/public/late", Entity(type="system/blob", data={"a": 1})
+        )
+        assert bytes(peer.entity_tree.get("system/peer/published-root")) != pr_n, (
+            "precondition: the write must actually have moved the root"
+        )
+
+        # The consumer's second fetch, for the root it was handed.
+        assert scope.in_scope(sig_n), (
+            "the consumer cannot verify the root this peer just served it"
+        )
+        assert scope.in_scope(pr_n), (
+            "the invariant-pointer fetch of the same root must resolve too"
+        )
+
+    def test_a_superseded_roots_CONTENT_is_still_out_of_scope(self):
+        """The control: retention widened the ANCHORS, not the closure.
+
+        §6.5.6 Amendment 10 pins the served closure to the *current* root.
+        Retaining anchors must not resurrect a retired root's content — the
+        obvious over-broad fix (keep the old closures, or union them) passes
+        the headline row and fails this one.
+        """
+        kp = Keypair.generate()
+        peer = PeerBuilder().with_keypair(kp).with_all_handlers().build()
+        peer.publish_root()
+        scope = self._live_scope(peer)
+        peer.enable_root_republish()
+
+        secret = Entity(type="system/blob", data={"s": "in root N only"})
+        h = peer.emit_pathway.emit("system/content/public/transient", secret).hash
+        pr_n, sig_n = self._anchors(peer)
+        assert scope.in_scope(h), "precondition: bound, so it is inside root N"
+
+        # Unbind it: root N+1 no longer contains it.
+        peer.emit_pathway.delete("system/content/public/transient")
+        assert bytes(peer.entity_tree.get("system/peer/published-root")) != pr_n
+
+        assert scope.in_scope(sig_n), "N's anchors are retained (headline row)"
+        assert not scope.in_scope(h), (
+            "a retired root's CONTENT must not be servable — anchor retention "
+            "must not become a union of every closure this peer ever signed"
+        )
+
+    def test_the_retention_ring_is_bounded(self):
+        """A long-lived publisher must not accumulate anchors forever."""
+        from entity_core.peer.published_root import LivePublishedRootScope
+
+        kp = Keypair.generate()
+        peer = PeerBuilder().with_keypair(kp).with_all_handlers().build()
+        peer.publish_root()
+        scope = self._live_scope(peer)
+        peer.enable_root_republish()
+
+        bound = LivePublishedRootScope._ANCHOR_RETENTION
+        first_pr, first_sig = self._anchors(peer)
+
+        for i in range(bound + 5):
+            peer.emit_pathway.emit(
+                f"system/content/public/n{i}",
+                Entity(type="system/blob", data={"i": i}),
+            )
+            scope.in_scope(first_sig)  # force the recompute each round
+
+        assert len(scope._anchors) == bound, "the ring must be capped"
+        assert not scope.in_scope(first_sig), (
+            "the oldest anchor must age out — otherwise the bound is decorative"
+        )
+        # ...and the most recent superseded root is still verifiable, which is
+        # the property the bound exists to preserve.
+        recent_pr, recent_sig = self._anchors(peer)
+        peer.emit_pathway.emit(
+            "system/content/public/final", Entity(type="system/blob", data={"z": 1})
+        )
+        assert scope.in_scope(recent_sig)
+
+
+class TestTheSignatureIsBoundBeforeTheHead:
+    """The publisher-side half of the same window, and the primary fix.
+
+    Retention (above) covers a consumer that was already mid-cycle when the
+    head moved. It does not cover the window *inside* `publish_root`: with
+    the head bound first, there is an instant at which this peer serves a
+    head whose signature does not exist yet, and a consumer landing there
+    404s on a root that was never invalid. Binding the signature first makes
+    the pair consistent at every instant a consumer can observe.
+
+    `entity-core-go` reached the same ordering independently
+    (`ext/httplive/closure_scope.go` — "the publisher now binds the
+    signature before the head to close the window") and, like this peer,
+    keeps the retention ring as a second line of defence. Neither half
+    subsumes the other, which is why both are pinned.
+    """
+
+    def test_when_the_head_binding_fires_its_signature_already_resolves(self):
+        """Behavioural: observed from inside the emit cascade."""
+        kp = Keypair.generate()
+        peer = PeerBuilder().with_keypair(kp).with_all_handlers().build()
+
+        observed: list[tuple[str, bool]] = []
+
+        class _Watcher:
+            def on_change_sync(self, event):
+                uri = event.uri
+                if uri.endswith("system/peer/published-root"):
+                    pr_hash = event.hash
+                    sig_path = published_root_signature_path(bytes(pr_hash))
+                    observed.append(
+                        (uri, peer.entity_tree.get(sig_path) is not None)
+                    )
+                return None
+
+        peer.emit_pathway._add_internal_hook(_Watcher(), name="order-watch")
+        peer.publish_root()
+
+        assert observed, "the head binding must have been observed"
+        for uri, sig_present in observed:
+            assert sig_present, (
+                "the head was bound while its signature did not exist — a "
+                "consumer served this head cannot verify it"
+            )
+
+    def test_the_source_emits_the_signature_before_the_head(self):
+        """Structural: two correct-looking emits read fine in either order.
+
+        A behavioural row alone does not protect this — someone tidying the
+        two adjacent `emit(...)` calls reintroduces the window, and the
+        cascade-timing row is the only thing that would catch it. Pin the
+        order at the source so the reason survives the refactor.
+        """
+        import inspect
+
+        from entity_core.peer.peer import Peer
+
+        src = inspect.getsource(Peer.publish_root)
+        sig_at = src.index("published_root_signature_path(")
+        head_at = src.index('emit_pathway.emit("system/peer/published-root"')
+        assert sig_at < head_at, (
+            "publish_root must bind the signature before the head "
+            "(see the ORDER IS LOAD-BEARING comment at the call site)"
+        )

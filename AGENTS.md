@@ -268,6 +268,45 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A race with TWO windows has ONE observable, so closing either window turns the cohort row
+  GREEN — and the row cannot tell you the other is still open.** *Candidate, 2026-09-13 — found
+  running the cohort number `entity-core-go` asked for, which reddened a row with nothing to do
+  with the diff that prompted the run.* `validate-complete.sh python` scored
+  `published_root.v5_outbound_dial` **FAIL** — `fetch signature entity: … 404`. The prior number
+  was `1644 · 0 F @ b8ee9e5` and the check has not changed in go since their initial release, so
+  the row moved at this seat. **It was not the session's diff:** `published_root.py` was untouched
+  and `serving.py`'s only change sat inside `CapTokenScope`, which the `--publish-root` path never
+  constructs.
+  **The verify cycle is TWO fetches** — `MANIFEST_GET` hands a consumer the head, then it fetches
+  that head's signature and MUST verify before walking (§1.1). **Two independent windows produce
+  the identical 404:** *consumer-side*, a republish between the consumer's two fetches, because the
+  §6.5.6 Amendment 10 recompute replaced the anchor set wholesale; and *publisher-side*, because
+  `publish_root` bound the head **before** its signature, so there was an instant at which this peer
+  served a head no one could verify.
+  **Fixing the consumer-side window alone turned the row green — measured, `0 F`, with the
+  publisher-side window still fully open.** That is the entry. A wire row that samples a race is
+  evidence about the sample it drew, and *"we fixed it and the gate is green"* is the weakest
+  possible evidence about a race.
+  **The sibling had both halves and labelled which was primary.** go's `ext/httplive/
+  closure_scope.go` carries a bounded `recentSigs` ring **and** *"the publisher now binds the
+  signature before the head to close the window"* — with the ring called, in their own words,
+  *"the second line of defence."* **We had independently built their backup and not their primary**,
+  and no local run and no cohort row could have said so. *(Ours is the reverse of the usual
+  direction: the cohort's convergence laws are about a sibling's claim being wrong; here their code
+  was simply ahead, and reading it was the whole check.)*
+  **Two checks:** when a cohort row reddens on a race, **enumerate every window that produces that
+  observable before fixing one**, and read the sibling's fix for which window *they* call primary.
+  And the fixture half, a new subject for a standing law: `test_live_closure_scope_follows_the_
+  republished_root` drove the **payload** arm of the exact recompute that dropped the anchors — so
+  **when a cache is invalidated wholesale, the rows you owe are one per thing the old cache
+  CARRIED, not one for the thing the invalidation was written for.**
+  Enforcement points: `TestSupersededAnchorsStayServable` — the headline row plus a **control**
+  asserting a retired root's *content* stays out of scope, which the tempting over-broad fix (union
+  the old closures) fails while passing the headline — and `TestTheSignatureIsBoundBeforeTheHead`,
+  a behavioural row observing from inside the emit cascade plus a **structural** source-order row,
+  because two adjacent correct-looking `emit(...)` calls read fine in either sequence. Three
+  mutations, three correct predictions.
+
 - **A SWEEP is scoped by the input you censused, and a rule whose sentence names two inputs
   will be swept on one of them — by the same author, in the same commit.** ***RATIFIED
   2026-09-13*** *— second instance of the "a ROW can have more than one INPUT" law, and the

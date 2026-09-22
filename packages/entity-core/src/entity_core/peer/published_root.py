@@ -287,9 +287,21 @@ class PublishedRootRepublisher:
 
 
 def _closure_scope_for_pr_hash(
-    entity_tree: Any, content_store: Any, pr_hash: bytes
+    entity_tree: Any,
+    content_store: Any,
+    pr_hash: bytes,
+    *,
+    anchor_hashes: "Any" = (),
+    anchor_paths: "Any" = (),
 ) -> Any:
-    """Build a static ``ClosureScope`` over one specific published-root."""
+    """Build a static ``ClosureScope`` over one specific published-root.
+
+    ``anchor_hashes`` / ``anchor_paths`` carry the **superseded** roots'
+    two anchor entities (the ``published-root`` and its signature) — see
+    :class:`LivePublishedRootScope`. They widen only the anchor set, never
+    the trie closure: a retired root's *content* stays unservable, which is
+    what §6.5.6 Amendment 10 pins.
+    """
     from entity_core.peer.serving import ClosureScope
 
     pr = content_store.get(pr_hash)
@@ -302,8 +314,12 @@ def _closure_scope_for_pr_hash(
         entity_tree,
         content_store,
         root_hash,
-        also_serve_hashes=[pr_hash, sig_hash],
-        also_serve_paths=["system/peer/published-root", sig_path],
+        also_serve_hashes=[pr_hash, sig_hash, *anchor_hashes],
+        also_serve_paths=[
+            "system/peer/published-root",
+            sig_path,
+            *anchor_paths,
+        ],
     )
 
 
@@ -332,7 +348,34 @@ class LivePublishedRootScope:
     serving path: the old closure is a set the publisher genuinely signed,
     so serving it is conservative, whereas an exception mid-request would
     surface as a 500 on a route the spec pins at 200/404.
+
+    **Superseded anchors are retained, and the verify cycle is why.** A cold
+    consumer's handshake is two fetches: ``MANIFEST_GET`` hands it root *N*,
+    then it fetches *N*'s signature by content hash and verifies before it
+    walks anything (§1.1 — never trust raw host bytes). Recomputing the
+    served set on a root change made that pair non-atomic: any write landing
+    in the window republished to *N+1* and took *N*'s signature out of scope,
+    so the consumer got a **404 on the signature for the root this peer had
+    just handed it** and could not verify a root that was never invalid. The
+    publisher's own self-tag comment already named the hazard ("each spin
+    invalidates the served closure before any consumer's CONTENT_GET can
+    complete"); the self-tag stopped the runaway spin and left the window.
+
+    So the last :data:`_ANCHOR_RETENTION` roots keep their two anchor
+    entities servable. This is not a relaxation of Amendment 10: the trie
+    closure still tracks the current root alone, so a superseded root's
+    *content* is as unservable as before — only the anchors a consumer needs
+    to finish verifying a root it already holds survive. Serving them
+    discloses nothing new (they are this peer's own signed anchors, reachable
+    only by a hash the consumer was handed) and rollback stays closed on the
+    consumer side, where `seq` monotonicity already lives.
     """
+
+    #: How many superseded roots keep their anchors servable. Cost is two
+    #: hashes per root; the bound exists so a long-lived publisher cannot
+    #: accumulate without limit. Sized for a burst of republishes landing
+    #: inside one consumer's fetch→verify window rather than for one.
+    _ANCHOR_RETENTION = 64
 
     def __init__(self, entity_tree: Any, content_store: Any) -> None:
         self._entity_tree = entity_tree
@@ -344,9 +387,21 @@ class LivePublishedRootScope:
                 "no published-root bound; call publish_root() first",
             )
         self._pr_hash = bytes(pr_hash)
+        #: Superseded roots, oldest first, as (pr_hash, sig_hash, sig_path).
+        self._anchors: list[tuple[bytes, bytes | None, str]] = []
         self._inner = _closure_scope_for_pr_hash(
             entity_tree, content_store, self._pr_hash
         )
+
+    def _retire(self, pr_hash: bytes) -> None:
+        """Move a superseded root's anchors into the retention ring."""
+        sig_path = published_root_signature_path(pr_hash)
+        sig_hash = self._entity_tree.get(sig_path)
+        self._anchors.append(
+            (pr_hash, bytes(sig_hash) if sig_hash is not None else None, sig_path)
+        )
+        if len(self._anchors) > self._ANCHOR_RETENTION:
+            del self._anchors[: -self._ANCHOR_RETENTION]
 
     def _current(self) -> Any:
         pr_hash = self._entity_tree.get("system/peer/published-root")
@@ -354,11 +409,22 @@ class LivePublishedRootScope:
             return self._inner
         pr_hash = bytes(pr_hash)
         if pr_hash != self._pr_hash:
+            # Retire the outgoing root BEFORE rebuilding: its signature is
+            # what an in-flight consumer is about to ask for.
+            self._retire(self._pr_hash)
+            hashes = [h for _pr, h, _p in self._anchors if h is not None]
+            hashes += [pr for pr, _h, _p in self._anchors]
+            paths = [p for _pr, _h, p in self._anchors]
             try:
                 self._inner = _closure_scope_for_pr_hash(
-                    self._entity_tree, self._content_store, pr_hash
+                    self._entity_tree,
+                    self._content_store,
+                    pr_hash,
+                    anchor_hashes=hashes,
+                    anchor_paths=paths,
                 )
             except PublishedRootError:
+                self._anchors.pop()
                 return self._inner
             self._pr_hash = pr_hash
         return self._inner

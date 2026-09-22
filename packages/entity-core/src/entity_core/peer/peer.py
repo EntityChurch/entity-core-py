@@ -1614,12 +1614,34 @@ class Peer:
         ctx = EmitContext(
             source="bootstrap", handler_pattern=PUBLISHER_HANDLER_PATTERN
         )
-        self.emit_pathway.emit("system/peer/published-root", pr_entity, ctx)
+        # ORDER IS LOAD-BEARING: the signature is bound BEFORE the head.
+        #
+        # A consumer's verify cycle is two fetches — MANIFEST_GET hands it the
+        # head, then it fetches that head's signature and MUST verify before
+        # walking (§1.1). Publishing the head first opens a window in which the
+        # head this peer is already serving has no signature bound yet, so the
+        # consumer 404s on a root that was never invalid. Binding the signature
+        # first makes the pair consistent at every instant a consumer can
+        # observe: any head that is visible is already verifiable.
+        #
+        # `published_root_signature_path` keys on the pr entity's own content
+        # hash, which is fixed before either emit, so the signature has
+        # somewhere to go before the head exists — the two writes have no
+        # ordering dependency in the other direction.
+        #
+        # `entity-core-go` reached the same ordering (`ext/httplive/
+        # closure_scope.go`: "the publisher now binds the signature before the
+        # head to close the window"), and keeps a bounded recent-signature ring
+        # as the second line of defence. This peer keeps both halves too — see
+        # `LivePublishedRootScope._ANCHOR_RETENTION`. The ordering closes the
+        # window at the publisher; retention covers the consumer that was
+        # already mid-cycle when the head moved. Neither subsumes the other.
         self.emit_pathway.emit(
             published_root_signature_path(pr_entity.compute_hash()),
             sig_entity,
             ctx,
         )
+        self.emit_pathway.emit("system/peer/published-root", pr_entity, ctx)
         return pr_entity
 
     def enable_root_republish(self) -> PublishedRootRepublisher:
