@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from entity_core.crypto.identity import Keypair
-from entity_core.handlers.connect import ConnectError
+from entity_core.handlers.connect import ADVERTISED_PROTOCOLS, ConnectError
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.peer.connection import Connection
 from entity_core.protocol.envelope import Envelope
@@ -108,7 +108,7 @@ async def test_connect_already_complete(server_peer: Peer):
             params={
                 "peer_id": client_keypair.peer_id,
                 "nonce": "test-nonce",
-                "protocols": ["entity-core/7.0"],
+                "protocols": list(ADVERTISED_PROTOCOLS),
                 "timestamp": 12345,
             },
         )

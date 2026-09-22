@@ -4,7 +4,7 @@ _Updated: 2026-09-01 · public: v0.8.0 (master)_
 
 ## Where it is
 
-Python reference implementation of the Entity Core Protocol (`entity-core/7.0`).
+Python reference implementation of the Entity Core Protocol V7 (`entity-core/1.0`).
 It is built clean-room — directly from the specification, with no shared code with the
 other implementations — so its real job is to prove the spec is clear and complete
 enough to build a compatible peer from scratch, and to act as an interoperability peer
@@ -49,7 +49,42 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1616 · 1602 P · 14 W · 0 F · 0 S @ core-go `d7a5847`` (2026-09-01)** —
+**The citable number is `1618 · 1603 P · 15 W · 0 F · 0 S @ core-go `7262f17`` (2026-09-01)** —
+all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b
+`761 · 646 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute `8/8`, pass 4
+`2/2`, pass 0/0b static `63 PASS · 0 FAIL`.
+
+**The W moved 14 → 15 and it is not this diff — but the two claims are separate and only the
+first is evidenced.** `concurrency.t1_1_concurrent_demux` is a timing-ratio check (N=16
+concurrent vs sequential, ceiling 0.70) that PASSed the previous run and WARNed this one. The
+measured numbers, recorded rather than the verdict, because a re-run to green reads identical
+to a green: `201.46 ms / 211.61 ms = 0.95` and `79.89 ms / 65.65 ms = 1.22`. The absolute times
+differ threefold between runs while the ratio moves the other way, which is the signature of
+host load rather than of the peer. It is the same family as the standing `t2_1_sustained_load`
+caveat and gets the same treatment: **not** a claim that the demux path is sound. What *is*
+established is that nothing in this diff is on it — the diff is the connect handshake — and
+that the §6.11(a) no-serialization MUST is carried by `t1_3_no_head_of_line`, which PASSes.
+
+**§4.7 row 10 is implemented — both halves.** arch's FM-2 Edit D found the row to be two
+failures wearing one code and one status, and it is landed here as ruled: a second `hello`
+mid-handshake is a **state conflict**, `409 connection_sequence_error` (row 9's precedent, and
+§4.6's Hardening block presumes 409 is what a state conflict gets); an **unknown connect
+operation** is `400 invalid_request`, because nothing is out of *order* when the name exists in
+no state, and a code that misdirects the client's remedy fails the contract §4.7 exists to
+provide. All three seats are now on the ruled behaviour ahead of the fold rather than after it,
+which is the posture the cohort works in — implement, report what building it finds, and let
+the fold ratify. Keepalive is unaffected: our connect branch is gated on
+`not conn_state.is_connected`, and §5.1 `ping` is served from the established path.
+
+The same run closed §4.7 **row 1**: `connect_incompatible_protocol` PASSes. Landing it found that
+this peer had advertised **`entity-core/7.0`** since Genesis where V7 §8.4, `entity-core-go` and
+`entity-core-rust` all say **`entity-core/1.0`** — invisible for the life of the project because
+§4.5's `protocols` intersection had no implementer in *any* tree, so every peer carried the field
+and none read it. Measured against a live go peer, py could not dial go at all. Both directions
+green; the constant now has one home and a pin against §8.4. See
+`docs/status/ROUTING-2026-09-01-c-…` and SA-PY-31 / SA-PY-32.
+
+**The previous citable number was `1616 · 1602 P · 14 W · 0 F · 0 S @ core-go `d7a5847``** —
 all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b (core profile)
 `759 · 644 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute `8/8`, pass 0/0b
 static `63 PASS · 0 FAIL`. Three checks that FAILed or could not look against py before this

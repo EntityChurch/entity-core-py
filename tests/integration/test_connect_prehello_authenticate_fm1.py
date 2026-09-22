@@ -144,8 +144,15 @@ async def test_an_unknown_connect_operation_is_still_the_out_of_order_row(
     answered `400 bad_request` — a code in no §4.7 row. It now asserts the pair
     (G-28/FM-1g), because a negative assertion is the shape that keeps passing
     while the thing it was watching goes empty: `!= 401` was equally satisfied
-    by the non-conformant code it was written over. Status 400 is the table's;
-    go emits 409 and routed the discrepancy as spec-issue `2026-09-01-b`. Full
+    by the non-conformant code it was written over — and it would have been
+    equally satisfied by the ruling below, which is the second time this one
+    row's negativity hid a change.
+
+    **The pair moved 2026-09-01** (arch's FM-2 Edit D): row 10 turned out to be
+    two failures, and this input — an operation name that exists in no state —
+    is `400 invalid_request`, not `connection_sequence_error`. Nothing is out of
+    ORDER. FM-1's carve-out is still the point of this row: the pre-hello
+    `authenticate` is 401 and this is not, which is what it discriminates. Full
     row family: `test_connect_error_table_4_7.py`.
     """
     from entity_core.protocol.messages import Execute
@@ -164,10 +171,10 @@ async def test_an_unknown_connect_operation_is_still_the_out_of_order_row(
         await writer.wait_closed()
 
     assert (int(response.status), response.result["data"]["code"]) == (
-        400, "connection_sequence_error",
+        400, "invalid_request",
     ), (
         f"an unknown connect operation answered "
-        f"{(int(response.status), response.result['data']['code'])} — §4.7's "
-        f"out-of-order row is `connection_sequence_error`; FM-1 moved the "
-        f"pre-hello `authenticate` out of that row and nothing else"
+        f"{(int(response.status), response.result['data']['code'])} — the ruled "
+        f"pair is (400, 'invalid_request'); FM-1 moved the pre-hello "
+        f"`authenticate` out of row 10, and FM-2 Edit D split what was left"
     )

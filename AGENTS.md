@@ -5,7 +5,9 @@ Read **AGENTS-STANDARD.md** first. This file adds entity-core-py specifics.
 
 ## Overview
 
-Python implementation of the Entity Core Protocol (`entity-core/7.0`), built as a
+Python implementation of the Entity Core Protocol (V7; the wire identifier §8.4 pins is
+**`entity-core/1.0`** — this line said `entity-core/7.0` until 2026-09-01 and that is where
+the peer got it), built as a
 clean-room peer for **interoperability testing against the Rust implementation** — it
 validates that the spec is clear and complete enough to build compatible implementations.
 The spec is upstream; this repo implements it.
@@ -1491,6 +1493,89 @@ fails the gates rather than slipping past them.
   Enforcement point: `tests/integration/test_connect_error_table_4_7.py`, which drives all four
   unprobed rows plus the two probed ones, each as a `(status, code)` pair, and carries
   `TestTheRowsDoNotCollapse` for §4.7's actual MUST (which is about the table, not any row).
+
+- **A DRAFT ruling is a thing to build, not a thing to wait on — the fold ratifies what the
+  seats built.** *Candidate, 2026-09-01. Cost: one pass of held work and a packet arguing for
+  the hold.* Arch ruled §4.7 row 10 in `PROPOSAL-CONNECT-SURFACE-RECONCILIATION` (FM-2), whose
+  §7 reads *"No seat implements ahead of the fold."* We held on that sentence plus
+  `AGENTS-STANDARD`'s *"implement against the landed spec, not in-flight proposals"*, and
+  reported the resulting gate FAIL red. **go and rust had both already built it.** The cohort's
+  actual working order is: **build the ruling, report what building it finds, let the fold
+  ratify** — and the feedback from three seats building it is *the input the fold wants*. A seat
+  that waits contributes nothing to the ruling and holds the cohort at two-of-three.
+  **The distinction that survives, and it is the only one:** `AGENTS-STANDARD`'s rule is about
+  *inventing* wire semantics — do not implement a proposal **nobody has ruled on**, and do not
+  invent one yourself. It is not about a ruling arch has derived and written down. **Ruled-but-
+  not-folded is not the same as unruled**, and treating them the same is what turned a one-line
+  change into a routed disagreement.
+  **What still justifies a hold** — narrowly: you find something *in the building* that
+  contradicts the ruling. That is a finding, and it goes back with the evidence. *"The document
+  says DRAFT"* is not a finding.
+  **And it changes what the gate means.** A sibling's wire check on a ruled-but-unfolded
+  semantic is not *"discriminating on an unruled semantic"* — the standing rule is about
+  **unruled**, and we cited it at a row arch had ruled. The check was correct and our FAIL was
+  ours.
+
+- **A field with no consumer *anywhere in the cohort* is not a converged field — it is an
+  unmeasured one, and the first seat to implement it creates the divergence rather than
+  finding it.** ***RATIFIED 2026-09-01*** *— the validator-vs-consumer law (§2.4 `exclude`, the
+  `peers` dimension, the resolver ceiling) with the missing consumer in **all three trees at
+  once**, which is the shape none of those instances could warn about. Cost: py could not dial a
+  go peer, measured, and the tree was `4138 P` green on both sides of the break.*
+  `entity-core-go` implemented V7 §4.7 row 1 (§4.5's `protocols` *"Intersection, must be
+  non-empty"*) and relayed it as *"both siblings owe the `handleHello` intersection check."*
+  True, complete as a description of the work, and **applying it verbatim would have partitioned
+  the cohort**: this peer advertised **`entity-core/7.0`** while §8.4, go and rust all say
+  **`entity-core/1.0`**. Measured against a live go peer at `7262f17`, before touching anything:
+  `400 incompatible_protocol · initiator=[entity-core/7.0] responder=[entity-core/1.0]`.
+  **The mechanism, and it is the reusable half.** Every previous instance of this law had a field
+  with a producer and no *local* consumer, so a cross-impl run could catch it — someone else read
+  the field. Here **nobody** read it, in any tree, for the life of the project. Three peers
+  carried it on every hello and agreed perfectly on the *behaviour* (ignore it) while disagreeing
+  on the *value*. **A dead field cannot diverge observably**, so the 358-vector corpus, the 1616
+  wire checks and three green suites were all evidence about a field none of them could see.
+  The divergence was *created* by the first conformant implementation.
+  **Why the direction of the check hides it, and this is what to carry past this bug.** Row 1 is
+  a **responder** obligation, and a peer that implements it against the wrong constant still
+  passes every responder-side check anyone will ever write — ours and the cohort's — because a
+  probe dialing *you* offers *your* string back to you. **A negotiated value is only testable
+  from the seat that does not choose it.** So the row that found this had to dial **out**, and
+  the general form is: for any field whose value your peer *asserts*, the discriminating test is
+  one where the other end asserts it instead.
+  **Two things this does NOT license.** It is not an argument against go's relay — their
+  measurement, their site and their fix were all correct for their peer, and the relay could not
+  have contained a fact neither seat had. And it is not "check the constant" — it is *find the
+  field's consumer in the cohort, and if there is none, the field's value has never been tested
+  by anything.*
+  **And it repeats the versioning conflation this file already refuses, one layer down.** The
+  `7` was read off the specification's **title** (`ENTITY-CORE-PROTOCOL-V7`, cited as v7.69
+  throughout) while §8.4 pins the wire identifier two thousand lines away. The top of this file
+  spends a section on *"our release version is not the protocol version"*; the same mistake
+  reached the wire because **a document's version and the identifier it pins are two numbers,
+  and one of them is a string a peer compares byte for byte.** Filed as SA-PY-32 asking for the
+  one cross-reference that would have prevented it: §4.5's row names §8.4's literal.
+  Enforcement points: `test_connect_protocols_intersection_4_5.py` —
+  `TestTheVersionStringItself::test_the_advertised_version_is_the_one_8_4_pins` (pinned to what
+  **§8.4 declares**, not to what we emit, per the `PINNED_ROOT_HASH` lesson), the **AST-based**
+  zero-ratchet against a second literal, and the `system/peer/info`-vs-hello row that compares the
+  two surfaces a peer states its version on — they were separate literals, so each surface's suite
+  asserted its own and neither could see the other. Seven mutations, seven correct predictions;
+  the one that matters is that reverting the constant to `entity-core/7.0` turns **only** the
+  version row red — every behavioural row passes, because both sides of a local test use the same
+  constant. *That is the entry, restated as a measurement.*
+  **Corollary, earned in the same pass: a rejection probe malformed in a second dimension is a
+  harness defect that only surfaces when someone implements the rule it violates.** Landing the
+  intersection turned go's `format_agility.agility_unknown_1` red — its hello encodes key_type
+  `0xFD` *and* advertises `entity-core/v7`, a **third** spelling in no spec and no tree. This is
+  the D11 rule (*"when two rules gate one write, every rejection test must satisfy the rule it is
+  not about"*) with a **sibling's probe** as the subject. The right response was **not** to
+  reorder our checks to suit it: tracing it (A1) found that §4.5 names hello *"the canonical
+  earliest reject point for an unsupported `key_type`"* and we rejected only at `authenticate` —
+  a real gap that `AGILITY-UNKNOWN-1` tolerated because it is satisfied *"at any handshake
+  surface"*. **A vector written to accept any of several surfaces cannot tell you that you are on
+  the wrong one**, so the gap read green until an earlier check took the surface away. Fix the
+  spec's rule, not the probe's expectation — and keep the probe's own malformed frame as a test
+  row, because the tidy frame your fixtures would have written cannot discriminate the ordering.
 
 - **A new wire field has THREE homes and only two of them have a test that fails when you miss
   one.** *Candidate, 2026-09-01, building RELAY v1.3 — the two-representations law with the

@@ -6,6 +6,7 @@ Auth is always required - all requests must be authenticated.
 import pytest
 
 from entity_core.crypto.identity import Keypair
+from entity_core.handlers.connect import PROTOCOL_VERSION
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.peer.connection import Connection
 
@@ -58,7 +59,7 @@ async def test_execute_system_peer_info(server_peer: Peer):
 
         assert response.status == 200
         assert response.result["type"] == "peer-info"
-        assert "entity-core/7.0" in response.result["data"]["protocols"]
+        assert PROTOCOL_VERSION in response.result["data"]["protocols"]
 
     finally:
         conn.close()

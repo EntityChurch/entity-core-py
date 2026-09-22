@@ -46,6 +46,7 @@ import os
 import pytest
 
 from entity_core.crypto.identity import Keypair
+from entity_core.handlers.connect import ADVERTISED_PROTOCOLS
 from entity_core.peer import Peer, PeerBuilder
 from entity_core.protocol.auth import create_identity_entity, create_signature_entity
 from entity_core.protocol.entity import Entity
@@ -89,7 +90,7 @@ def _hello_execute(peer_id: str, nonce: bytes) -> Execute:
             data={
                 "peer_id": peer_id,
                 "nonce": nonce,
-                "protocols": ["entity-core/7.0"],
+                "protocols": list(ADVERTISED_PROTOCOLS),
                 "hash_formats": default_advertised_hash_formats(),
                 "key_types": list(DEFAULT_ADVERTISED_KEY_TYPES),
             },
@@ -325,32 +326,63 @@ class TestRow6InvalidNonce:
 
 
 class TestRow10ConnectionSequenceError:
-    """The code is `connection_sequence_error` in every reading; the STATUS is
-    the open question (§4.7 says 400, go emits 409, routed as spec-issue
-    `2026-09-01-b`). We implement the table and say so, because what shipped
-    here was `bad_request` — in no row at all."""
+    """**Row 10 is two failures, not one** — arch's 2026-09-01 ruling (FM-2
+    Edit D), implemented here.
+
+    The landed table gives one code and one status to two different inputs, and
+    asking *"400 or 409?"* as a single question is what makes either answer
+    wrong:
+
+    | input | nature | code | status |
+    |---|---|---|---|
+    | second `hello` mid-handshake | state conflict | `connection_sequence_error` | **409** |
+    | unknown connect operation | invalid request | `invalid_request` | **400** |
+
+    The derivation for 409 is row 9's precedent (`connection_already_established`
+    is already 409 for the same class) plus §4.6's Hardening block, which
+    presumes 409 is what a state conflict gets. The derivation for
+    `invalid_request` is that nothing is out of order when the operation does not
+    exist in any state — and §4.7 exists so clients key handling off the code, so
+    one that misdirects the remedy fails its own contract.
+
+    **Both are landed ahead of the FM-2 fold**, matching `entity-core-go` and
+    `entity-core-rust` so all three seats reach the ruled behaviour before
+    ratification rather than after. The rows below are the two halves, and they
+    are separate rows because the whole finding is that they are separate
+    failures.
+    """
 
     @pytest.mark.asyncio
-    async def test_a_second_hello_mid_handshake(self, server_peer: Peer):
-        """Row 10's own example. Distinct from row 9 (`409
-        connection_already_established`), which is a second hello *after* the
-        handshake completes and is answered a frame earlier, at the wire
-        boundary — this peer already passes that row."""
+    async def test_a_second_hello_mid_handshake_is_409(self, server_peer: Peer):
+        """The state-conflict half.
+
+        Distinct from row 9 (`409 connection_already_established`), which is a
+        second hello *after* the handshake completes and is answered a frame
+        earlier at the wire boundary. Both are 409 now, which is the point —
+        two adjacent state rows at two different statuses was the inconsistency
+        the ruling removed.
+        """
         keypair = Keypair.generate()
         hello = _hello_execute(keypair.peer_id, os.urandom(32))
         second = _hello_execute(keypair.peer_id, os.urandom(32))
         response = await _drive(hello, (second, []))
-        assert _pair(response) == (400, "connection_sequence_error"), (
-            f"a second hello mid-handshake answered {_pair(response)}; §4.7 "
-            f"row 10 pins the code `connection_sequence_error` (status 400 in "
-            f"the table, 409 at entity-core-go — spec-issue 2026-09-01-b)"
+        assert _pair(response) == (409, "connection_sequence_error"), (
+            f"a second hello mid-handshake answered {_pair(response)}; the "
+            f"ruled pair is (409, 'connection_sequence_error') — a valid "
+            f"operation refused for the connection's STATE"
         )
 
     @pytest.mark.asyncio
-    async def test_an_unknown_connect_operation(self, server_peer: Peer):
-        """Row 10's other named input, and the one that was previously pinned
-        only by a `!= 401` assertion in the FM-1 file — a negative assertion
-        that stayed green while the code was `bad_request`."""
+    async def test_an_unknown_connect_operation_is_400_invalid_request(
+        self, server_peer: Peer
+    ):
+        """The invalid-request half, and the one that moved.
+
+        It was pinned only by a `!= 401` assertion in the FM-1 file — a negative
+        assertion that stayed green while the code was `bad_request`, and would
+        have stayed green through this change too. That is why the pair is
+        asserted positively here.
+        """
         execute = Execute(
             request_id="row10-unknown-op",
             uri=f"entity://{server_peer.peer_id}/{CONNECT_URI_PATH}",
@@ -358,9 +390,47 @@ class TestRow10ConnectionSequenceError:
             params={},
         )
         response = await _drive(None, (execute, []))
-        assert _pair(response) == (400, "connection_sequence_error"), (
-            f"an unknown connect operation answered {_pair(response)}; §4.7 "
-            f"row 10 names it in the same breath as the second hello"
+        assert _pair(response) == (400, "invalid_request"), (
+            f"an unknown connect operation answered {_pair(response)}; the "
+            f"ruled pair is (400, 'invalid_request') — the operation name "
+            f"exists in no state, so nothing is out of ORDER"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_two_halves_do_not_answer_the_same_thing(
+        self, server_peer: Peer
+    ):
+        """The row that carries the ruling itself rather than either half.
+
+        Both rows above pass against a peer that answers one pair for both
+        inputs — they just have to be *that* pair. This one fails such a peer,
+        because the finding is not "row 10 has these values", it is "row 10 was
+        one row describing two failures." A future seat that re-merges them
+        satisfies half the table and this row.
+        """
+        keypair = Keypair.generate()
+        hello = _hello_execute(keypair.peer_id, os.urandom(32))
+        second = _hello_execute(keypair.peer_id, os.urandom(32))
+        state_conflict = _pair(await _drive(hello, (second, [])))
+
+        unknown = _pair(
+            await _drive(
+                None,
+                (
+                    Execute(
+                        request_id="row10-split",
+                        uri=f"entity://{server_peer.peer_id}/{CONNECT_URI_PATH}",
+                        operation="not-a-connect-operation",
+                        params={},
+                    ),
+                    [],
+                ),
+            )
+        )
+
+        assert state_conflict != unknown, (
+            f"both inputs answered {state_conflict}; row 10 names two distinct "
+            f"failures and collapsing them is what the ruling undid"
         )
 
 

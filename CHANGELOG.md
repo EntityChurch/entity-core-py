@@ -39,6 +39,37 @@ for added surface or a breaking change, and the patch for fixes.
 
 Development lands on `dev`; `master` carries the last release.
 
+_Protocol: Entity Core Protocol 0.8.2 (wire identifier `entity-core/1.0`, V7 §8.4)._
+
+### Fixed
+
+- **The advertised protocol version is `entity-core/1.0`, per V7 §8.4.** This peer had
+  advertised `entity-core/7.0` since the Genesis release — the specification's *title*
+  version rather than the wire identifier §8.4 pins. It went unnoticed because §4.5's
+  `protocols` rule (*"Intersection, must be non-empty"*) had no implementer in any
+  implementation: every peer carried the field on every hello and none read it, so the
+  value had never been compared. It is now a single constant with a test pinning it to
+  §8.4 and a gate against a second literal.
+  *Earlier entries in this file describe the protocol as `entity-core/7.0`; they are left
+  as written, because they record what was shipped.*
+- **The `protocols` intersection is checked (V7 §4.5 / §4.7 row 1).** A hello whose
+  non-empty `protocols` set is disjoint from ours is refused with
+  `400 incompatible_protocol` instead of completing a handshake with a peer that speaks no
+  version we support. An omitted or empty list stays unconstrained (SA-PY-31).
+- **An unallocated `key_type` is refused at hello**, which §4.5 names as the canonical
+  earliest reject point. The peer previously refused only at `authenticate`; the
+  `AGILITY-UNKNOWN-1` vector accepted that, being satisfied *"at any handshake surface"*.
+- **V7 §4.7 row 10 is split into its two failures (arch FM-2 Edit D).** A second `hello`
+  mid-handshake is a state conflict — `409 connection_sequence_error`, consistent with row 9's
+  `connection_already_established`. An unknown connect operation is `400 invalid_request`:
+  nothing is out of *order* when the operation name exists in no state, and
+  `connection_sequence_error` told a client its ordering was wrong when its name was wrong.
+- **A handshake refusal at the `hello` step now carries the remote's `(status, code)`.**
+  Both the TCP and HTTP dialers read `peer_id`/`nonce` straight out of the hello response
+  and reported *"Missing peer_id or nonce"* for what was actually a coded refusal, dropping
+  the remote's answer. Four §4.7 rows refuse at hello, so this affected all of them. The
+  `authenticate` step already did this correctly.
+
 ## [0.9.0] — 2026-08-23
 
 _Protocol: Entity Core Protocol 0.8.2 (`entity-core/7.0`)._

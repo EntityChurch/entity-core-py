@@ -60,6 +60,36 @@ logger = logging.getLogger(__name__)
 
 CONNECT_URI = "system/protocol/connect"
 
+#: V7 §8.4 *Protocol Version* — the wire identifier advertised in a hello's
+#: ``protocols`` and echoed by the responder. §4.5 negotiates it as
+#: *"Intersection, must be non-empty"*, so it is the one hello field whose
+#: **string** is the contract rather than its meaning.
+#:
+#: **This peer advertised ``entity-core/7.0`` until 2026-09-01, and nothing
+#: could see it.** The spec's own §8.4 and §4.4 hello example, `entity-core-go`
+#: and `entity-core-rust` all say ``entity-core/1.0``; the "7" was almost
+#: certainly read off the specification's *title* (``ENTITY-CORE-PROTOCOL-V7``,
+#: §-cited as v7.69 throughout) — which is the same conflation this repo's own
+#: `AGENTS.md` versioning section exists to refuse, arriving on the wire
+#: instead of on a package. **A document's version and the identifier it pins
+#: are two numbers, and one of them is a string a peer compares byte for byte.**
+#:
+#: It survived because §4.5's *"must be non-empty"* had no implementer: the
+#: field was carried on every hello in the cohort and read by nobody, and a
+#: dead field cannot diverge observably. Measured the day the first seat
+#: implemented the check — a py initiator against an `entity-core-go` peer at
+#: `7262f17` gets `400 incompatible_protocol`, i.e. the cohort partitions along
+#: this constant.
+#:
+#: **One home, deliberately.** The value was four literals (both hellos, the
+#: `system/peer` advertisement, a CLI help string) and the cost of a fifth is a
+#: peer that negotiates one string and advertises another.
+PROTOCOL_VERSION = "entity-core/1.0"
+
+#: What we advertise. A list because §4.5 negotiates a set; one element because
+#: one version exists. A second entry here is a wire commitment, not a default.
+ADVERTISED_PROTOCOLS = [PROTOCOL_VERSION]
+
 # Use shared normalize_hash from ecf module
 _normalize_hash = normalize_hash
 
@@ -192,29 +222,111 @@ def handle_connect_hello(
         # the only phase arriving here is a re-hello mid-handshake, which is
         # row 10's own example.
         #
-        # The STATUS half of this row is contested and we implement the table:
-        # §4.7 pins 400, `entity-core-go` emits 409 (its own reading — a
-        # sequence error is a state conflict, and row 9 is already 409), and
-        # go routed the discrepancy as spec-issue 2026-09-01-b. The code half
-        # is not contested by anyone, and `bad_request` — what this raise
-        # carried — is in no row at all, so it is fixed now and the status
-        # converges on the ruling. We do not ship a wire check on this pair.
+        # arch ruled 2026-09-01 (FM-2 Edit D) that this — a valid operation
+        # arriving in a state that forbids it — is a STATE CONFLICT and takes
+        # **409**, not the landed table's 400. Row 9's precedent is the
+        # derivation: `connection_already_established` is already 409 for the
+        # same class, and §4.6's Hardening block presumes 409 is what a state
+        # conflict gets when it rules that a 409 *under-signals a replay*. The
+        # unknown-operation half of row 10 is the opposite case — nothing is out
+        # of order there — and stays 400, in `peer/peer.py`.
+        #
+        # Landed ahead of the FM-2 fold, matching `entity-core-go` (which has
+        # emitted 409 here all along) and `entity-core-rust`. The code half was
+        # never contested; `bad_request`, which this raise carried before G-28,
+        # is in no §4.7 row at all.
         raise ConnectError(
             f"connection_sequence_error: unexpected hello in phase {state.phase}",
             code="connection_sequence_error",
+            status=409,
         )
 
     # Params is a full entity per spec - data contains the actual fields
     params_data = params.get("data", {})
     remote_peer_id = params_data.get("peer_id", "")
     their_nonce = params_data.get("nonce", b"")
-    protocols = params_data.get("protocols", [])
     timestamp = params_data.get("timestamp", 0)
 
     if not remote_peer_id:
         raise ConnectError("Missing peer_id in hello")
     if not their_nonce:
         raise ConnectError("Missing nonce in hello")
+
+    # V7 §4.5 — the unsupported-`key_type` CANONICAL REJECT POINT, which this
+    # peer was not honoring: §4.5 says in terms that "hello negotiation is the
+    # canonical earliest reject point for an unsupported `key_type`" and that
+    # "hello-time reject is the canonical guidance for new implementations
+    # (matches Rust's choice)". Ours rejected at `authenticate` (§4.6 step 0)
+    # and nowhere else, which the AGILITY-UNKNOWN-1 vector tolerated — it is
+    # satisfied "at any handshake surface" — so the gap read as green for as
+    # long as the hello let the frame through.
+    #
+    # **It stopped reading as green the moment the protocols check landed, and
+    # that is the whole reason this is here.** go's probe sends a hello whose
+    # `peer_id` encodes key_type 0xFD *and* whose `protocols` is
+    # `entity-core/v7` — a THIRD spelling of the version string, in no spec and
+    # no implementation. With the intersection checked and no hello-side
+    # key-type gate, that frame is refused `incompatible_protocol` and the
+    # key-type vector never gets a surface to be satisfied at. Adding a check
+    # that should always have run is a behaviour change; this is the second
+    # finding it exposed, and the fix is the one §4.5 already asked for rather
+    # than a reordering to suit a probe.
+    #
+    # Ordered BEFORE the protocols check deliberately: a `peer_id` whose
+    # key_type is unallocated is a statement about WHO is calling, and §4.5
+    # gives that reject point a name and a "canonical earliest" status it gives
+    # no other hello check. An undecodable peer_id is NOT refused here — that
+    # is §4.6 step 3's identity binding (§4.7 row 8, a 401), and pulling it
+    # forward would move a row nobody asked us to move.
+    from entity_core.crypto.identity import (
+        UnsupportedKeyTypeError,
+        decode_peer_id as _decode_peer_id_hello,
+        validate_supported_key_type as _validate_key_type_hello,
+    )
+
+    try:
+        _hello_key_type, _, _ = _decode_peer_id_hello(remote_peer_id)
+    except Exception:
+        _hello_key_type = None  # §4.6 step 3's row, not this one.
+    if _hello_key_type is not None:
+        try:
+            _validate_key_type_hello(_hello_key_type)
+        except UnsupportedKeyTypeError as exc:
+            raise ConnectError(str(exc), code="unsupported_key_type")
+
+    # V7 §4.5 — `protocols` is "Intersection, must be non-empty"; §4.7 row 1
+    # pins the refusal as `400 incompatible_protocol`. Both halves are LANDED
+    # text (§4.5's negotiation table, §4.7's row), which is why this lands now
+    # rather than with the rest of FM-2: arch's ruling records that the row
+    # "needs no spec change — it needs the check §4.5 already requires", and
+    # FM-2's Edit B leaves the row itself untouched. Nothing here is downstream
+    # of the draft.
+    #
+    # **The absent case is a ruling, not a null check** — the standing law that
+    # a binary operator with no arm for the absent case is a policy decision
+    # wearing a type guard. §4.5 marks `protocols` Required: Yes, so a hello
+    # omitting it is arguably malformed; we nevertheless treat an omitted or
+    # empty list as UNCONSTRAINED and refuse only a NON-EMPTY disjoint set.
+    # Two reasons, and neither is "it reads more naturally":
+    #   1. `entity-core-go` chose the same arm. A responder that refuses an
+    #      omitted list while its sibling accepts one is a divergence we would
+    #      be manufacturing out of a gap, on a surface where a divergence is a
+    #      refused connection rather than a wrong field.
+    #   2. §4.7 row 1's failure is "incompatible protocol VERSIONS" — a
+    #      statement about two sets, which an absent set does not make. A hello
+    #      with no `protocols` is a *missing required field*, which is a
+    #      different (and unruled) refusal; collapsing it into this row would
+    #      answer `incompatible_protocol` for a peer that named no version at
+    #      all.
+    # Filed as SA-PY-31 rather than settled here, because the two readings
+    # diverge across a peer boundary the moment any seat picks the other arm.
+    initiator_protocols = params_data.get("protocols") or []
+    if initiator_protocols and not (set(initiator_protocols) & set(ADVERTISED_PROTOCOLS)):
+        raise ConnectError(
+            f"no common protocol version: initiator {initiator_protocols}, "
+            f"responder {ADVERTISED_PROTOCOLS}",
+            code="incompatible_protocol",
+        )
 
     # V7 v7.69 §4.5 — negotiate the connection's active content_hash_format and
     # check key_type mutual verifiability. Absent fields take the §4.5 floor
@@ -267,7 +379,7 @@ def handle_connect_hello(
         data={
             "peer_id": local_keypair.peer_id,
             "nonce": our_nonce,
-            "protocols": ["entity-core/7.0"],
+            "protocols": ADVERTISED_PROTOCOLS,
             "timestamp": Uint(now_ms),
             "hash_formats": our_hash_formats,
             "key_types": our_key_types,
@@ -710,7 +822,7 @@ def create_connect_hello_execute(keypair: Keypair) -> tuple[Execute, bytes]:
         data={
             "peer_id": keypair.peer_id,
             "nonce": nonce,
-            "protocols": ["entity-core/7.0"],
+            "protocols": ADVERTISED_PROTOCOLS,
             "timestamp": Uint(now_ms),
             "hash_formats": default_advertised_hash_formats(),
             "key_types": DEFAULT_ADVERTISED_KEY_TYPES,

@@ -323,6 +323,15 @@ class HttpConnection:
             raise ConnectError(
                 f"expected EXECUTE_RESPONSE hello, got {hello_root.get('type')}"
             )
+        # Same seam, same gap, same fix as the TCP dialer — see the comment
+        # there. Two transports carrying one concern is the standing
+        # two-representations shape, and the half nobody drove was the half
+        # that had it: both got the authenticate seam right and both read the
+        # hello response as though a refusal could not arrive on it.
+        hello_response = ExecuteResponse.from_entity(hello_root)
+        if hello_response.status != 200:
+            raise connect_refusal("http connect hello failed", hello_response)
+
         hello_data = hello_root.get("data", {})
         hello_result = hello_data.get("result", {})
         hello_result_data = hello_result.get("data", {})

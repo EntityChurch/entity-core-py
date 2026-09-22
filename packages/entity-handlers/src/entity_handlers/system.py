@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from entity_core.handlers.connect import ADVERTISED_PROTOCOLS
 from entity_core.handlers.context import HandlerContext
 from entity_core.types.registry import list_handler_names, get_handler_manifest
 
@@ -50,7 +51,12 @@ async def system_handler(
                 "type": "peer-info",
                 "data": {
                     "peer_id": ctx.local_peer_id,
-                    "protocols": ["entity-core/7.0"],
+                    # The same string the hello negotiates (V7 §8.4). This was
+                    # a fourth independent literal of it, which is how a peer
+                    # ends up advertising one version here and negotiating
+                    # another at §4.5 — the two are read by different parties
+                    # and never compared.
+                    "protocols": ADVERTISED_PROTOCOLS,
                 },
             },
         }

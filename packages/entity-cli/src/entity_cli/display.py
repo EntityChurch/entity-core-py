@@ -268,7 +268,7 @@ def display_status(entity: dict[str, Any]) -> str:
     Format:
         Status
           peer_id: abc123
-          protocols: ["entity-core/7.0"]
+          protocols: ["entity-core/1.0"]
     """
     entity_type = entity.get("type", "")
     data = entity.get("data", {})

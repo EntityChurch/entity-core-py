@@ -27,6 +27,7 @@ import pytest
 
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.connect import (
+    ADVERTISED_PROTOCOLS,
     ConnectError,
     ConnectState,
     handle_connect_hello,
@@ -67,7 +68,7 @@ def _hello_params(
     data: dict = {
         "peer_id": keypair.peer_id,
         "nonce": b"\x01" * 32,
-        "protocols": ["entity-core/7.0"],
+        "protocols": list(ADVERTISED_PROTOCOLS),
         "timestamp": Uint(0),
     }
     if hash_formats is not None:

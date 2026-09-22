@@ -2817,19 +2817,38 @@ class Peer:
                 )
 
             else:
-                # V7 §4.7 row 10 — the row names two inputs, "a second `hello`
-                # after `hello_done`, **or an unknown connect operation**", and
-                # `connection_sequence_error` is the code for both. The sibling
-                # input is raised in `handle_connect_hello`; this is the other
-                # one, and it was answering a generic `bad_request` (in no §4.7
-                # row) while the FM-1 carve-out left this row explicitly
-                # occupied. Status stays the table's 400 — see the note at the
-                # hello raise: go emits 409 and routed the discrepancy as
-                # spec-issue 2026-09-01-b; only the status is in question.
+                # V7 §4.7 row 10 — the LANDED row names two inputs, "a second
+                # `hello` after `hello_done`, **or an unknown connect
+                # operation**", and gives both one code and one status. That
+                # single pair is what the ruling below undid. The sibling input
+                # (the state conflict) is raised in `handle_connect_hello`;
+                # this is the unknown-operation one, which answered a generic
+                # `bad_request` — in no §4.7 row — until G-28.
+                #
+                # arch ruled 2026-09-01 (FM-2 Edit D) that the row is TWO
+                # failures, and this input — an operation name that exists in
+                # no state — is `400 invalid_request`. Nothing is out of order;
+                # telling a client its ORDERING was wrong when its NAME was
+                # wrong misdirects the remedy, which is the contract §4.7 exists
+                # to provide. The sequence half (a re-hello) is the other input
+                # and is `409 connection_sequence_error`, raised in
+                # `handlers/connect.py`.
+                #
+                # Landed ahead of the FM-2 fold, matching `entity-core-go` and
+                # `entity-core-rust`, so all three seats are on the ruled
+                # behaviour before it is ratified rather than after. Edit D also
+                # declares `invalid_request` at core level (it closes PD-1g);
+                # until that lands, the code we emit here is one §3.3 already
+                # names as the generic 400 — so this is not a code nobody
+                # declares, it is the declared generic reaching a row that will
+                # name it explicitly.
+                #
+                # If the fold moves this, it moves for the cohort at once and
+                # `connect_unknown_operation` is the gate that says so.
                 response = ExecuteResponse.bad_request(
                     request_id=request_id,
                     message=f"Unknown connect operation: {operation}",
-                    code="connection_sequence_error",
+                    code="invalid_request",
                 )
                 await send_envelope(
                     writer, Envelope(root=response.to_entity())

@@ -623,6 +623,28 @@ class Connection:
                     f"Expected EXECUTE_RESPONSE hello, got {their_hello_root.get('type')}"
                 )
 
+            # A refusal AT HELLO is a §4.7 row too, and this seam was reading
+            # the response as though it could only ever be a hello. Four of the
+            # table's rows refuse here — 1 `incompatible_protocol`,
+            # 2 `incompatible_hash_format`, 4 `unsupported_key_type`,
+            # 10's re-hello — and every one of them arrived as the structural
+            # complaint below, because a refusal carries no `peer_id`. So the
+            # dialer reported "Missing peer_id or nonce", which describes the
+            # response shape correctly and says nothing about the refusal, and
+            # dropped the remote's code and status on the floor.
+            #
+            # The authenticate seam forty lines down has run the extractor
+            # since the audit that added it; `connect_refusal`'s own docstring
+            # says both transports route their refusals through here. That was
+            # true of the seam the audit was looking at. This is the same
+            # concern with a second site, and the second site is the earlier
+            # one — measured by dialing an `entity-core-go` peer that refuses
+            # at hello, which reported `bad_request` for a refusal go had
+            # correctly coded `incompatible_protocol`.
+            their_hello_response = ExecuteResponse.from_entity(their_hello_root)
+            if their_hello_response.status != 200:
+                raise connect_refusal("Connect hello failed", their_hello_response)
+
             their_hello_data = their_hello_root.get("data", {})
             their_hello_result = their_hello_data.get("result", {})
             # Result is a full entity (system/protocol/connect/hello) - data contains the actual fields
