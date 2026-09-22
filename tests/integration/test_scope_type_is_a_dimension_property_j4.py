@@ -1,64 +1,69 @@
-"""J4 — the scope type is a property of the DIMENSION (§5.2, 0.8.2.22).
+"""J4 — the scope type is a property of the DIMENSION (§5.2).
 
-The ruling has **two clauses**, and they need different things from an
-implementation:
+**Clause 1 stands. Clause 2 was WITHDRAWN at 0.8.2.24 (N1), and this file was
+inverted rather than deleted.**
+
+The ruling landed at 0.8.2.22 with two clauses:
 
 1. *"The scope type is a property of the DIMENSION and is supplied by the call
    site ``[MUST]``. … An implementation MUST NOT take the dispatch type from a
-   received entity's ``scope.type`` field."*
-2. *"**A received ``scope`` whose declared ``type`` contradicts its dimension
-   is a malformed token and MUST be refused ``403 capability_denied``
-   ``[MUST]``**."*
+   received entity's ``scope.type`` field."* — **stands.**
+2. *"A received ``scope`` whose declared ``type`` contradicts its dimension is
+   a malformed token and MUST be refused ``403 capability_denied``."* —
+   **WITHDRAWN 0.8.2.24.**
 
-.. rubric:: Why clause 2 is the one that needed building at two seats
+.. rubric:: Why clause 2 went away, since nothing fails when a rule is withdrawn
 
-Clause 1 is satisfied *structurally* by any peer that never plumbed the field:
-this tree derives the type from the dimension name
-(``_SCOPE_TYPE_BY_DIMENSION``), and `entity-core-go`'s ``types.CapabilityScope``
-has no ``Type`` field at all, so a wire ``scope.type`` is dropped at decode.
-go filed J4 as **CONFORMS, no code change** and added a regression guard.
+This seat built clause 2 (SA-PY-60) on the argument that *dropping is not
+refusing*: clause 1 is satisfied structurally by any peer that never plumbed
+the field, and a peer that silently ignores a contradicting type *accepts* a
+token the spec called malformed. The argument was internally sound and the
+premise it rested on was wrong.
 
-**Dropping is not refusing.** A peer that silently ignores a contradicting type
-*accepts* a token the spec calls malformed — clause 2 has its own status and
-its own code, and nothing about clause 1 produces them. Two ground-up seats
-landing on clause 1 is the standing law that cohort agreement is evidence about
-the reading implementers reach, not about the text; the more so here, because
-the clause they both satisfied is the one that comes with a mechanism and the
-one they missed is the one that comes with a bare obligation.
+**A peer that does not read ``scope.type`` cannot observe a contradiction in
+it.** So clause 2 obliged re-introducing the exact field whose absence IS the
+safety property — plus a targeted MUST-ignore exception — in order to reject a
+shape no conformant implementation produces. A rule satisfiable only by undoing
+the rule beside it is mechanism-shaped. Arch's §0, now a named failure mode with
+three instances in three days: *"when a finding says nobody validates X, the fix
+is a rule about who SUPPLIES X — and the temptation is to also demand a refusal
+when X arrives wrong. The refusal is what puts the mechanism back."*
 
-Routed as **SA-PY-60**: the disagreement is about whether *"drop the field"*
-discharges *"refuse the token"*, and the answer decides whether go owes a
-change. Implemented in the refusing direction here because clause 2 is written
-as a ``[MUST]`` with an explicit pair, and the standing posture is to build the
-ruling and report what building it finds.
+Three parties reached the withdrawal independently, by three methods, none
+having read the others: keystone's 45-peer wire census (``403`` on **zero** of
+40 driven), go's three-way source read (all three ground-up seats structurally
+immune), and arch's own line-reads taken before either packet was opened.
 
-.. rubric:: The refusal is produced by failing the grant closed
+**The replacement is a ``MAY`` at admission** (``put``, §6.3) — where a caller
+still exists to answer and the field has not yet been dropped. Not built here:
+it is a MAY, its cohort cost is zero, and a refusal go and rust do not make is a
+divergence this seat would be manufacturing out of an optional clause.
 
-There is no second error path: a grant carrying a contradicting type is skipped
-by every check's grant loop, so no grant matches and the caller is answered
-``403 capability_denied`` — which is the pair the ruling names. The alternative
-(a dedicated raise) would have to be threaded through four call sites and would
-give the same answer.
+.. rubric:: What this file pins now
 
-.. rubric:: What the rule protects, and why an ABSENT type must stay legal
+The rows below are the 0.8.2.22 rows **inverted in place**. A reader who found
+the class simply deleted would have no way to learn that the refusal was built,
+driven, and retracted — and *"we should refuse a mistyped token"* is exactly the
+hardening a later seat re-invents, because it reads as obviously correct and
+nothing in the tree contradicts it. It is a conformance defect: it refuses a
+token go and rust accept.
 
-The mistyping that matters is an ``operations`` or ``peers`` dimension declared
-as ``path-scope``: under clause 1's violation that value reaches the
-canonicalizing matcher, which *"over-grants on ``include`` and inverts the
-intent on ``exclude``."* An **absent** ``type`` is the ordinary shape of every
-capability this cohort mints — pinned below, because a guard that refused an
-absent type would refuse every token in the ecosystem while reading as strict.
+**The evidence is not wasted.** Building clause 2 is what reached the real
+boundaries — absent ≠ contradiction, and the unit of malformedness is the token
+rather than the axis — and it is what showed the clause was mechanism-shaped
+from the inside. Those boundaries are still pinned below, now as the shape the
+admission-time ``MAY`` would have to respect if anyone ever builds it.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from entity_core.capability import checking
 from entity_core.capability.checking import (
     ID_SCOPE,
     PATH_SCOPE,
     check_path_permission,
-    grant_declares_a_contradicting_scope_type,
     scope_type_for_dimension,
 )
 
@@ -81,7 +86,7 @@ def _grant(**scope_types: str) -> dict:
 
 
 class TestTheTypeComesFromTheDimension:
-    """Clause 1 — satisfied structurally here, pinned so it stays that way."""
+    """Clause 1 — stands, satisfied structurally here, pinned so it stays."""
 
     def test_the_mapping_is_fixed_by_the_specification(self):
         assert scope_type_for_dimension("handlers") == PATH_SCOPE
@@ -98,8 +103,13 @@ class TestTheTypeComesFromTheDimension:
             scope_type_for_dimension("something_new")
 
 
-class TestAContradictingTypeIsRefused:
-    """⭐ Clause 2 — the half neither ground-up seat had."""
+class TestClauseTwoIsWithdrawn:
+    """⭐ 0.8.2.24 (N1) — these rows asserted the OPPOSITE until the withdrawal.
+
+    Every row here failed before the retraction. That is the point of inverting
+    rather than deleting: the file is the only artifact that says the refusal
+    was real, was driven, and was taken back for a reason.
+    """
 
     @pytest.mark.parametrize("dimension,wrong", [
         ("operations", PATH_SCOPE),
@@ -107,82 +117,66 @@ class TestAContradictingTypeIsRefused:
         ("handlers", ID_SCOPE),
         ("resources", ID_SCOPE),
     ])
-    def test_every_dimension_declared_as_the_other_type_is_malformed(
+    def test_a_contradicting_type_does_NOT_refuse_at_the_matcher(
         self, dimension, wrong,
     ):
-        assert grant_declares_a_contradicting_scope_type(
-            _grant(**{dimension: wrong}),
-        ) is True
-
-    def test_the_grant_authorizes_NOTHING(self):
-        """The behavioural half. A malformed token grants nothing, so the check
-        finds no matching grant and the caller is answered
-        ``403 capability_denied``."""
-        malformed = {"grants": [_grant(operations=PATH_SCOPE)]}
+        """The headline inversion. A grant whose declared ``type`` contradicts
+        its dimension still authorizes, because the matcher never reads the
+        field — which is clause 1 working, not clause 2 failing."""
+        malformed = {"grants": [_grant(**{dimension: wrong})]}
         assert check_path_permission(
             malformed, "get", "data/file", PEER, handler_pattern="system/tree",
-        ) is False
-
-    def test_teeth_the_same_grant_without_the_bad_type_is_GRANTED(self):
-        """Without this the row above passes on a peer that refuses every
-        path, and the guard would be indistinguishable from a broken check."""
-        well_formed = {"grants": [_grant()]}
-        assert check_path_permission(
-            well_formed, "get", "data/file", PEER, handler_pattern="system/tree",
-        ) is True
-
-    def test_one_bad_dimension_poisons_the_whole_GRANT_not_just_that_axis(self):
-        """*"a malformed token"* — the unit is the token, not the dimension.
-
-        A peer that refused only the mistyped axis would still evaluate the
-        other three from a grant the spec says it must refuse.
-        """
-        malformed = {"grants": [_grant(peers=PATH_SCOPE)]}
-        assert check_path_permission(
-            malformed, "get", "data/file", PEER, handler_pattern="system/tree",
-        ) is False, (
-            "a grant whose `peers` dimension is mistyped still authorized a "
-            "RESOURCE read — the refusal was scoped to the axis rather than "
-            "to the token"
+        ) is True, (
+            "0.8.2.24 (N1) withdrew the clause-2 refusal; refusing here "
+            "diverges from go and rust, which cannot observe the field at all"
         )
 
-    def test_a_sound_grant_BESIDE_a_malformed_one_still_authorizes(self):
-        """The refusal is per-grant, and §5.2 evaluates grants independently.
+    def test_the_refusal_helper_is_GONE_and_must_not_come_back(self):
+        """Structural, and deliberately so.
 
-        This is the boundary of the row above: poisoning the token is not
-        poisoning the capability, or one malformed entry would silently revoke
-        every other grant a caller holds.
+        A behavioural row cannot distinguish *"we removed the refusal"* from
+        *"we kept the refusal and this input does not reach it"*. A withdrawn
+        rule leaves no failing test behind, so the enforcement point for a
+        withdrawal has to be the absence of the mechanism itself.
         """
-        mixed = {"grants": [_grant(operations=PATH_SCOPE), _grant()]}
+        assert not hasattr(
+            checking, "grant_declares_a_contradicting_scope_type",
+        ), (
+            "the clause-2 refusal helper is back. 0.8.2.24 (N1) WITHDREW that "
+            "clause: a peer that does not read `scope.type` cannot observe a "
+            "contradiction in it, so the refusal obliges re-introducing the "
+            "very field whose absence is the safety property. The disposition, "
+            "where one is wanted, is a MAY at admission (`put`, §6.3) — not a "
+            "matcher-side refusal. See the module docstring."
+        )
+
+    def test_the_boundary_clause_2_taught_us_still_holds_absent_is_not_contradiction(self):
+        """Kept from the pre-withdrawal class, re-pointed.
+
+        Every capability this cohort mints OMITS ``type``. Under clause 2 this
+        row stopped a *"be stricter"* fix from reading silence as contradiction
+        and refusing the entire ecosystem. It survives the withdrawal as the
+        boundary an admission-time ``MAY`` would have to respect.
+        """
         assert check_path_permission(
-            mixed, "get", "data/file", PEER, handler_pattern="system/tree",
+            {"grants": [_grant()]}, "get", "data/file", PEER,
+            handler_pattern="system/tree",
         ) is True
 
-
-class TestAnAbsentTypeIsTheOrdinaryShape:
-    """The non-obvious half: silence is not a contradiction.
-
-    Every capability this cohort mints omits ``type`` — the field exists in
-    §3.6's schema and no minter writes it. A guard that treated absence as
-    malformed would refuse the entire ecosystem while reading as strict, which
-    is the direction a "be stricter" fix errs in.
-    """
-
-    def test_no_declared_type_is_not_a_contradiction(self):
-        assert grant_declares_a_contradicting_scope_type(_grant()) is False
-
-    @pytest.mark.parametrize("dimension,right", [
-        ("operations", ID_SCOPE),
-        ("peers", ID_SCOPE),
-        ("handlers", PATH_SCOPE),
-        ("resources", PATH_SCOPE),
-    ])
-    def test_a_type_that_AGREES_with_its_dimension_is_fine(self, dimension, right):
-        """A sender that spells the field correctly is conformant, not merely
-        tolerated — the rule is about contradiction, not about presence."""
-        assert grant_declares_a_contradicting_scope_type(
-            _grant(**{dimension: right}),
+    def test_teeth_a_grant_that_authorizes_NOTHING_still_refuses(self):
+        """Without this, every row above passes on a peer whose check is simply
+        broken open. The refusal path must still work; it is the *trigger* that
+        was withdrawn, not the mechanism."""
+        assert check_path_permission(
+            {"grants": [_grant()]}, "get", "other/file", PEER,
+            handler_pattern="system/tree",
         ) is False
+
+
+class TestACorrectlyTypedGrantIsUnaffected:
+    """A sender that spells the field correctly was always conformant, and the
+    withdrawal does not change that — it only removes the obligation to punish
+    one that spells it wrong."""
 
     def test_a_grant_declaring_every_type_correctly_still_authorizes(self):
         fully_typed = {"grants": [_grant(

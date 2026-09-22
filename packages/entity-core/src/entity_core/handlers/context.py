@@ -524,11 +524,70 @@ class HandlerContext:
         # about the frame" MUST NOT be spelled the same as "any handler".
         if not frame:
             return False
-        return check_path_permission(
+        if not check_path_permission(
             self.caller_capability,
             operation,
             path,
             self.local_peer_id,
             handler_pattern=frame,
             granter_peer_id=self.caller_capability_granter_peer_id,
+        ):
+            return False
+
+        # §6.8 row 1 — THE CEILING, and *"Both MUST pass [MUST]"* (0.8.2.24 N5).
+        #
+        #   *"the handler is about to touch a path IN SERVICE OF THE CALLER'S
+        #   REQUEST … the authority is the caller's verified capability (§6.7)
+        #   — AND the executing handler's own grant as an additional ceiling.
+        #   Both MUST pass."*
+        #
+        # This method IS row 1's site: every caller of it is authorizing a path
+        # touched in service of a live caller's request (that is what
+        # distinguishes it from row 2, where the handler acts on its own behalf
+        # and `handler_grant` is the SOLE authority — `execute_with_capability`).
+        #
+        # .. rubric:: Why all three ground-up seats concluded it was not owed
+        #
+        # 0.8.2.22 derived row 1 from `EXTENSION-TREE` §8.1/§8.5's dual-check
+        # and generalized `max_scope` to *the executing handler's own grant*.
+        # §8.5 carries a REDUCTION — absent `max_scope`, the dual check reduces
+        # to the single request-capability check — and three independent
+        # readers carried that qualifier across with the rest of the
+        # derivation. 0.8.2.24 says what the generalization did to it: the
+        # thing it generalized TO cannot be absent. §6.8's dispatch-time grant
+        # validation requires the grant entity to exist at
+        # `system/capability/grants/{pattern}`, treats a missing or invalid one
+        # as `permission_denied`, and forbids falling back to the caller's
+        # capability — **a handler with no valid grant does not run**. So the
+        # ceiling is present at every dispatch and the conjunction always
+        # binds. A view tree is one MECHANISM for enforcing the intersection
+        # structurally; it is not the condition under which it applies.
+        #
+        # .. rubric:: Why nothing here could measure it
+        #
+        # Every handler this peer registers gets §6.2's default self-grant —
+        # `handlers:["*"] operations:["*"] resources:["/*/*"]` — which is
+        # wider than any caller capability, so the ceiling is satisfied
+        # vacuously at every reachable site. That is keystone's finding
+        # ("a core peer has one path-resource handler, so owner and runner
+        # coincide") and it is why this rule is *"landed, binding, implemented
+        # nowhere, observable by nothing"* across the cohort.
+        #
+        # ⭐ It is observable HERE: `PeerBuilder.with_handler(max_scope=…)`
+        # mints a narrower grant, and this peer already ships one —
+        # `system/validate/dispatch-outbound`, narrowed on all three of
+        # handlers/operations/resources per GUIDE-CONFORMANCE §7a.1. The
+        # fixture the cohort is blocked on for KB-16 exists at two seats.
+        #
+        # The frame is the SAME on both checks by construction: §6.3's
+        # `handler_pattern` describes *the access being authorized* (a tree
+        # read is a tree read whoever's grant is being consulted), and giving
+        # the two checks different frames would be SA-PY-58's defect with the
+        # ceiling as the victim.
+        return check_path_permission(
+            self.handler_grant,
+            operation,
+            path,
+            self.local_peer_id,
+            handler_pattern=frame,
         )

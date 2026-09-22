@@ -268,6 +268,142 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A RETRACTION round's cost table is the one nobody checks, because a withdrawal reads as
+  free — and the seat that BUILT the withdrawn rule is the only one it costs.** ***RATIFIED
+  2026-09-14*** *— eleventh axis of the "a routed report's claims about our repo are hearsay"
+  law, and the first where the claim is an **absence of work**. Four of 0.8.2.24's six deltas
+  showed `—` for py and **three of them were owed here.*** Arch's §5 table reads
+  `N1 — · N2 — · N3 — · N4 —` for this seat. Measured before touching anything: **N1** was live
+  at four grant loops (we shipped clause 2 as SA-PY-60 three commits earlier, which is *why* the
+  withdrawal costs us and nobody else); **N2** was live at four call sites; **N4** was a bare
+  socket close at the serve loop, byte-identical to the go behaviour the packet contrasts py
+  with.
+  **Why a retraction inverts every instinct the law was built on.** Every prior axis —
+  architecture, coverage, version, behaviour, filing record, remedy, build state, schedule,
+  count, citation — is a claim you check because you are *about to do work*. A `—` in a
+  withdrawal column says *you have nothing to undo*, which terminates in no task, no diff and no
+  test, and it is **most likely to be wrong precisely at the seat that implemented the withdrawn
+  rule** — because arch's premise is *"it removes an obligation none could satisfy"* and our
+  satisfying it is the thing that premise cannot see. The seat that did the most work on a
+  ruling is the seat its retraction is most expensive for, and the table is sorted the other way.
+  **The check is the same two seconds as every other axis and has to be run on the `—` rows,
+  which is the part that is new:** for each delta, grep for the *mechanism* the delta withdraws
+  or narrows (`grant_declares_a_contradicting_scope_type`, `NEVER_MATCH`, the serve loop's
+  `break`) before reading the column. And when a fold is announced as *"mostly a retraction"*,
+  read the **whole** table rather than your own row — a retraction round is where a `—` is
+  cheapest to write and most expensive to believe. Enforcement points: one test file per delta,
+  each carrying the measured pre-state in its module docstring, plus
+  `test_scope_type_is_a_dimension_property_j4.py`, **inverted rather than deleted** so a later
+  reader can learn the refusal was built, driven and taken back — and a *structural* row pinning
+  that the helper is gone, because no behavioural row can tell *"we removed the refusal"* from
+  *"this input does not reach it."*
+
+- **A guard is scoped by its CALL GRAPH, not by where it sits — and a comment describing the
+  call graph as a design decision is what stops anyone reading it.** *Candidate, 2026-09-14 —
+  0.8.2.24 N2 at four sites.* `NEVER_MATCH` is a §5.4 **path**-canonicalization sentinel, and
+  it sat in `matches_scope` — which **is** the path-scope matcher, correctly, since 0.8.2.16
+  split `matches_id_scope` out *"so that which matcher a dimension uses is visible at the call
+  site."* The guard was in the right place. **Four call sites handed it an id-scope value**:
+  subscription's and substitute's `operations`, and both of query's `type_scope`. So an
+  `operations` exclude of `*/apply` — an ordinary literal the id matcher would ignore, an
+  escaping path to the canonicalizer — **denied every operation**.
+  **The tell was a true sentence.** The comment over the guard read *"reached by every dimension
+  of every grant, so this is the widest of the three arms."* False as a design statement and
+  **true as a description of the call graph**, so it read as a considered scoping decision by
+  someone who had thought about it. *A comment that is accidentally true is worse than one that
+  is wrong, because nothing about it invites a check.*
+  **And two of the four sites carried the citation that refutes them.** `query.py`'s own comment
+  says *"type_scope is an id-scope"* directly above a path-matcher call, and `EXTENSION-QUERY`
+  §5.2 names the arm outright — *"the same function that evaluates `id-scope` include/exclude
+  patterns for operations and peers dimensions."* Not a reading; a citation four call sites did
+  not follow. Landing it broke **nothing among 4314** — the SA-PY-54 signal — because nobody
+  writes `*/apply` by accident, so the defect was reachable only by asking.
+  **The check:** when a matcher is split by type, the enforcement is a census of **who calls
+  which**, not the split itself. Enforcement point:
+  `test_never_match_is_path_scope_only_n2.py::TestNoIdScopeDimensionReachesThePathMatcher` —
+  **and its first mutation run corrected its author (sixth instance).** The census keys on the
+  *argument's text* carrying an id-scope token, so it caught `matches_scope(grant.operations, …)`
+  and was **blind** to a site that binds the value to a local named `scope` first. That is AP-21's
+  own shape — a gate whose search key is part of what the defect removes — firing inside a gate
+  written to apply AP-21. Remedy is a **module ledger** (a module whose every scope match is
+  id-scope must not reference the path matcher *at all*), not a better regex.
+
+- **Fix the class at the HANDLER, because a census keyed on "reads the field" cannot reach a
+  site that ignores it.** *Candidate, 2026-09-14 — 0.8.2.24 N6, and my own test row caught the
+  error.* N6 separates the two empties: an absent `resource` takes the operation's own
+  absent-case behaviour, a `resource` **present** whose effective list is empty is `400
+  path_required`. The distinction was already carried — the dispatcher sets `resource_targets`
+  to `None` when absent and to a list when present — and every consumer wrote
+  `if ctx.resource_targets:`, where `None` and `[]` are both falsy. *A truthiness test on an
+  `Optional[list]` is the `min(binding.ttl, local_max)` shape: a construct with no arm for one
+  of the cases is a ruling, not a null check.*
+  **The placement is the finding.** I guarded the three tree operations that *read*
+  `ctx.resource_targets` — `get`, `put`, `extract`. **Five of the eight do not read it at all**:
+  `snapshot`, `diff`, `merge`, `create`, `destroy` take their path from `params`
+  unconditionally. SA-PY-59's class on the most-dispatched handler in the peer — and the
+  params-only operations are exactly where serving the absent-case behaviour is **widest**:
+  `snapshot`'s default prefix is `""`, the whole tree, and `snapshot` is the row
+  `EXTENSION-TREE` §8.4 **exempts** from the path-level check. Predicted 400, measured 200, and
+  the prediction being wrong is the finding. The guard is now at the tree handler's **entry**:
+  thirteen operations covered, and one added later inherits it without knowing it exists.
+  **Second correction in the same pass, recorded because it read as a regression and was not:**
+  the `put` teeth row sent `{type, data}` and got a 400. The **fixture** was wrong — 0.8.2.11
+  §6.3 makes `put` a receipt path, so the submitter authors the hash (SA-PY-41). *"N6 broke
+  put"* was this repo's own conformance working. **When a new guard reddens a row, check whether
+  the row was ever conformant before blaming the guard.**
+
+- **If the claim is about what goes on the WIRE, the row has to read the wire — and a docstring
+  is where an unasserted claim gets laundered into a cohort measurement.** ***RATIFIED
+  2026-09-14*** *— the "two representations" law with a **claim** and its **evidence** as the
+  two, and the first instance where the false claim had already been routed to two sibling
+  seats as our data point.* `test_resolution_integrity_k1.py`'s module docstring read: *"go
+  refuses by a receive-boundary connection close with no status … **py answers a coded 401 on
+  one arm and a coded 400 on the other**, so this seat's data point is: the coded response is
+  reachable."* The 401 arm is true. **The 400 arm was false.** Its row asserts
+  `pytest.raises(HashValidationError)` against `recv_envelope` called **directly**, and the
+  bridging sentence — *"which the wire boundary renders as that pair"* — is prose nothing drove.
+  The serve loop caught the exception, logged at INFO and `break`'d: **a bare close, nothing on
+  the wire**, exactly the go behaviour the paragraph contrasts us with. So py argued for a rule
+  it did not implement, and go's routed finding was about both of us.
+  **The mechanism is that the test was RIGHT about its own subject.** The row measures which
+  mechanism refuses the forgery, and it measures it correctly; the docstring then added one
+  clause about what reaches the wire, which is a different surface with a different boundary and
+  no assertion behind it. **A docstring sits at the same indentation as evidence and is not
+  evidence** — and it is the part a routing packet quotes, because it is the part written in
+  prose.
+  **Two checks.** When a test's docstring makes a claim about a **layer the test does not
+  drive**, either drive it or delete the sentence; *"renders as"*, *"which the wire boundary
+  turns into"*, *"i.e. a 400"* are the tells. And before quoting your own tree into a packet as
+  a cohort-comparable number, **open the row that backs the number and check what it asserts** —
+  ours asserted an exception type. Enforcement point:
+  `test_decode_boundary_refusal_n4.py`, every row of which opens a socket and reads the frame,
+  with the K1 docstring corrected in place (not edited away) so the retraction is legible to
+  whoever arrives from the old packet.
+
+- **A cohort blocked on building a fixture is worth one grep before it is worth a cross-repo
+  build — the thing may already be shipped, twice.** *Candidate, 2026-09-14 — 0.8.2.24 N5 /
+  `KB-16`.* Arch: N5's ceiling, `K4`/`K5`'s owner-frame arm and rust's frame vector *"all need
+  the same thing: a peer where the executing handler's own grant is NARROWER than the caller's.
+  **Nobody ships one.**"* keystone reached that from a 45-peer wire census (*"a core peer has
+  one path-resource handler, so owner and runner coincide at every reachable site"*); go from
+  161 cross-impl rows. Both measurements are correct **about the generated lineage**, and the
+  conclusion was generalized to the cohort.
+  **py ships one and so does go.** `system/validate/dispatch-outbound` is registered with a
+  narrow `max_scope` — handlers, operations **and** resources all narrowed, `peers` omitted —
+  per GUIDE-CONFORMANCE §7a.1's scaffold contract, and our own call-site comment records it as
+  byte-parallel with go's `DispatchOutboundHandler.Manifest().InternalScope`. The premise is
+  the hearsay law on its architecture axis, in the **expensive** direction: *"the fixture does
+  not exist"* terminates in a cross-repo build of a thing already built, at two seats, for a
+  documented reason.
+  **Why nobody looked:** the fixture is in the **conformance scaffold**, not in the handler set
+  a census enumerates — it exists to make §1.4's compose-vs-bypass discriminator constructible,
+  which is a *different* finding, so no search for *"a narrow handler grant"* was ever run
+  against it. **A fixture built for one ruling is invisible to the next one unless somebody
+  greps for the shape rather than the purpose.** Enforcement point:
+  `test_handler_grant_ceiling_n5.py::TestTheFixtureTheCohortIsBlockedOn`, which asserts the
+  registration rather than describing it — the claim is being routed, so it must fail here if it
+  ever stops being true.
+
 - **A race with TWO windows has ONE observable, so closing either window turns the cohort row
   GREEN — and the row cannot tell you the other is still open.** *Candidate, 2026-09-13 — found
   running the cohort number `entity-core-go` asked for, which reddened a row with nothing to do

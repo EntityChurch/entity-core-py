@@ -160,6 +160,14 @@ def require_single_resource_target(
         # and a fully self-excluded one are the same answer to the same
         # question, and giving them different codes is how a caller learns
         # which of its targets the authorizer skipped.
+        #
+        # 0.8.2.24 (N6) SEPARATES the two empties — but only for an operation
+        # that does NOT require a resource, where the absent case has some
+        # other behaviour to fall into. Here both empties answer the same code
+        # (`path_required`), so this collapse stays correct and this helper is
+        # untouched by N6. The resource-OPTIONAL row is
+        # :func:`refuse_an_emptied_resource` below, and it is a different
+        # question, not a stricter version of this one.
         return None, _refuse("path_required", f"{what}.")
     if len(targets) != 1:
         return None, _refuse(
@@ -180,6 +188,79 @@ def require_single_resource_target(
             "not usable as *this* operation's subject.",
         )
     return first, None
+
+
+def refuse_an_emptied_resource(
+    ctx: HandlerContext, what: str, *, result_type: str | None = None,
+) -> dict[str, Any] | None:
+    """The §3.3 row for an operation that does **not** require a resource.
+
+    Returns an error response when the caller sent a ``resource`` whose
+    effective target list is empty, else ``None``.
+
+    .. rubric:: The two empties are distinct `[MUST]` (§3.3, 0.8.2.24 N6)
+
+        *"For an operation that does NOT require one, the two empties are
+        distinct: a **genuinely absent** ``resource`` takes that operation's
+        own absent-case behaviour (for ``system/tree:get``, the root listing —
+        its specification reads "Path ending with ``/`` **or empty**:
+        listing"), while a ``resource`` that is **present** and whose effective
+        list is empty MUST be refused ``400 path_required`` and MUST NOT be
+        served the absent-case behaviour."*
+
+    The caller named a target and its own ``exclude`` removed it. Serving the
+    absent-case behaviour answers the **wider** thing — §5.2's subject rule
+    (*a handler MUST NOT widen the set*) reached through the front door. On
+    ``get`` it turns a request for one excluded path into a listing of the
+    tree; on ``snapshot`` it turns it into a snapshot of the whole tree.
+
+    .. rubric:: Why a truthiness test cannot express this, which is the bug
+
+    Every site read ``if ctx.resource_targets:`` — and ``None`` and ``[]`` are
+    both falsy, so *"the caller sent no resource"* and *"the caller sent a
+    resource and excluded all of it"* took the same branch and fell through to
+    the params path. The distinction was **already carried**: the dispatcher
+    sets the attribute to ``None`` when ``EXECUTE.resource`` is absent and to a
+    list when it is present, then narrows that list to the effective set
+    (F68). No new context field is needed, and none should be added — the
+    F68 law is that the reduction has ONE derivation, and a `resource_present`
+    flag beside the list would be a second one.
+
+    .. rubric:: This binds more than ``system/tree:get``
+
+    §3.3's sentence is about *"an operation"*, and the ``get`` example is an
+    example. Measured at this seat it is seven sites: ``tree:get``,
+    ``tree:put``, ``tree:snapshot``, ``inbox`` delivery-path resolution and
+    three ``continuation`` path resolutions — each one a resource-optional
+    operation with a params fallback. The dangerous ones are not the named
+    one: ``snapshot`` falls back to prefix ``""``, which is the whole tree,
+    and ``put`` falls back to a caller-supplied params path on a **write**.
+
+    Args:
+        ctx: The dispatch context.
+        what: Human-readable description of what the target would have named.
+        result_type: The error entity's ``type``, for handlers whose own
+            specification gives them one. Same reason as
+            :func:`require_single_resource_target`: a differing result type
+            must not become a reason to own a copy of the row.
+    """
+    targets = getattr(ctx, "resource_targets", None)
+    # `None` is ABSENT — the operation's own absent-case behaviour applies and
+    # this helper has nothing to say. `[]` is PRESENT-AND-EMPTIED.
+    if targets is None or len(targets) > 0:
+        return None
+    built = error_response(
+        400,
+        "path_required",
+        f"{what}, and the `resource` you sent names no target after your own "
+        "`exclude` was applied (§3.3, 0.8.2.24). This is NOT the absent case: "
+        "an absent `resource` would take this operation's default behaviour, "
+        "but you named a target and excluded it, so serving that default "
+        "would answer something wider than you asked for.",
+    )
+    if result_type is not None:
+        built["result"]["type"] = result_type
+    return built
 
 
 def unresolvable_tree_path(

@@ -16,7 +16,11 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from entity_core.capability.checking import find_matching_grant, get_scope, matches_scope
+from entity_core.capability.checking import (
+    find_matching_grant,
+    get_scope,
+    matches_id_scope,
+)
 from entity_core.peer.extensions import Extension, ExtensionContext
 from entity_core.storage.indexes import (
     IndexManager,
@@ -384,7 +388,14 @@ def _check_type_scope(
         exclude=type_scope.get("exclude"),
     )
 
-    if not matches_scope(scope, type_filter):
+    # EXTENSION-QUERY §5.2 step 3 names the arm outright: *"Both steps use
+    # `matches_scope` … the same function that evaluates `id-scope`
+    # include/exclude patterns for operations and peers dimensions."* The
+    # comment above has said `type_scope` is an id-scope since it was written;
+    # the call under it reached the PATH matcher, which canonicalizes — and
+    # since 0.8.2.21 a `type_scope` exclude that canonicalizes to NEVER_MATCH
+    # denied every type (0.8.2.24 N2).
+    if not matches_id_scope(scope, type_filter):
         return _error(403, "type_not_authorized",
                       f"type_filter '{type_filter}' not authorized by type_scope")
 
@@ -404,7 +415,8 @@ def _type_authorized_by_scope(
         include=type_scope.get("include", ["*"]),
         exclude=type_scope.get("exclude"),
     )
-    return matches_scope(scope, type_name)
+    # §5.2 step 6a — the id-scope arm, same citation as step 3 above.
+    return matches_id_scope(scope, type_name)
 
 
 # ---------------------------------------------------------------------------

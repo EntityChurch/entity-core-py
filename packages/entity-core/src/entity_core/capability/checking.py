@@ -91,51 +91,38 @@ def scope_type_for_dimension(dimension: str) -> str:
         ) from None
 
 
-def grant_declares_a_contradicting_scope_type(grant: dict[str, Any]) -> bool:
-    """§5.2 (0.8.2.22) — does this grant carry a ``scope.type`` that
-    contradicts the dimension it sits on?
-
-        *"The scope type is a property of the DIMENSION and is supplied by the
-        call site ``[MUST]``. … An implementation MUST NOT take the dispatch
-        type from a received entity's ``scope.type`` field. **A received
-        ``scope`` whose declared ``type`` contradicts its dimension is a
-        malformed token and MUST be refused ``403 capability_denied``
-        ``[MUST]``**."*
-
-    .. rubric:: The ruling has TWO clauses, and dropping the field satisfies
-       only the first
-
-    This peer never read ``scope.type`` — the type comes from
-    :py:func:`scope_type_for_dimension`, keyed on the dimension name — so the
-    *"MUST NOT take the dispatch type from a received entity"* half was already
-    satisfied, and satisfied structurally. That is also `entity-core-go`'s
-    position, reached the same way (their ``types.CapabilityScope`` has no
-    ``Type`` field at all, so a wire ``scope.type`` is dropped at decode), and
-    they filed J4 as **CONFORMS, no code change**.
-
-    **Dropping is not refusing.** The second clause is a separate ``[MUST]``
-    with its own status and code, and a peer that silently ignores a
-    contradicting type *accepts* a token the spec calls malformed. Two
-    ground-up seats converging on the first clause is the standing law that
-    cohort agreement is evidence about the reading implementers reach, not
-    about the text — the more so here, because the clause they both satisfied
-    is the one that comes with a mechanism and the one they missed is the one
-    that comes with a bare obligation. Routed as **SA-PY-60**.
-
-    Failing the grant closed here makes the surrounding check find no matching
-    grant, so the caller is answered ``403 capability_denied`` — the pair the
-    ruling names, produced without a second error path.
-    """
-    for dimension, expected in _SCOPE_TYPE_BY_DIMENSION.items():
-        value = grant.get(dimension)
-        if not isinstance(value, dict):
-            continue
-        declared = value.get("type")
-        # An ABSENT type is the ordinary shape of every capability this cohort
-        # mints; only a DECLARED one that disagrees is the malformed token.
-        if declared is not None and declared != expected:
-            return True
-    return False
+# ---------------------------------------------------------------------------
+# WITHDRAWN 0.8.2.24 (N1): there is NO matcher-side refusal of a contradicting
+# `scope.type`, and re-adding one is a conformance defect, not hardening.
+#
+# 0.8.2.22's §5.2 had TWO clauses: (1) MUST NOT take the dispatch type from a
+# received entity's `scope.type`, and (2) a `scope` whose declared `type`
+# contradicts its dimension is a malformed token and MUST be refused
+# `403 capability_denied`. This peer satisfied (1) structurally — the type
+# comes from `scope_type_for_dimension`, keyed on the dimension name — and
+# built (2) at four sites (SA-PY-60), on the argument that *dropping is not
+# refusing*.
+#
+# **0.8.2.24 WITHDRAWS clause 2.** Three parties reached that independently
+# (keystone's 45-peer wire census: `403` on zero; go's three-way source read;
+# arch's own line-reads). The clause was unsatisfiable for the implementation
+# clause 1 prescribes: a peer that does not read `scope.type` cannot observe a
+# contradiction in it, so the refusal obliged re-introducing the exact field
+# whose absence IS the safety property — plus a MUST-ignore exception — to
+# reject a shape no conformant peer produces. Arch's §0: *"when a finding says
+# nobody validates X, the fix is a rule about who SUPPLIES X; the refusal is
+# what puts the mechanism back."*
+#
+# The replacement is a **MAY at admission** (`put`, §6.3), where a caller still
+# exists to answer and the field has not yet been dropped. Deliberately NOT
+# built here: it is a MAY, its cohort cost is zero, and a refusal go and rust
+# do not make is a divergence this seat would be manufacturing out of an
+# optional clause.
+#
+# Recorded rather than deleted silently, because a withdrawn rule leaves no
+# failing test behind — the comment is the only thing that stops it coming
+# back (the 0.8.2.13 `system/*` reservation, same shape, same file family).
+# ---------------------------------------------------------------------------
 
 
 def granter_frame_peer_id(
@@ -482,11 +469,26 @@ def matches_scope(scope: CapabilityScope | dict[str, Any], value: str) -> bool:
     # Check if any exclude pattern matches
     if scope.exclude:
         for pattern in scope.exclude:
-            # AN UNMATCHABLE EXCLUDE EXCLUDES EVERYTHING (§5.2, 0.8.2.21).
-            # Reached by every dimension of every grant, so this is the widest
-            # of the three arms. A granter writing `exclude: ["*/secret"]` for
-            # *not `secret`, in any peer's namespace* otherwise gets an
-            # exclusion that carves out nothing.
+            # AN UNMATCHABLE EXCLUDE EXCLUDES EVERYTHING (§5.2, 0.8.2.21;
+            # SCOPED TO PATH-SCOPE 0.8.2.24 N2). A granter writing
+            # `exclude: ["*/secret"]` for *not `secret`, in any peer's
+            # namespace* otherwise gets an exclusion that carves out nothing.
+            #
+            # ⛔ This comment used to read *"reached by every dimension of
+            # every grant, so this is the widest of the three arms"* — and
+            # that sentence is why nobody looked. It was FALSE as a design
+            # statement (this is the PATH-scope matcher; `operations` and
+            # `peers` take `matches_id_scope`) and TRUE as a description of
+            # the call graph, because four call sites routed an id-scope
+            # value here. 0.8.2.24 N2 is exactly that: the sentinel is a §5.4
+            # PATH-canonicalization sentinel, it has no meaning on an id-scope
+            # dimension, and applying it there denies the WHOLE dimension on a
+            # property unrelated to whether the exclude carves anything out —
+            # an `operations` exclude of `*/apply` is an ordinary literal to
+            # the matcher that will evaluate it and an escaping path to the
+            # canonicalizer. The guard is correct HERE; what was wrong was who
+            # was calling here. Keep it path-scope-only by keeping the call
+            # sites honest, not by adding a dimension parameter.
             if is_unmatchable_pattern(pattern):
                 return False
             if matches_pattern(pattern, value):
@@ -645,12 +647,6 @@ def check_handler_scope(
     peer = target_peer if target_peer is not None else local_peer_id
 
     for grant in capability_data.get("grants", []):
-        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
-        # dimension is a malformed token. Fail the grant closed so the
-        # check answers 403 capability_denied — dropping the field, as
-        # both ground-up seats do, satisfies only the ruling's first half.
-        if grant_declares_a_contradicting_scope_type(grant):
-            continue
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
@@ -827,12 +823,6 @@ def check_resource_scope(
                 return False
 
         for grant in capability_data.get("grants", []):
-            # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
-            # dimension is a malformed token. Fail the grant closed so the
-            # check answers 403 capability_denied — dropping the field, as
-            # both ground-up seats do, satisfies only the ruling's first half.
-            if grant_declares_a_contradicting_scope_type(grant):
-                continue
             # Check handler scope
             handlers_scope = get_scope(grant, "handlers")
             if not matches_scope(handlers_scope, handler_pattern):
@@ -1021,12 +1011,6 @@ def check_path_permission(
     canonical_path = canonicalize(path, local_peer_id)
 
     for grant in capability_data.get("grants", []):
-        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
-        # dimension is a malformed token. Fail the grant closed so the
-        # check answers 403 capability_denied — dropping the field, as
-        # both ground-up seats do, satisfies only the ruling's first half.
-        if grant_declares_a_contradicting_scope_type(grant):
-            continue
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
@@ -1144,12 +1128,6 @@ def find_matching_grant(
         return None
 
     for grant in capability_data.get("grants", []):
-        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
-        # dimension is a malformed token. Fail the grant closed so the
-        # check answers 403 capability_denied — dropping the field, as
-        # both ground-up seats do, satisfies only the ruling's first half.
-        if grant_declares_a_contradicting_scope_type(grant):
-            continue
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
             continue

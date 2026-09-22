@@ -716,7 +716,11 @@ def _validate_deliver_token(
     Returns:
         True if token grants access, False otherwise.
     """
-    from entity_core.capability.checking import matches_pattern, matches_scope
+    from entity_core.capability.checking import (
+        matches_id_scope,
+        matches_pattern,
+        matches_scope,
+    )
     from entity_core.capability.token import Grant
 
     grants = token_entity.data.get("grants", [])
@@ -734,8 +738,13 @@ def _validate_deliver_token(
             if not matches_scope(grant.resources, deliver_uri):
                 continue
 
-            # Check operation scope.
-            if not matches_scope(grant.operations, deliver_operation):
+            # Check operation scope. `operations` is an ID-SCOPE dimension
+            # (§5.2), so it takes the id-scope matcher: matching it with the
+            # path matcher is the F40 defect §5.2 names, and since 0.8.2.21 it
+            # additionally put an `operations` exclude through the §5.4 path
+            # transforms, where a literal like `*/apply` canonicalizes to
+            # NEVER_MATCH and DENIES THE WHOLE DIMENSION (0.8.2.24 N2).
+            if not matches_id_scope(grant.operations, deliver_operation):
                 continue
 
             return True

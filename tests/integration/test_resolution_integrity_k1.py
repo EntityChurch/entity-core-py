@@ -78,6 +78,29 @@ required, or is fail-closed close conformant?"* to arch as finding (1). py
 answers a coded **401** on one arm and a coded **400** on the other, so this
 seat's data point is: *the coded response is reachable, and it is two different
 codes for two different attacker spellings of one attack.*
+
+.. rubric:: ⛔ CORRECTION (0.8.2.24) — the 400 half of that claim was FALSE
+
+The paragraph above went into a routing packet as a cohort-comparable
+measurement. **The 401 arm is true**; that request is admitted and refused by
+`verify_request`. **The 400 arm was not.** Arm 1's row below asserts
+``pytest.raises(HashValidationError)`` against ``recv_envelope`` called
+directly, and its *"which the wire boundary renders as that pair"* was prose
+in a docstring that nothing drove. Measured on a socket, the serve loop caught
+the exception, logged it at INFO and closed — **a bare close with nothing on
+the wire, byte-identical to the go behaviour this paragraph contrasts py
+with.**
+
+So py was arguing for a rule it did not implement, and go's finding (1) was
+about both of us. `N4` now pins it and the fix is in `peer.py`
+(`_emit_decode_refusal`); the claim is driven by
+`test_decode_boundary_refusal_n4.py`, every row of which opens a socket.
+
+**The arms below still measure what they say** — the two attacker spellings
+really are refused by two different mechanisms at two different layers, and
+that is the finding. What was wrong was the sentence about what reaches the
+wire. *A row that asserts an exception is evidence about the exception; only a
+row that reads the socket is evidence about the response.*
 """
 
 from __future__ import annotations

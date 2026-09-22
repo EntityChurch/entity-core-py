@@ -293,7 +293,28 @@ class TestIncludePayloadReadAuth:
         return HandlerContext(
             local_peer_id=keypair.peer_id,
             remote_peer_id="remote-peer-id",
-            handler_grant={},
+            # §6.2's default per-handler self-grant — what the dispatcher
+            # actually installs on every context it builds (`peer.py`
+            # `_bootstrap_handler_grants`).
+            #
+            # This was `{}` until 0.8.2.24 (N5). An empty grant was harmless
+            # while `handler_grant` was only read on the row-2 path (a handler
+            # acting on its OWN behalf); N5 makes it a CEILING on row 1 as
+            # well — *"the caller's verified capability AND the executing
+            # handler's own grant. Both MUST pass."* — and an empty grant
+            # correctly fails closed there, because §6.8 says a handler with
+            # no valid grant does not run.
+            #
+            # So this row's 403 was the fixture, not the code: the standing
+            # law that a fixture is a claim about what production supplies,
+            # and this one claimed nothing. Same shape as SA-PY-58, where
+            # every in-process fixture left `handler_pattern` at `None` and
+            # therefore ran with the §6.3 handlers filter disabled.
+            handler_grant={"grants": [{
+                "handlers": {"include": ["*"]},
+                "operations": {"include": ["*"]},
+                "resources": {"include": ["/*/*"]},
+            }]},
             caller_capability={"grantee": HASH_AUTHOR, "grants": grants},
             emit_pathway=emit_pathway,
             remote_identity_hash=HASH_AUTHOR,

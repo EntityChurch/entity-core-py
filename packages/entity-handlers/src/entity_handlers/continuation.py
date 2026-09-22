@@ -107,7 +107,10 @@ from entity_core.protocol.delivery import DeliverySpec
 from entity_core.storage.emit import EmitContext
 from entity_core.utils.ecf import Hash, is_hash_ref
 from entity_core.utils.path import invariant_signature_path, sanitize_path_segment
-from entity_handlers._common import require_single_resource_target
+from entity_handlers._common import (
+    refuse_an_emptied_resource as _refuse_an_emptied_resource,
+    require_single_resource_target,
+)
 from entity_handlers.manifest import error_response as _error_response
 
 logger = logging.getLogger(__name__)
@@ -685,6 +688,14 @@ async def _handle_advance(
     # placement of maybeSweepJoins at the very top of handleAdvance, before
     # the resource-path read and the cap check).
     await _maybe_sweep_joins(ctx)
+
+    # §3.3 (0.8.2.24 N6): a `resource` PRESENT whose effective list is empty
+    # is not the absent case and MUST NOT fall through to the params path.
+    _emptied = _refuse_an_emptied_resource(
+        ctx, "system/continuation:advance takes the continuation path from the resource target",
+    )
+    if _emptied is not None:
+        return _emptied
 
     # Per EXTENSION-CONTINUATION §3.1: path from resource.targets[0]
     # Fall back to params for backwards compatibility with internal dispatch
@@ -2876,6 +2887,14 @@ async def _handle_resume(
     Returns:
         Response dict with status and result.
     """
+    # §3.3 (0.8.2.24 N6): a `resource` PRESENT whose effective list is empty
+    # is not the absent case and MUST NOT fall through to the params path.
+    _emptied = _refuse_an_emptied_resource(
+        ctx, "this operation takes the suspended path from the resource target",
+    )
+    if _emptied is not None:
+        return _emptied
+
     # Per spec §3.6: path from resource.targets[0], fallback to params
     suspended_path = None
     if ctx.resource_targets and len(ctx.resource_targets) > 0:
@@ -2969,6 +2988,14 @@ async def _handle_abandon(
     Returns:
         Response dict with status and result.
     """
+    # §3.3 (0.8.2.24 N6): a `resource` PRESENT whose effective list is empty
+    # is not the absent case and MUST NOT fall through to the params path.
+    _emptied = _refuse_an_emptied_resource(
+        ctx, "this operation takes the suspended path from the resource target",
+    )
+    if _emptied is not None:
+        return _emptied
+
     # Per spec §3.7: path from resource.targets[0], fallback to params
     suspended_path = None
     if ctx.resource_targets and len(ctx.resource_targets) > 0:

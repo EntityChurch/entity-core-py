@@ -35,6 +35,9 @@ from entity_core.storage.entity_tree import EntityTree
 from entity_core.types.deletion_marker import is_deletion_marker
 from entity_core.utils.ecf import Hash, hash_to_display, is_zero_hash
 from entity_core.utils.path import validate_path_chars
+from entity_handlers._common import (
+    refuse_an_emptied_resource as _refuse_an_emptied_resource,
+)
 from entity_handlers._common import unresolvable_tree_path as _unresolvable_tree_path
 from entity_handlers.manifest import error_response as _error_response
 
@@ -145,6 +148,39 @@ async def tree_handler(
     """
     # Extract params data (params is a full entity per spec §3.4)
     params_data = params.get("data", params) if isinstance(params, dict) else {}
+
+    # §3.3 (0.8.2.24 N6) — AT THE HANDLER ENTRY, for every operation, and the
+    # placement is the finding.
+    #
+    # None of `system/tree`'s eight operations REQUIRES a resource, so all
+    # eight are governed by N6's resource-optional row: an absent `resource`
+    # takes the operation's own absent-case behaviour; a `resource` PRESENT
+    # whose effective list is empty MUST be refused `400 path_required` and
+    # MUST NOT be served that behaviour.
+    #
+    # ⛔ The first cut of this put a guard in `_handle_get`, `_handle_put` and
+    # `_handle_extract` — the three operations that read `ctx.resource_targets`
+    # — which is a census keyed on *reads the field*. **Five of the eight do
+    # not read it at all**: `snapshot`, `diff`, `merge`, `create` and
+    # `destroy` take their path from `params` unconditionally. That is
+    # SA-PY-59's class (*"the handler that takes its path from `params` is
+    # reached by nothing"*) on the most-dispatched handler in the peer, and it
+    # makes the params-only operations the ones where serving the absent-case
+    # behaviour is WIDEST: `snapshot`'s default prefix is `""`, the whole
+    # tree, and `snapshot` is the row EXTENSION-TREE §8.4 exempts from the
+    # path-level check on the argument that it cannot commit to bindings the
+    # caller may not see.
+    #
+    # So the unit is the HANDLER, not the operations that happen to read the
+    # field — a guard per reading site shrinks as sites are fixed and can
+    # never reach a site that ignores the value.
+    emptied = _refuse_an_emptied_resource(
+        ctx,
+        f"system/tree:{operation} takes its path from the resource target "
+        "when one is given",
+    )
+    if emptied is not None:
+        return emptied
 
     if operation == "get":
         return await _handle_get(params_data, ctx)

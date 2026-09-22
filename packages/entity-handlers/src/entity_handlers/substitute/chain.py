@@ -21,7 +21,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from entity_core.capability.checking import canonicalize, matches_pattern, matches_scope
+from entity_core.capability.checking import (
+    canonicalize,
+    matches_id_scope,
+    matches_pattern,
+    matches_scope,
+)
 from entity_core.capability.temporal import temporal_validity
 from entity_core.capability.token import get_scope
 from entity_core.crypto.signing import public_key_from_bytes, verify_signature
@@ -274,7 +279,11 @@ def _find_consult_grants(
         if not matches_scope(handlers_scope, SUBSTITUTE_SOURCES_HANDLER):
             continue
         operations_scope = get_scope(grant, "operations")
-        if not matches_scope(operations_scope, CONSULT_OPERATION):
+        # ID-SCOPE dimension (§5.2) — the id matcher, not the path one. See
+        # the note at the subscription site: the path matcher canonicalizes,
+        # and an `operations` exclude that canonicalizes to NEVER_MATCH denies
+        # every operation (0.8.2.24 N2).
+        if not matches_id_scope(operations_scope, CONSULT_OPERATION):
             continue
         # D2: every target the consumer is reading into MUST be covered
         # by this grant's resources scope. (Any-one-uncovered = no match.)

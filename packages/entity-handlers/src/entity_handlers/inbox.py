@@ -33,6 +33,9 @@ from entity_core.capability.grant import Grant, create_capability_token
 from entity_core.capability.token import DelegationCaveats
 from entity_core.crypto.identity import Keypair
 from entity_core.handlers.context import HandlerContext
+from entity_handlers._common import (
+    refuse_an_emptied_resource as _refuse_an_emptied_resource,
+)
 from entity_core.protocol.delivery import InboxDelivery, InboxNotification, DeliverySpec
 from entity_core.protocol.entity import Entity
 from entity_core.storage.emit import EmitContext
@@ -228,6 +231,17 @@ async def _handle_receive(
         delivery_status = 200
         delivery_result = params
 
+    # §3.3 (0.8.2.24 N6): a `resource` PRESENT whose effective list is empty
+    # is not the absent case. `_resolve_inbox_target` falls back to the
+    # handler-URI subpath, so an emptied resource would silently store the
+    # delivery at the mailbox root the URI names rather than at the target
+    # the caller asked for and then excluded.
+    emptied = _refuse_an_emptied_resource(
+        ctx, "this inbox operation takes the inbox path from the resource target",
+    )
+    if emptied is not None:
+        return emptied
+
     inbox_target = _resolve_inbox_target(path, ctx)
 
     # G-3: Read cascade_depth from incoming bounds for cross-peer propagation.
@@ -334,6 +348,17 @@ async def _handle_notification(
                 },
             },
         }
+
+    # §3.3 (0.8.2.24 N6): a `resource` PRESENT whose effective list is empty
+    # is not the absent case. `_resolve_inbox_target` falls back to the
+    # handler-URI subpath, so an emptied resource would silently store the
+    # delivery at the mailbox root the URI names rather than at the target
+    # the caller asked for and then excluded.
+    emptied = _refuse_an_emptied_resource(
+        ctx, "this inbox operation takes the inbox path from the resource target",
+    )
+    if emptied is not None:
+        return emptied
 
     inbox_target = _resolve_inbox_target(path, ctx)
 

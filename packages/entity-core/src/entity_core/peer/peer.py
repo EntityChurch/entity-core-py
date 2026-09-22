@@ -2393,6 +2393,25 @@ class Peer:
                         "exc=%s msg=%s",
                         who, type(e).__name__, e,
                     )
+                    # §5.2a (0.8.2.24 N4): A DECODE-BOUNDARY REFUSAL IS A
+                    # REFUSAL, NOT SILENCE.
+                    #
+                    #   *"A peer that refuses at the decode boundary MUST emit
+                    #   the coded response … correlated by `request_id` where
+                    #   the id is available, and otherwise MUST make a
+                    #   best-effort coded frame before closing. Dropping the
+                    #   frame with no response and no close is non-conformant,
+                    #   and SO IS CLOSING WITH NO CODED FRAME."*
+                    #
+                    # This `break` was the whole handler until now: a bare
+                    # socket close, which §4.6 says is indistinguishable from a
+                    # network fault. §4.9(c)'s deliver-or-signal rule does not
+                    # reach here — it is scoped to *"every request the peer
+                    # ADMITS"*, and a frame refused at decode was never
+                    # admitted. That narrow seam is what N4 exists to close,
+                    # and closing afterwards remains our own choice: framing
+                    # can no longer be trusted, so we still close.
+                    await self._emit_decode_refusal(writer, conn_state, e)
                     break
 
                 # Per-request processing. A single bad request — malformed
@@ -2670,6 +2689,86 @@ class Peer:
             logger.debug(
                 "failed to send error response for rejected request",
                 exc_info=True,
+            )
+
+    async def _emit_decode_refusal(
+        self,
+        writer: asyncio.StreamWriter,
+        conn_state: PeerConnectionState,
+        exc: BaseException,
+    ) -> None:
+        """§5.2a (0.8.2.24 N4) — the coded frame a decode-boundary refusal owes.
+
+        .. rubric:: Two failures reach this seam and they are NOT the same row
+
+        ``recv_envelope`` refuses for two reasons, and this peer answers them
+        with two codes:
+
+        * a **hash-binding** failure (``HashValidationError``) →
+          **400 ``hash_mismatch``**. This is N3's subject, pinned in the
+          imperative at 0.8.2.24 and the same code+condition
+          ``EXTENSION-CONTENT`` §6.3 and ``EXTENSION-TREE`` Appendix A already
+          define for a mis-keyed ``included`` entry. ``400
+          non_canonical_ecf`` is explicitly non-conformant here: ``§5.4``
+          defines that code for CBOR **tag-policy** violations, and a
+          mis-keyed entry carries no tag — its encoding is canonical and what
+          is false is the claim the key makes.
+        * a **framing** failure (undecodable CBOR, a truncated payload) →
+          **400 ``invalid_request``**, §3.3's declared default for 400.
+
+        ⚠ **The second arm is this seat reading N4 narrowly, and it is
+        routed.** N4's sentence says a decode-boundary refusal *"MUST emit the
+        coded response above"*, and the response above is ``hash_mismatch``.
+        Read literally that answers ``hash_mismatch`` to a caller whose bytes
+        were truncated — which is the exact defect arch corrected in the same
+        delta when it refused ``non_canonical_ecf``: *"the remedy the code
+        selects sends an honest caller to the wrong layer."* Telling someone
+        with a short read to go check their hashes is that sentence again.
+
+        ``entity-core-go`` does not have to make this choice: their edit sits
+        at ``validateRecv → ValidateAll``, which is the hash step alone, and
+        their own note says *"every ``ValidateAll`` failure is a hash-binding
+        failure."* py's decode boundary carries both, so py is the seat that
+        has to answer it. Filed rather than papered over.
+
+        .. rubric:: Best-effort, and it really is best-effort
+
+        Framing is untrusted by the time we get here, and the connection is
+        about to close, so a failure to write is swallowed: the obligation is
+        to *try* before closing, and a peer that raised out of its own refusal
+        path would turn a coded refusal back into a bare close.
+        """
+        from entity_core.protocol.framing import HashValidationError
+
+        if isinstance(exc, HashValidationError):
+            code = "hash_mismatch"
+            # None when the ROOT is what failed — §4.10(a)'s "otherwise MUST
+            # make a best-effort coded frame" arm, with an empty id.
+            request_id = exc.request_id or ""
+            message = (
+                "entity hash binding is false at the decode boundary "
+                f"(§5.2a, 0.8.2.24): {exc}"
+            )
+        else:
+            code = "invalid_request"
+            request_id = ""
+            message = f"frame did not decode (§3.3): {exc}"
+
+        try:
+            response = ExecuteResponse.bad_request(
+                request_id=request_id, message=message, code=code,
+            )
+            await self._send_locked(
+                writer, conn_state, Envelope(root=response.to_entity()),
+            )
+            logger.debug(
+                "[decode-refusal] -> response status=400 code=%s request_id=%s",
+                code, request_id or "<none>",
+            )
+        except Exception as write_error:  # pragma: no cover - best effort
+            logger.info(
+                "[decode-refusal] could not put the coded frame on the wire "
+                "before closing: %s", write_error,
             )
 
     async def _send_locked(

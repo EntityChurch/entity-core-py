@@ -39,9 +39,28 @@ class FramingError(Exception):
 
 
 class HashValidationError(Exception):
-    """Entity content_hash doesn't match computed hash."""
+    """Entity content_hash doesn't match computed hash.
 
-    pass
+    .. rubric:: ``request_id`` — the correlation N4 asks for (0.8.2.24)
+
+    §5.2a: *"A peer that refuses at the decode boundary MUST emit the coded
+    response correlated by ``request_id`` where the id is available, and
+    otherwise MUST make a best-effort coded frame before closing."*
+
+    The id is available **exactly when the root decoded and only an included
+    entry is bad** — which is the shape of the §1.8 forgery this row exists
+    for: the root is a valid EXECUTE and the attacker has mis-stamped an
+    entity in ``included``. So the receive path records the id on the way past
+    rather than making the serve loop re-parse a payload it has just been told
+    not to trust.
+
+    ``None`` means *no reliable id* (the root itself failed, or carried none),
+    and the caller emits the best-effort frame with an empty id.
+    """
+
+    def __init__(self, message: str, *, request_id: str | None = None) -> None:
+        super().__init__(message)
+        self.request_id = request_id
 
 
 def _format_value_for_debug(value: Any, max_bytes: int = 64) -> str:
@@ -412,7 +431,21 @@ async def recv_envelope(
                 validate_entity_hash(root)
             except HashValidationError as e:
                 logger.error("Hash validation failed for ROOT entity")
-                raise
+                # No correlation: the root is the thing that failed, so its
+                # `request_id` is not a value this peer may rely on (§4.10(a)).
+                raise HashValidationError(str(e), request_id=None) from e
+
+        # §5.2a/N4 (0.8.2.24): the id to correlate a decode-boundary refusal
+        # by. Read only after the ROOT has validated, so it is the id of a
+        # frame whose envelope really is what it says it is — which is the
+        # forgery shape: valid EXECUTE root, mis-stamped `included` entry.
+        request_id = None
+        if isinstance(root, dict):
+            root_data = root.get("data")
+            if isinstance(root_data, dict):
+                candidate = root_data.get("request_id")
+                if isinstance(candidate, str):
+                    request_id = candidate
 
         # Validate all included entities
         included = data.get("included", {})
@@ -423,7 +456,9 @@ async def recv_envelope(
                 except HashValidationError as e:
                     key_display = entity_hash.hex() if isinstance(entity_hash, bytes) else str(entity_hash)
                     logger.error("Hash validation failed for INCLUDED entity at key=%s", key_display[:16] + "...")
-                    raise
+                    raise HashValidationError(
+                        str(e), request_id=request_id,
+                    ) from e
         elif isinstance(included, list):
             for idx, entity in enumerate(included):
                 if entity.get("content_hash"):
@@ -431,7 +466,9 @@ async def recv_envelope(
                         validate_entity_hash(entity)
                     except HashValidationError as e:
                         logger.error("Hash validation failed for INCLUDED entity at index=%d", idx)
-                        raise
+                        raise HashValidationError(
+                            str(e), request_id=request_id,
+                        ) from e
 
     return Envelope.from_dict(data)
 
