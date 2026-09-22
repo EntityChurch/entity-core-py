@@ -153,14 +153,36 @@ class TestTheCompositionThatBroke:
 
 
 class TestOverARealConnection:
-    """The seam the probe drives: an inbound EXECUTE naming a foreign namespace.
+    """The seam this used to drive, and what PD-1h did to it.
 
-    The connect-time grant is supplied by the builder rather than debug mode,
-    because open-access mode legitimately sets ``peers: ["*"]``
-    (`create_full_access_grant`, matching Go's and Rust's open-access shape) and
-    a wildcard peers scope *should* reach a foreign namespace. The interesting
-    grant is the one that says nothing about peers — which is every grant the
-    §4.4 connect-time floor issues, and the row the probe calls P-3.
+    These rows were written against `authz_peers_target_from_uri`, whose P-3
+    row asserted that an inbound EXECUTE naming a foreign namespace under a
+    grant with no `peers` field is refused **403** by §5.2 Dimension 4. That
+    was right when it was written and is wrong now, in a way worth keeping
+    rather than deleting.
+
+    **0.8.2.2 / PD-1h made the refusal earlier and different.** §1.4 requires
+    an inbound EXECUTE whose handler uri names a non-local peer to be refused
+    at canonicalization with **400 `invalid_request`**, and §6.5 step 3 makes
+    that a *gate*: it MUST NOT be reached by stripping the peer id, resolving
+    the local handler and letting §5.2 decide — which is exactly what a 403
+    here would mean. So the status these rows assert had to change, and a
+    403 is now a **failure**, not a pass.
+
+    The consequence for this file is the finding, not a detail: **the peers
+    dimension is no longer observable over the wire at all.** Both rows below
+    now answer 400 regardless of the grant, so neither can discriminate the
+    dimension any more. They are kept because they still discriminate the
+    *gate* — including the case a lazy gate would get wrong, a grant that
+    would have been allowed — and because a reader who finds this class
+    deleted has no way to learn that the seam moved.
+
+    Where the dimension's teeth actually live now:
+    `TestTheDefaultIsCheckedNotSkipped` and `TestTheCompositionThatBroke`
+    above (the predicate and the resolver), and the outbound branch measured
+    in `test_peers_dimension_outbound_gap.py` — where it is currently not
+    checked at all, filed as SA-PY-29. The gate itself is
+    `test_dispatch_foreign_namespace_pd1.py`.
     """
 
     async def _serve(self, port: int, grants):
@@ -193,6 +215,7 @@ class TestOverARealConnection:
 
     @pytest.mark.asyncio
     async def test_a_grant_without_peers_does_not_reach_a_foreign_namespace(self):
+        """Formerly P-3 (403 by Dimension 4); now the gate (400 by §1.4)."""
         no_peers = [Grant.create(
             handlers=["*"], resources=["*", "/*/*"], operations=["*"],
         )]
@@ -204,18 +227,26 @@ class TestOverARealConnection:
 
         assert local != 403, (
             f"the control failed — the local dispatch was denied ({local}), so a "
-            f"foreign denial would not be attributable to the peers dimension"
+            f"foreign denial would not be attributable to the peer segment"
         )
-        assert foreign == 403, (
-            f"a grant with no `peers` field reached peer {FOREIGN}'s namespace "
-            f"(status {foreign}) — §5.2 defaults absent peers to the local peer "
-            f"and still checks it"
+        assert foreign == 400, (
+            f"a foreign namespace answered {foreign}; §1.4 refuses it at "
+            f"canonicalization with 400. A 403 here means the refusal came "
+            f"from §5.2 after resolving the local handler, which §6.5 step 3 "
+            f"forbids"
         )
 
     @pytest.mark.asyncio
-    async def test_a_wildcard_peers_grant_still_does(self):
-        """P-1 over the wire. Open-access mode depends on this, so the fix has
-        to deny the default without breaking the deliberate wildcard."""
+    async def test_a_wildcard_peers_grant_is_gated_too(self):
+        """Formerly P-1, and this is the row that carries the weight now.
+
+        Under `peers: ["*"]` §5.2 would **allow** this dispatch, so a peer
+        that only ever refused via the authorization path answers 200 here —
+        which is the PD-1 escalation, and was this peer's measured behaviour.
+        The gate has to fire on a request the grant permits, or it is not a
+        gate. Open-access mode used to depend on the opposite answer; §1.4
+        says the address is refused regardless of what any grant permits.
+        """
         wildcard = [Grant.create(
             handlers=["*"], resources=["*", "/*/*"], operations=["*"], peers=["*"],
         )]
@@ -225,8 +256,9 @@ class TestOverARealConnection:
         finally:
             await server.stop()
 
-        assert local != 403
-        assert foreign != 403, (
-            f"a `peers: [*]` grant was refused a foreign namespace (status "
-            f"{foreign}) — the dimension is now denying what it should allow"
+        assert local != 400, f"control: a local handler uri was refused ({local})"
+        assert foreign == 400, (
+            f"a `peers: [*]` grant reached peer {FOREIGN}'s namespace (status "
+            f"{foreign}) — §1.4's gate is pre-authorization and does not "
+            f"consult the grant at all"
         )

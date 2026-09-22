@@ -181,6 +181,53 @@ def create_full_access_grant() -> list[Grant]:
     return [query_grant, general_grant]
 
 
+def create_default_handler_self_grant() -> list[Grant]:
+    """The §6.2 default per-handler self-grant — what a handler declaring
+    neither ``requested_scope`` nor ``internal_scope`` receives.
+
+    Pinned normatively at protocol 0.8.2.3, and the two dimensions pull in
+    opposite directions on purpose (§6.3):
+
+    - ``resources`` spans namespaces (``/*/*``) because a peer's store is one
+      local address space keyed by peer id (§1.4). ``/{them}/…`` names a
+      **local** region holding that peer's cached or mirrored data, so writing
+      there is a local write, not a remote reach. A proposal to narrow this to
+      ``/{local}/*`` was **withdrawn** at 0.8.2.3 — it closes no hole and
+      breaks the common follow-mirror write.
+    - ``peers`` is **omitted**, which §5.2 Dimension 4 defaults to
+      ``{include: [local_peer_id]}`` **and still checks**. The whole network
+      bound is carried here. The spec calls ``peers: ["*"]`` — what this repo
+      shipped, via :func:`create_full_access_grant` — *"specifically wrong …
+      the one direction that must not be widened"*: it authorizes sub-dispatch
+      at *foreign peers'* handlers under a grant nobody minted for that
+      purpose.
+
+    **This is a ceiling, not merely a default.** For a handler that declares
+    nothing, this grant IS its §5.2 Dimension 3 ceiling on the in-process
+    sub-dispatch path — so the silent case is not the harmless case when the
+    silent value is a ceiling. That is why it is its own function rather than
+    a shared open-access one: :func:`create_full_access_grant` is still the
+    right shape for the two surfaces that genuinely reach across peers (the
+    debug-mode grants handed to connecting peers, and the extension execute
+    pathway that delivers notifications to remote subscribers), and folding
+    three authorities into one helper is how the wrong one gets widened.
+
+    Cohort: `entity-core-go` `defaultHandlerSelfGrant` has always omitted
+    ``peers`` and routed the divergence as spec-issue ``2026-08-23-a``; it was
+    ruled in that shape, so this is convergence on a ruling, not on a peer.
+
+    Returns:
+        The single-entry default scope, as a list (the grant array shape).
+    """
+    return [Grant.create(
+        handlers=["*"],
+        operations=["*"],
+        # The whole LOCAL store, including the foreign-namespace regions it
+        # holds. `peers` is deliberately not passed — see above.
+        resources=["/*/*"],
+    )]
+
+
 def create_owner_grant(peer_id: str) -> list[Grant]:
     """The peer-owner seed grant — full authority over the peer's OWN
     namespace ``/{peer_id}/*`` (V7 §6.9a peer-authority-bootstrap, F27).

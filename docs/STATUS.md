@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-08-22 · public: v0.8.0 (master)_
+_Updated: 2026-09-01 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -48,6 +48,65 @@ on the host (a pinned `Dockerfile` carries the exact Python + `uv`); local dev u
 Python 3.11–3.13 and `uv`.
 
 ## Where we left off
+
+**The citable number is `1613 · 1598 P · 15 W · 0 F · 0 S @ core-go `50f2140`` (2026-09-01)** —
+all six `validate-complete.sh` passes exit 0 against a committed tree: pass 1b
+(core profile) `756 · 641 P · 12 W · 0 F · 103 S`, pass 2 `55/55`, pass 3 `32/32`, substitute
+`8/8`, pass 0/0b static `63 PASS · 0 FAIL`. The 15 W is the standing baseline (it includes
+`concurrency.t1_1_concurrent_demux`, a timing-sensitive informational check that flaps). Both
+of the cohort's new checks PASS: `authz.dispatch_inbound_foreign_namespace_refused` and
+`connectivity.connect_prehello_authenticate`, each of which was FAIL against py before this
+session. No concurrent validator run and no leftover peer on the harness ports — pre-flight
+checked, and this run reaped its own containers.
+
+**Two relayed wire fixes landed, and the relay was wrong about one of the remedies
+(2026-09-01).** `entity-core-go` routed PD-1h and FM-1d after arch folded PD-1 at protocol
+`0.8.2.2` and corrected it at `0.8.2.3`.
+
+- **PD-1h — an inbound EXECUTE naming a non-local peer is now `400 invalid_request`.**
+  §1.4 requires the refusal at canonicalization and §6.5 step 3 makes it a *gate*,
+  not an ordering preference. Reproduced here before fixing, independently of the relay: under
+  a grant whose `peers` scope covered the named peer we answered **200**, having executed our
+  own `system/tree` handler under someone else's address; under a narrower grant we answered
+  403, which is the right refusal from the wrong layer and is exactly the shape §6.5 step 3
+  forbids. The gate reads the **handler** uri only — a foreign `resource.targets` entry under a
+  local handler uri is the §1.4 universal-address-space slot and stays conformant.
+- **FM-1d — a pre-hello `authenticate` is `401 invalid_nonce`**, where it was
+  `400 bad_request`. **The relayed remedy was insufficient and would have read as fixed.** It
+  said to set `code="invalid_nonce"` on the raise, *"it carries a 401"*. In this tree it does
+  not: the wire boundary called `ExecuteResponse.bad_request(..., code=…)`, which hardcodes
+  status 400, so applying the relay verbatim yields `400 invalid_nonce` — a pair in no §4.7 row
+  either, on the one surface whose entire defect was a pair in no §4.7 row. The boundary now
+  emits the (status, code) **pair**; §4.7 is a table of triples and three of its ten rows are
+  401. Mutation-verified in both halves — status-only and code-only each redden the headline
+  rows.
+- **The default handler self-grant drops `peers`**, per §6.2's shape pinned
+  normatively at `0.8.2.3`. Split out of `create_full_access_grant`, which was carrying three
+  different authorities behind one name; the two that legitimately reach across peers keep
+  their wildcard.
+
+**And the ruling that pinned that shape argues from an enforcement point no shipping peer has
+— filed as SA-PY-29.** §6.2 justifies omitting `peers` with *"a default-scope handler
+consequently **cannot** dispatch at a foreign peer."* That is a claim about where a check runs,
+and here it runs nowhere: inbound, PD-1h now refuses before `check_permission`; in-process,
+`_dispatch_local_execute` returns at `_remote_execute` **before** `_resolve_for_dispatch`, and
+`target_peer` is computed below that return, so the only value that can reach the check is the
+local peer. Measured: a handler holding exactly the ruled grant, sub-dispatching at
+`entity://{foreign}/system/tree`, gets **502 "No live transport profile"** — the peer went
+looking for a *route*, i.e. it had already decided the dispatch was permitted. `entity-core-go`
+measured the identical structure in their own tree and said so first (spec-issue
+`2026-08-23-a`), asking for a vector that reaches the ceiling with a cross-peer uri; `0.8.2.3`
+delivered the ruling and not the vector. Filed rather than fixed — inventing the check would
+refuse a sub-dispatch go permits, manufacturing a cross-impl divergence out of a spec gap, and
+would silently re-ceiling every cross-peer handler in the tree. Pinned as behaviour by rows
+that **fail when the enforcement point lands**, each carrying its retirement condition.
+
+**PD-1h also retired a seam two of our own tests were standing on.** `test_authz_peers_dimension`'s
+over-the-wire rows asserted `403` from §5.2 Dimension 4; post-gate that answer is `400`, and a
+403 there is now a *failure* because it would mean the refusal came from authorization after
+resolving the local handler. The rows were re-pointed rather than deleted: they still
+discriminate the gate, including on a request the grant would have permitted — which is the
+case a peer with only an authorization path gets wrong.
 
 **The leaked peers were ours, and the fix was never "be more careful" (2026-08-22).**
 Five entries in `AGENTS.md` describe tripping over a leftover peer on a fixed port; every

@@ -112,8 +112,15 @@ class ConnectError(Exception):
     only ever assert that *something* was raised. Same defect class as
     core-go's R-7 extractor, on the other side of the same seam — which is
     why the audit had to reach past the checks to the layer beneath them.
-    ``status`` is the remote's response status, ``None`` when the failure
-    was local (nothing was refused, so there is nothing to carry).
+    ``status`` is the §4.7 wire status of the refusal, and it reads the same
+    way from both seats: dialer-side it is what the remote answered, ``None``
+    when the failure was purely local (nothing was refused, so there is
+    nothing to carry); responder-side it is what the wire boundary in
+    ``peer.py`` will answer, ``None`` meaning §4.7's 400 default. It exists on
+    the responder side because §4.7's table is a list of ``(failure, code,
+    status)`` triples and three of its ten rows are 401 — a boundary that
+    carried the code and hardcoded the status could only ever emit two thirds
+    of a row (FM-1).
     """
 
     def __init__(
@@ -178,7 +185,24 @@ def handle_connect_hello(
     logger.debug("[connect] op=hello phase=%s", state.phase)
 
     if state.phase != "awaiting_hello":
-        raise ConnectError(f"Unexpected hello in phase: {state.phase}")
+        # §4.7 row 10 — "Out-of-order operation — e.g. a second `hello` after
+        # `hello_done`" is `connection_sequence_error`. A second hello on an
+        # ESTABLISHED connection is row 9 instead and never reaches here: the
+        # wire boundary answers `409 connection_already_established` first. So
+        # the only phase arriving here is a re-hello mid-handshake, which is
+        # row 10's own example.
+        #
+        # The STATUS half of this row is contested and we implement the table:
+        # §4.7 pins 400, `entity-core-go` emits 409 (its own reading — a
+        # sequence error is a state conflict, and row 9 is already 409), and
+        # go routed the discrepancy as spec-issue 2026-09-01-b. The code half
+        # is not contested by anyone, and `bad_request` — what this raise
+        # carried — is in no row at all, so it is fixed now and the status
+        # converges on the ruling. We do not ship a wire check on this pair.
+        raise ConnectError(
+            f"connection_sequence_error: unexpected hello in phase {state.phase}",
+            code="connection_sequence_error",
+        )
 
     # Params is a full entity per spec - data contains the actual fields
     params_data = params.get("data", {})
@@ -328,7 +352,25 @@ def handle_connect_authenticate(
     logger.debug("[connect] op=authenticate phase=%s", state.phase)
 
     if state.phase != "awaiting_authenticate":
-        raise ConnectError(f"Unexpected authenticate in phase: {state.phase}")
+        # §4.7 row 6 / §4.6 step 1 / §4.2 (0.8.2.1, FM-1): an `authenticate`
+        # arriving before any hello nonce was issued is `401 invalid_nonce`,
+        # NOT §4.7's out-of-order row. §4.7 says so in terms — a captured
+        # `authenticate` replayed onto a fresh connection IS this input, so it
+        # is an authentication failure and not a malformed request, and it
+        # takes the same status the Hardening block pins for the adjacent
+        # same-connection replay (RT-6). The caller has already answered the
+        # established-connection case, so the only phase reaching here is
+        # `awaiting_hello`.
+        #
+        # The status is carried, not just the code: the wire boundary emits
+        # whatever `ConnectError.status` says, and setting the code alone
+        # would produce `400 invalid_nonce` — a pair in no §4.7 row, on the
+        # surface whose entire defect was a pair in no §4.7 row.
+        raise ConnectError(
+            f"Unexpected authenticate in phase: {state.phase}",
+            code="invalid_nonce",
+            status=401,
+        )
 
     # Params is a full entity per spec - data contains the actual fields
     params_data = params.get("data", {})
@@ -338,6 +380,14 @@ def handle_connect_authenticate(
     key_type = params_data.get("key_type", "ed25519")
     nonce = params_data.get("nonce", b"")
 
+    # Structurally undecodable authenticate params (this raise, the public_key
+    # type check, and the two content_hash raises below) keep the §4.7 default
+    # `400 bad_request`. The line drawn here, stated because it decides inputs
+    # no probe has driven: a §4.6 numbered step names a failure, so its inputs
+    # take that step's row; a frame that cannot be read far enough to REACH a
+    # step is not any row of §4.7 and takes the table's 400 class. Widening the
+    # 401 rows to cover frame shape would put an authentication verdict on a
+    # caller who never presented a claim to authenticate.
     if not remote_peer_id or not public_key_raw:
         raise ConnectError("Missing required authenticate fields")
 
@@ -346,10 +396,20 @@ def handle_connect_authenticate(
         raise ConnectError(f"Invalid public_key format: {type(public_key_raw)}")
     public_key_bytes = public_key_raw
 
-    # Verify peer_id matches hello
+    # Verify peer_id matches hello.
+    #
+    # §4.7 row 8 names TWO inputs — "`peer_id` not derived from `public_key`,
+    # **or** `hello`/`authenticate` peer_id mismatch (§4.6 step 3)" — and pins
+    # both to `401 identity_mismatch`. This is the second of them; the
+    # derivation check below is the first. They are one row, so they carry one
+    # pair: a peer that codes only the derivation half answers a §4.7 row for
+    # one input and a generic 400 for the other.
     if remote_peer_id != state.remote_peer_id:
         raise ConnectError(
-            f"Authenticate peer_id mismatch: expected {state.remote_peer_id}, got {remote_peer_id}"
+            f"identity_mismatch: authenticate peer_id {remote_peer_id} does not "
+            f"match the hello peer_id {state.remote_peer_id} on this connection",
+            code="identity_mismatch",
+            status=401,
         )
 
     # Verify peer_id is BOUND to the presented public_key (V7 v7.64 §1.5
@@ -369,8 +429,14 @@ def handle_connect_authenticate(
     try:
         presented_key_type, presented_hash_type, _ = _decode_peer_id(remote_peer_id)
     except Exception as exc:
+        # §4.6 step 3 / §4.7 row 8. An undecodable peer_id cannot equal the
+        # peer-id derived from `public_key`, so it fails the identity binding
+        # rather than being a separate malformed-frame class — and the message
+        # here has claimed `identity_mismatch` since long before the code did.
         raise ConnectError(
-            f"identity_mismatch: peer_id {remote_peer_id} undecodable: {exc}"
+            f"identity_mismatch: peer_id {remote_peer_id} undecodable: {exc}",
+            code="identity_mismatch",
+            status=401,
         )
     # V7 v7.66 §4.4 surface 6 / AGILITY-UNKNOWN-1 — reject unallocated
     # key_type bytes at the handshake boundary. Protocol maps to
@@ -389,15 +455,30 @@ def handle_connect_authenticate(
         hash_type=presented_hash_type,
     )
     if remote_peer_id != derived_peer_id:
+        # §4.6 step 3 / §4.7 row 8 — `401 identity_mismatch`. This is the
+        # security-load-bearing half of the row: step 2 proves possession of
+        # *some* private key, and only this check binds that proof to the
+        # identity the caller claims.
         raise ConnectError(
             f"identity_mismatch: peer_id {remote_peer_id} does not derive from "
-            f"presented public_key (derived {derived_peer_id})"
+            f"presented public_key (derived {derived_peer_id})",
+            code="identity_mismatch",
+            status=401,
         )
 
-    # Verify nonce echoes our nonce
+    # Verify nonce echoes our nonce.
+    #
+    # §4.6 step 1 / §4.7 row 6 — "Nonce mismatch / absent / pre-hello" is one
+    # row at `401 invalid_nonce`. FM-1 fixed the *pre-hello* input (the phase
+    # check at the top of this function); the mismatch input is the same row
+    # and was still answering a generic 400 here. A captured authenticate
+    # replayed against a fresh nonce is exactly this input.
     if nonce != state.our_nonce:
         raise ConnectError(
-            f"Nonce mismatch: expected {state.our_nonce[:8].hex()}..., got {nonce[:8].hex() if nonce else 'empty'}..."
+            f"invalid_nonce: expected {state.our_nonce[:8].hex()}..., got "
+            f"{nonce[:8].hex() if nonce else 'empty'}...",
+            code="invalid_nonce",
+            status=401,
         )
 
     # Params is a full entity per spec - use its content_hash for verification
@@ -409,10 +490,23 @@ def handle_connect_authenticate(
     if not authenticate_hash:
         raise ConnectError("Invalid content_hash format")
 
-    #Find signature via target-matching (not refs)
+    # Find signature via target-matching (not refs).
+    #
+    # Everything from here to the end of the verification block is §4.6 step 2,
+    # and §4.7 row 7 pins the whole step to `401 authentication_failed`. Step 2
+    # says in terms that an **absent** signature and an **invalid** signature
+    # take the SAME pair, so the not-found arm below is not a malformed-frame
+    # 400 — it is the row's first named input. (§4.7 also records that
+    # `invalid_signature`, the pre-v7.61 spelling, is superseded here; this peer
+    # has never emitted it on this surface and MUST NOT start.)
     signature_dict = envelope.find_signature_for_target(authenticate_hash)
     if not signature_dict:
-        raise ConnectError("Signature for AUTHENTICATE not found in included")
+        raise ConnectError(
+            "authentication_failed: no system/signature in `included` targets "
+            "the authenticate entity (§4.6 step 2 — absent signature)",
+            code="authentication_failed",
+            status=401,
+        )
 
     #Verify signature over hash bytes
     try:
@@ -421,13 +515,26 @@ def handle_connect_authenticate(
 
         #signature is raw bytes
         if not isinstance(signature_raw, bytes):
-            raise ConnectError(f"Invalid signature format: {type(signature_raw)}")
+            # A signature entity whose `signature` is not bytes cannot be
+            # verified against `authenticate.public_key`, which is step 2's
+            # "invalid signature" arm — not a separate frame-shape class.
+            raise ConnectError(
+                f"authentication_failed: signature field is {type(signature_raw)}, "
+                f"not bytes (§4.6 step 2 — unverifiable signature)",
+                code="authentication_failed",
+                status=401,
+            )
         signature_bytes = signature_raw
 
         # Verify target matches the AUTHENTICATE entity hash
         sig_target = _normalize_hash(sig_data.get("target"))
         if not hash_equals(sig_target, authenticate_hash):
-            raise ConnectError("Signature target doesn't match AUTHENTICATE hash")
+            raise ConnectError(
+                "authentication_failed: signature target does not match the "
+                "authenticate entity hash (§4.6 step 2)",
+                code="authentication_failed",
+                status=401,
+            )
 
         # V7 v7.67 Phase 2 — dispatch the verifier on the presented key_type
         # (decoded from the peer_id above) so an Ed448 peer is verified with
@@ -435,11 +542,26 @@ def handle_connect_authenticate(
         if not verify_for_key_type(
             presented_key_type, public_key_bytes, authenticate_hash, signature_bytes,
         ):
-            raise ConnectError("Invalid signature in authenticate")
+            # §4.7 row 7's headline input: a well-formed authenticate whose
+            # signature does not verify. `401 authentication_failed`.
+            raise ConnectError(
+                "authentication_failed: signature does not verify against "
+                "authenticate.public_key (§4.6 step 2)",
+                code="authentication_failed",
+                status=401,
+            )
     except ConnectError:
         raise
     except Exception as e:
-        raise ConnectError(f"Signature verification failed: {e}")
+        # A verifier that *raised* has not verified the signature; the outcome
+        # for the caller is step 2's invalid-signature arm, and routing it to a
+        # 400 would let a malformed key or a backend fault read as a malformed
+        # request. Fail closed, on the row.
+        raise ConnectError(
+            f"authentication_failed: signature verification raised: {e}",
+            code="authentication_failed",
+            status=401,
+        )
 
     state.remote_public_key_bytes = public_key_bytes
 

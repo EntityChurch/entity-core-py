@@ -716,6 +716,51 @@ fails the gates rather than slipping past them.
   containment a second time and not the premise; driven bare it is orthogonal, which is the only way
   it can tell the two failures apart. *A row that fails for two reasons is a row that has told you
   nothing about either.*
+  ***RATIFIED 2026-09-01 — second instance, and the property was asserted by the ruling's own
+  justification rather than assumed by its premise.*** Filed as SA-PY-29. §6.2 (0.8.2.3) pins the
+  default per-handler self-grant with `peers` omitted and justifies the shape behaviourally: *"A
+  default-scope handler consequently **cannot** dispatch at a foreign peer, which is the escalation
+  that matters."* Asserted here, that is false on **both** paths — inbound, PD-1h now refuses before
+  `check_permission`; in-process, `_dispatch_local_execute` returns at `_remote_execute` **before**
+  `_resolve_for_dispatch`, and `target_peer` is computed *below* that return, so the only value that
+  can reach the four-dimension check is the local peer. Measured: a handler holding exactly the ruled
+  grant, sub-dispatching at a foreign uri, gets **502 "No live transport profile"** — it went looking
+  for a *route*, i.e. it had already decided the dispatch was permitted. **The ruled shape is inert.**
+  **Two things this adds to the law.** First, the tell moved: in the §8.3 instance the unasserted
+  property sat in the ruling's *premise* (what it said we do), and the check was to grep for the
+  identifier. Here it sits in the ruling's *justification* (why the shape is right), which nobody
+  greps because it reads as motivation rather than as a claim. **A justification is a claim about
+  your peer whenever it contains a verb your peer is the subject of** — `cannot`, `is still checked`,
+  `defaults to and is enforced`. Second: **a ruling can absorb a filing and answer a different
+  question than the one filed.** 0.8.2.3 absorbed `entity-core-go`'s `2026-08-23-a`, which asked
+  *where does the check bind*, and ruled *what shape the grant has* — while resting that ruling on
+  the check binding. Both seats' boards read the item closed. **When a ruling names your filing as
+  absorbed, re-read what the filing asked, not what the ruling settled.**
+  Enforcement point: `tests/integration/test_peers_dimension_outbound_gap.py` — rows that **fail
+  when the enforcement point lands**, each carrying its retirement condition in the assertion
+  message, including a structural row asserting `target_peer` is still read *after* the remote
+  branch. That row is the one worth copying: the missing check is not a missing `if` but an argument
+  that cannot be anything except the local peer, and **a reviewer reading a correct-looking call
+  site cannot see that one of its arguments is a constant** — so the row reads the source and pins
+  the *order*, not the behaviour.
+
+- **A fix that moves a refusal earlier retires the seam an existing test was standing on — and the
+  stale row keeps passing for one release if the statuses happen to differ.** *Candidate, 2026-09-01,
+  found by running the full suite rather than the new file.* PD-1h moved the foreign-namespace
+  refusal from §5.2 authorization (403) to §1.4 canonicalization (400).
+  `test_authz_peers_dimension.py::TestOverARealConnection` had two rows driving that seam: the one
+  asserting `foreign == 403` failed loudly, which is how the seam-move was found — but its sibling
+  asserted `foreign != 403`, and **that row passed, silently, now measuring nothing at all**. A
+  negative assertion survives the very change that empties it. The class is broader than this fix:
+  **when a refusal changes layer, every test written against the old layer is either a loud failure
+  or a passing row that has stopped discriminating, and only the first kind tells you.** So the move
+  is: grep for the *old status* across the suite, not for the function you changed. Here the honest
+  outcome was that the `peers` dimension is no longer wire-observable at all (core-go's PD-1d #2
+  reached from the other side), so the rows were **re-pointed at the gate and relabelled** rather
+  than deleted — a reader who finds the class gone has no way to learn the seam moved. The
+  re-pointed wildcard row is now the load-bearing one: it drives a request the grant *permits*,
+  which is the case a peer with only an authorization path gets wrong, and the case the old row
+  could not express.
 
 - **A clause that names a grep as its enforcement point is read as having one — run the grep before
   you believe it.** *Candidate, 2026-08-22, filed as SA-PY-27.* D8's §10.3 clause 3 states a
@@ -1180,6 +1225,39 @@ fails the gates rather than slipping past them.
     search and a test run, the same standard AGENTS-STANDARD sets for claims we make about
     *them*. Then route the correction back: an uncorrected report is what the next cohort
     member reads.
+  - **Sixth shape, 2026-09-01, and the wrong claim was about the *remedy* — the one axis where
+    every previous instance's defence does not fire.** The five above are wrong about our
+    architecture, our coverage, our version, our behaviour, or our filing record; all five fail
+    the moment you look at the tree, because the tree disagrees. `entity-core-go`'s FM-1d relay
+    was **right about everything it measured** — our defect (`400 bad_request`), our site
+    (`handle_connect_authenticate`'s opening phase check, one frame above the nonce comparison),
+    and a correction to a census that had us down as conformant. Then it prescribed the fix:
+    *"set `code="invalid_nonce"` on that raise (it carries a 401), exactly as the
+    unsupported-key-type call sites already do."* **The parenthetical is false here.** Our wire
+    boundary called `ExecuteResponse.bad_request(…, code=…)`, which hardcodes `status=400`, so
+    the relay applied verbatim yields **`400 invalid_nonce`** — a pair in no §4.7 row either, on
+    the one surface whose entire defect was a pair in no §4.7 row. The cited precedent held
+    because those rows *are* 400s, which is exactly why it read as the same shape.
+    **Why this axis is the dangerous one:** a wrong claim about our code sends you to the tree,
+    which corrects it. A wrong *remedy* sends you to an **edit**, and a one-line edit backed by
+    a sibling's measurement is the least-audited change there is — it is short, it is authorized,
+    the defect it names is real, and the diff looks complete. Nothing surfaces afterwards: the
+    code assertion passes, and status alone cannot separate this from a post-hello nonce
+    mismatch. **The check, and it is one read:** when a relay names the fix, open the function
+    the fix lands in and confirm it does what the relay says it does — especially when the relay
+    cites a precedent, because a precedent is a claim that two call sites are the same shape and
+    that is a claim about *your* code, not theirs. And when a spec row is a `(status, code)`
+    pair, mutate each half separately: a half-fix that satisfies the assertion you wrote is how
+    a non-conformant peer ships wearing a green diff.
+  - **And a relay's *strike* is a claim too.** The same packet struck an item as *"their standing
+    change, which is the `2026-08-23-a` item"* — a spec-issue whose own file still reads
+    `Status: open — measured divergence, routed. go is NOT converging by count.` It had been
+    **ruled**, in go's shape, in the same protocol commit that produced the packet. Read as a
+    standing divergence the correct answer is *refuse* (GUIDE-CONFORMANCE §4: one-differs → the
+    spec arbitrates, two seats do not vote a third into line); read as a ruling it is ours to
+    implement. **Same word, opposite obligations** — so resolve which it is from the spec text,
+    never from the routing sentence, and grep the normative section for the field before
+    deciding you owe nothing.
 - **Two representations of one value is a bug that hides until the boundary — cover the
   form your own tests never mint.** `compute/error` is carried two ways here: `make_error`
   returns a **dict**, a stored error *literal* resolves to an **`Entity`**. Every

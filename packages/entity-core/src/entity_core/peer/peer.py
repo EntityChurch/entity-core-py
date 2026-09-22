@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from entity_core.capability.grant import (
     Grant,
     create_connect_grants,
+    create_default_handler_self_grant,
     create_full_access_grant,
 )
 from entity_core.capability.token import CapabilityToken
@@ -924,10 +925,21 @@ class Peer:
             if max_scope:
                 grants = max_scope
             else:
-                # Default: handler can access any handler and resource.
-                # This allows handlers to dispatch to other handlers internally
-                # (e.g., continuation handler resuming requests to any target).
-                grants = create_full_access_grant()
+                # §6.2 default self-grant (pinned normatively at 0.8.2.3):
+                # any handler, any operation, the whole LOCAL store including
+                # the foreign-namespace regions it holds — and `peers`
+                # OMITTED, so §5.2 Dimension 4 defaults it to the local peer
+                # and still checks it. This lets a handler dispatch to other
+                # handlers internally (the continuation handler resuming a
+                # request, a follow-mirror write to `/{them}/…`) without
+                # authorizing dispatch at a *foreign peer's* handlers.
+                #
+                # This used to be `create_full_access_grant()`, whose
+                # `peers: ["*"]` the spec names as "specifically wrong … the
+                # one direction that must not be widened". That helper stays
+                # where cross-peer reach is the point; it is not the default
+                # ceiling.
+                grants = create_default_handler_self_grant()
 
             grant_dicts = [g.to_dict() for g in grants]
             grant_entity, signature_entity, _ = build_signed_handler_grant(
@@ -2805,9 +2817,19 @@ class Peer:
                 )
 
             else:
+                # V7 §4.7 row 10 — the row names two inputs, "a second `hello`
+                # after `hello_done`, **or an unknown connect operation**", and
+                # `connection_sequence_error` is the code for both. The sibling
+                # input is raised in `handle_connect_hello`; this is the other
+                # one, and it was answering a generic `bad_request` (in no §4.7
+                # row) while the FM-1 carve-out left this row explicitly
+                # occupied. Status stays the table's 400 — see the note at the
+                # hello raise: go emits 409 and routed the discrepancy as
+                # spec-issue 2026-09-01-b; only the status is in question.
                 response = ExecuteResponse.bad_request(
                     request_id=request_id,
                     message=f"Unknown connect operation: {operation}",
+                    code="connection_sequence_error",
                 )
                 await send_envelope(
                     writer, Envelope(root=response.to_entity())
@@ -2815,14 +2837,34 @@ class Peer:
 
         except ConnectError as e:
             logger.warning(f"Connect error: {e}")
-            # V7 §4.7 — emit the canonical wire code (e.g.
-            # "unsupported_key_type" for v7.66 §4.4 surface 6) rather
-            # than collapsing every connect failure to "bad_request".
-            response = ExecuteResponse.bad_request(
-                request_id=request_id,
-                message=str(e),
-                code=getattr(e, "code", "bad_request"),
-            )
+            # V7 §4.7 — emit the canonical wire (status, code) PAIR. The code
+            # half was fixed once already (e.g. "unsupported_key_type" for
+            # v7.66 §4.4 surface 6, rather than collapsing every connect
+            # failure to "bad_request"); the STATUS half was still collapsed
+            # to 400 here, which is not a cosmetic difference — §4.7's table
+            # is a list of (failure, code, status) triples and three of its
+            # ten rows are 401. A pre-hello `authenticate` (FM-1, row 6) is
+            # `401 invalid_nonce`, and emitting `400 invalid_nonce` for it
+            # would be as non-conformant as the `400 bad_request` it replaced.
+            #
+            # Unset status keeps the §4.7 default: 400. A refusal that wants
+            # another status says so at the raise, where the failure mode is
+            # known — deriving it here from the code would put the §4.7 table
+            # in two places.
+            code = getattr(e, "code", "bad_request")
+            status = getattr(e, "status", None) or 400
+            if status == 401:
+                response = ExecuteResponse.unauthorized(
+                    request_id=request_id, message=str(e), code=code,
+                )
+            elif status == 409:
+                response = ExecuteResponse.conflict(
+                    request_id=request_id, message=str(e), code=code,
+                )
+            else:
+                response = ExecuteResponse.bad_request(
+                    request_id=request_id, message=str(e), code=code,
+                )
             await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
 
     async def establish_via_rendezvous(self, peer_id: str) -> Any:
@@ -3584,6 +3626,43 @@ class Peer:
         # the peer segment, so anything downstream sees `system/tree` and can
         # only ever answer "local".
         target_peer = extract_peer(canonical_path, self.peer_id)
+
+        # §1.4 inbound-dispatch routing gate (PD-1h, 0.8.2.2). An inbound
+        # EXECUTE whose HANDLER uri names a peer that is not us is refused
+        # here, at canonicalization — before handler resolution and before
+        # `check_permission`.
+        #
+        # §6.5 step 3 makes this a GATE, not an ordering preference: it MUST
+        # NOT be reached by stripping the peer id, resolving the local handler
+        # and letting §5.2 decide. That is what this peer did, and it is
+        # observable — under a grant whose `peers` scope covered the named
+        # peer we answered 200, having executed our own handler under someone
+        # else's address; under a narrower grant we answered 403, which is the
+        # right refusal for the wrong reason and from the wrong layer. §6.2
+        # forbids `404 handler_not_found` here too: 404 asserts "this peer has
+        # no such handler", which is false of a peer refusing the ADDRESS.
+        #
+        # Scope, and it is the whole design of the rule: this reads the
+        # handler uri and nothing else. A foreign `resource.targets` entry
+        # under a LOCAL handler uri is the §1.4 universal-address-space slot —
+        # the store is one local address space keyed by peer id, so a write to
+        # `/{them}/…` is a local write (a follow-mirror), not a remote reach,
+        # and it stays conformant. 0.8.2.3 withdrew a proposed `resources`
+        # narrowing on exactly that argument. In-process sub-dispatch does not
+        # pass through here at all, so §5.2 Dimension 4 remains the decider on
+        # §1.4's internal-dispatch class — which, post-gate, is the only class
+        # in which that dimension is still live.
+        if target_peer != self.peer_id:
+            response = ExecuteResponse.bad_request(
+                request_id=request_id,
+                message=(
+                    f"EXECUTE targets peer {target_peer}, not this peer "
+                    f"{self.peer_id} (§1.4 inbound dispatch)"
+                ),
+                code="invalid_request",
+            )
+            await self._send_locked(writer, conn_state, Envelope(root=response.to_entity()))
+            return
 
         # Extract handler-relative path for dispatch
         path = extract_handler_path(canonical_path)
