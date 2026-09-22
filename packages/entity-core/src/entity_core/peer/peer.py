@@ -3653,6 +3653,16 @@ class Peer:
                 "authority; falling back to the ambient arm",
             )
 
+        # NOTE (SA-PY-45, withdrawn): a hold on Dimension 4 sat here for one
+        # commit, for what looked like a third authority case §1.4 has no arm
+        # for — `EXTENSION-CONTINUATION` §4.2 case 3's cross-peer dispatch
+        # capability. **There is no third case.** That credential is rooted at
+        # the target and granted to this peer, so it *is* presented authority;
+        # what refused it was our own leaf-granter reading, above. The hold was
+        # removed with the reading that made it necessary. A carve-out that
+        # stops matching anything is cover for nothing while reading as a live
+        # exception, so it is deleted rather than left in place.
+
         # Ambient arm. Same two calls, in the same order, as the local arm
         # below — handler/operation/peers, then the resource dimension when a
         # resource is named. One predicate, and a sub-dispatch that names no
@@ -3762,11 +3772,32 @@ class Peer:
                 return None
             return peer_id_from_identity_entity(ent)
 
-        # (1) granter is the target peer. A multi-granter struct is not a
-        # single identity and cannot be "the target peer's identity"; it falls
-        # to the ambient arm rather than being interpreted here.
-        if peer_of(cap_data.get("granter")) != target_peer:
-            return None
+        # (1) The credential is **rooted at the target** — enforced by the
+        # chain verification in step (3), which runs in the target's frame and
+        # whose root rule is *root granter == the frame peer*.
+        #
+        # It is NOT enforced here as `leaf.granter == target_peer`, and that
+        # correction is the whole of SA-PY-42(c). §1.4 says *"the capability's
+        # `granter` resolves to the target peer's identity"*, which reads
+        # naturally as the leaf's own granter — and we shipped that reading for
+        # one commit. **Measured against the corpus, it is wrong**, and the
+        # shape that proves it is the one `EXTENSION-CONTINUATION` §4.2 case 3
+        # has shipped all along:
+        #
+        #     B grants the installer  ->  the installer grants A
+        #
+        # The leaf's granter is the **installer**, a third party; the chain's
+        # **root** is the target. Under the leaf reading every cross-peer
+        # continuation advance in the cohort is refused — measured as
+        # `convergence.rexec_delivered` FAIL, which additionally skipped the
+        # ~20 checks that declare it a prerequisite.
+        #
+        # The root reading is also the safe one, which is why it is not a
+        # concession: §5.5's attenuation walk binds every link, so the leaf can
+        # only carry what the target granted the installer. The target decided
+        # what could be sub-delegated, and it decided at mint time. A leaf
+        # granter check adds nothing to that and subtracts a shipped,
+        # conformant flow.
 
         # (2) grantee is this peer.
         if peer_of(cap_data.get("grantee")) != self.peer_id:

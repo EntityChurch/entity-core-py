@@ -338,24 +338,32 @@ class TestThePresentedArm:
         assert result.status == 403
 
     @pytest.mark.asyncio
-    async def test_a_capability_the_target_DELEGATED_is_not_presented_authority(
+    async def test_a_capability_the_target_ROOTED_but_delegated_IS_presented_authority(
         self, peer, target_peer_id,
     ):
-        """Verification 1, the discriminating configuration.
+        """Verification 1, and this row asserted the **opposite** for one
+        commit. It is the shipped `EXTENSION-CONTINUATION` §4.2 case 3 shape.
 
-        A chain **rooted at the target** — so chain verification in the
-        target's frame passes — whose *leaf* was minted by an intermediate and
-        granted to this peer. Everything else about it is valid. The only
-        thing that refuses it is §1.4's *"the capability's `granter` resolves
-        to the target peer's identity"*, read as the leaf's own granter.
+        A chain **rooted at the target**, whose leaf was minted by an
+        installer and granted to this peer:
 
-        That reading is a **narrowing** and it is the interpretive call
-        SA-PY-42 files: a credential the target *delegated* through a third
-        party does not qualify as presented authority here and falls back to
-        the ambient arm. Fail-closed, and the only reading under which §1.4's
-        granter sentence and §5.5's root rule are simultaneously satisfiable.
-        This row is what makes the narrowing measurable rather than a comment
-        — if arch rules the other way, it is the row that changes.
+            target grants the installer  ->  the installer grants us
+
+        §1.4 says *"the capability's `granter` resolves to the target peer's
+        identity"*, which reads naturally as the **leaf's** granter, and we
+        implemented that. Measured against the corpus it is wrong: in the
+        cohort's own cross-peer continuation flow the leaf granter is the
+        **installer**, and only the root is the target. Under the leaf
+        reading every cross-peer continuation advance in the cohort is
+        refused — measured as `convergence.rexec_delivered` FAIL, which
+        additionally skipped the ~20 checks that declare it a prerequisite
+        (pass 1 total 1637 -> 1617).
+
+        **The root reading is also the safe one.** §5.5's attenuation walk
+        binds every link, so the leaf can only carry what the target granted
+        the installer. The target decided what could be sub-delegated, at mint
+        time. A leaf-granter check adds nothing to that and subtracts a
+        shipped, conformant flow.
         """
         intermediate = Keypair.generate()
         parent, root_identity, root_sig = create_capability_token(
@@ -380,11 +388,12 @@ class TestThePresentedArm:
                 root_identity.to_dict(), root_sig.to_dict(),
             ],
         )
-        assert result.status == 403, (
-            "a capability whose leaf granter is NOT the target was accepted "
-            "as presented authority — the granter check is the only thing "
-            "standing between 'the target minted this for me' and 'something "
-            "in this chain once touched the target'"
+        assert result.status == 502, (
+            "a capability ROOTED at the target and granted to this peer was "
+            "refused as presented authority (status="
+            f"{result.status}, error={result.error!r}). This is the shipped "
+            "§4.2 case 3 shape — if this row is red, cross-peer continuation "
+            "advance is broken and `convergence.rexec_delivered` is too"
         )
 
     @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 # entity-core-py — status
 
-_Updated: 2026-09-02 · public: v0.8.0 (master)_
+_Updated: 2026-09-09 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -49,7 +49,26 @@ Python 3.11–3.13 and `uv`.
 
 ## Where we left off
 
-**The citable number is `1624 · 1610 P · 14 W · 0 F · 0 S @ core-go `d42752b`` (2026-09-02)** —
+**The citable number is `1637 · 1619 P · 15 W · 2 F · 1 S @ core-go `bef708b`` (2026-09-09)**,
+and **both F are the withdrawn `system/*` rule, not this peer.** `0.8.2.13` withdrew V7 §6.2's
+*"user-installed handlers MUST NOT register at `system/*`"*; we landed the withdrawal, and go's
+`core_register_reserved_refused` / `_publishes_nothing` still assert `403 forbidden_pattern` for
+it. Arch already ruled that disposition to go and the re-base is theirs. **The seat that
+implements a withdrawal first is the seat that goes red on the gate that has not caught up** —
+there is no ambiguity to resolve here, only a sequencing cost that lands on whoever moves first.
+
+Second sample the same day: `1618 P · 16 W`, the one-check delta being `t1_1_concurrent_demux`,
+the documented non-violation timing warn that flips run to run. The check count moved
+`1624 -> 1637`. **One warn is new and is ours**: `convergence.bisync_a_to_b` (`PASS` with PD-2
+disabled in a control run, `WARN` 2/2 with it on) — attributed, not localized, and written up in
+`docs/status/ROUTING-2026-09-09-…` §11 rather than absorbed into the baseline.
+
+This session landed `0.8.2.11 -> 0.8.2.17`: PD-2's outbound sub-dispatch check (both arms), the
+`0.8.2.16` id-scope fix in `scope_subset` plus the `peers` attenuation that was missing there
+entirely, the `path_required` per-operation audit, and — outside the relay's diff, because it was
+scoped to go's baseline — `0.8.2.13`'s `system/*` withdrawal and `EXTENSION-COMPUTE` v3.29.
+
+**The previous citable number was `1624 · 1610 P · 14 W · 0 F · 0 S @ core-go `d42752b`` (2026-09-02)** —
 all seven `validate-complete.sh` passes exit 0 against a committed tree, `connectivity`
 **36/36**. The count moved 1622 → 1624 on two checks core-go added for CE-1 and row 10's
 established arm; both PASS. The warn count moved 15 → 14 and **the drop is not attributed** —

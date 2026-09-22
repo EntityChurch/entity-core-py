@@ -1419,6 +1419,60 @@ fails the gates rather than slipping past them.
     "unknown operator". An error that only refuses makes the reader re-derive what the
     corpus already decided.
 
+- **"The spec conflicts with itself" is the flattering hypothesis for a regression you just
+  caused, and a real measurement will support it all the way to the filing.** ***RATIFIED
+  2026-09-09*** *— the "'they read the spec differently' is the flattering hypothesis" law with a
+  **conflict between two documents** as the subject instead of a sibling's code, and the first
+  instance where the wrong diagnosis was written up, implemented, tested, committed, and
+  withdrawn in one session.*
+  Landing 0.8.2.17's outbound check took `convergence.rexec_delivered` FAIL against a
+  **4359-green** tree. Traced to: §1.4 gives two authority arms (ambient / target-minted) and
+  `EXTENSION-CONTINUATION` §4.2 case 3 authorizes a cross-peer advance with a capability
+  *"authored by this host peer"* — **neither arm**. Filed as SA-PY-45, a **fold blocker**: PD-2 as
+  written refuses every cross-peer continuation advance in the cohort. Implemented a named,
+  retirement-conditioned hold on Dimension 4. All of it good procedure, and **the diagnosis was
+  our own defect wearing a spec conflict's clothes.**
+  **What refuted it: reading the sibling's FIXTURE, not either document.** `rexec_setup` mints
+  `CreateChainedCapGrantedTo(b.CapEntity(), …, a.RemotePeerIdentityHash())` — the credential is
+  `B (target) -> installer -> us`. Its **leaf** granter is the installer; its **root** is the
+  target. §1.4's *"the capability's `granter` resolves to the target peer's identity"* read as the
+  **leaf's** granter — the reading a careful implementer reaches first, and the one we shipped —
+  refuses it. Read as the **chain's root** it is ordinary presented authority, there is no third
+  case, and the hold had nothing to cover.
+  **Where the wrong premise came from, and this is the part to carry: our own code comment.**
+  `continuation.py` says the dispatch capability is *"authored by this host peer"*, paraphrasing
+  §4.2 case 3. That sentence is true of one field and false as a description of the chain, and it
+  was the entire evidence for a filing about the **corpus**. **A comment that paraphrases a spec
+  is not evidence about the spec, and it is the last thing anyone re-reads** — it sits in the file
+  you are already editing, in your own repo, written by someone who had read the section.
+  **Why this branch is expensive in the same asymmetric way CE-1's was.** *"Two documents
+  conflict"* terminates in a filing, a hold, a fold blocker and three seats' attention. *"We
+  misread a sentence"* terminates in deleting six lines. The cheap branch has to be checked
+  first, and *"I have a real measurement"* is not evidence for the expensive one — the measurement
+  was real in both worlds.
+  **The two checks, in order:**
+  1. **When you are about to claim two documents conflict, drive the configuration the second one
+     actually produces** — from the fixture or the sibling's constructor, never from its prose and
+     never from your own paraphrase of its prose. One `grep` in the harness that failed.
+  2. **Before filing a conflict, re-read your own sentence for a word that admits two readings**
+     and ask which one your code took. Here it was `granter`: leaf or root. A one-word ambiguity
+     in a ruling is indistinguishable from a gap in the corpus until you name it.
+  **What survives:** the *measurement* (PD-2 breaks cross-peer continuation under the leaf
+  reading) and the *ask* — §1.4 should say **"the chain's root granter"**, because go and rust
+  will each reach this fork independently and the leaf reading is the one the sentence suggests.
+  That is now SA-PY-42(c), a one-clause request rather than a fold blocker. Enforcement point:
+  `test_outbound_sub_dispatch_authorization_pd2.py::TestThePresentedArm::
+  test_a_capability_the_target_ROOTED_but_delegated_IS_presented_authority`, which asserted the
+  **opposite** for one commit and carries the measured numbers (`1637 -> 1617`, convergence 30/30
+  under the control) in its docstring.
+  **And a corollary about holds, since one was built and removed here:** a hold is the right
+  move when a ruling and a shipped behaviour genuinely collide, and it must be *named,
+  single-dimension, retirement-conditioned, and paired with a teeth row proving the other
+  dimensions still bind* — without that row a hold is indistinguishable from a bypass. But
+  **build the hold last**, after the cheap branch is excluded, because a hold is a change to an
+  authorization path and it made this defect *harder* to see: it explained why the check still
+  failed as "the hold does not cover this shape" rather than "the reading is wrong".
+
 - **A second dispatch path is a second boundary, and the in-process one is the untested
   half.** ***RATIFIED 2026-08-18*** *— third instance, and the first where the untested half
   was an* authorization *check rather than a lookup. Filed as a candidate 2026-08-17; the
@@ -1441,6 +1495,17 @@ fails the gates rather than slipping past them.
   drives a **stub** `_execute_dispatcher`. 3667 tests, and not one exercised real in-process
   authorization. *A test that substitutes the dispatcher cannot be evidence about the
   dispatcher* — when the thing under test is the seam, the stub is the bug's hiding place.
+  **Second instance, 2026-09-09, at the same seam and in the opposite direction (SA-PY-45).**
+  Landing PD-2's outbound check took `convergence.rexec_delivered` FAIL against a **4359-green**
+  tree — a cross-peer continuation advance stopped being delivered. Same cause, one layer out:
+  every continuation *cross-peer* test here also drives a stub, so the suite could not see a
+  change to the real outbound path either. **The first instance was a missing check the stub hid;
+  this one is an added check the stub hid.** A stub is not biased toward false green or false red
+  — it is blind, and what it hides is whatever you just changed.
+  **The consequence for scheduling, which is the actionable half:** a change to the dispatcher is
+  a change **no local run can measure**, so the cohort validator is not a final gate for it, it
+  is *the* measurement — run it before believing a dispatcher diff, not after. Here the two-peer
+  check found a cohort-wide spec conflict that three green suites had no way to surface.
   Enforcement point: `tests/integration/test_authz_resource_dimension_in_process.py`,
   which drives a synthetic handler that performs **no** `check_caller_permission`, so the
   assertion is about the dispatcher's verdict and not a handler's, with in-scope controls on
