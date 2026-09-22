@@ -1517,6 +1517,19 @@ async def _handle_log(
     ph = _compute_prefix_hash(ctx, prefix)
     limit = params.get("limit")
 
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("log", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant log on: {prefix}",
+        )
+
+
     # `since` is REFUSED on log, and the refusal is deliberate rather than
     # ordinary unknown-field tolerance. §4.4.2 carried `since` until the
     # rename, and `fetch` still does — with the opposite meaning. Measured on
@@ -1602,6 +1615,19 @@ async def _handle_status(
     """Current HEAD, remote HEADs, conflict count, pending changes."""
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
+
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("status", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant status on: {prefix}",
+        )
+
 
     # Get local HEAD
     head_entity = _get_entity_at_path(ctx, _head_path(ph))
@@ -2126,6 +2152,19 @@ async def _handle_diff(
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
 
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("diff", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant diff on: {prefix}",
+        )
+
+
     if not base_ref or not target_ref:
         return _error_response(400, "invalid_params", "base and target required")
 
@@ -2170,6 +2209,19 @@ async def _handle_branch(
     """Create, list, or delete branches."""
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
+
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("branch", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant branch on: {prefix}",
+        )
+
     action = params.get("action", "list")
     name = params.get("name")
     from_ref = params.get("from")
@@ -2403,6 +2455,19 @@ async def _handle_tag(
     """Create, list, or delete tags (immutable named pointers)."""
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
+
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("tag", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant tag on: {prefix}",
+        )
+
     action = params.get("action", "list")
     name = params.get("name")
     version_param = params.get("version")
@@ -2786,6 +2851,19 @@ async def _handle_fetch(
     since = params.get("since")
     depth = params.get("depth")
 
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("fetch", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant fetch on: {prefix}",
+        )
+
+
     # Get HEAD
     head_entity = _get_entity_at_path(ctx, _head_path(ph))
     if head_entity is None:
@@ -2863,6 +2941,19 @@ async def _handle_fetch_entities(
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
     snapshot_hash = params.get("snapshot")
+
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("fetch-entities", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant fetch-entities on: {prefix}",
+        )
+
     requested_hashes = params.get("hashes", [])
 
     if not snapshot_hash:
@@ -3280,6 +3371,19 @@ async def _handle_push(
     """Update remote tracking pointer."""
     prefix = params.get("prefix", "")
     ph = _compute_prefix_hash(ctx, prefix)
+
+    # EXTENSION-REVISION / V7 §6.3: the prefix is CALLER-SUPPLIED params,
+    # not `resource.targets[0]` — this handler reads the resource field
+    # nowhere — so §5.2's resource arm never runs for a caller that simply
+    # omits the field, and this is the only thing authorizing the path.
+    # Eight of the nineteen operations carried no check at all; go checks
+    # sixteen. See tests/integration/test_revision_unchecked_operations.py.
+    if not ctx.check_caller_permission("push", prefix):
+        return _error_response(
+            403, "capability_denied",
+            f"Capability doesn't grant push on: {prefix}",
+        )
+
     remote_peer = params.get("remote")
     remote_prefix = params.get("remote_prefix", prefix)
     force = params.get("force", False)

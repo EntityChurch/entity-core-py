@@ -418,8 +418,11 @@ def _handle_query(
     # Canonicalize path
     path = ctx.emit_pathway.entity_tree.normalize_uri(raw_path)
 
-    # Dual capability check: caller needs get on target path
-    if not ctx.check_caller_permission("get", raw_path):
+    # Dual capability check: caller needs get on target path.
+    # §4.2's `check_history_access` writes the handler frame as the literal
+    # `"system/tree"` — the target path is a TREE read, and a grant scoped to
+    # `system/history` is not what authorizes it.
+    if not ctx.check_caller_permission("get", raw_path, handler_pattern="system/tree"):
         return _error_response(403, "access_denied", f"No get permission on path: {raw_path}")
 
     # Walk history chain
@@ -506,8 +509,9 @@ def _handle_rollback(
     # Canonicalize path
     path = ctx.emit_pathway.entity_tree.normalize_uri(raw_path)
 
-    # Dual capability check: rollback needs put on target path
-    if not ctx.check_caller_permission("put", raw_path):
+    # Dual capability check: rollback needs put on target path (§4.2's
+    # `target_operation = "put"` arm; same `"system/tree"` frame as `query`).
+    if not ctx.check_caller_permission("put", raw_path, handler_pattern="system/tree"):
         return _error_response(403, "access_denied", f"No put permission on path: {raw_path}")
 
     # Verify target_hash is in history for this path

@@ -192,14 +192,12 @@ class TestTheFourthSiteArchDidNotEnumerate:
     def test_the_handler_level_check_denies(self, bad):
         assert check_path_permission(
             _cap(["*"], exclude=[bad]), operation="get",
-            path=f"/{PEER}/secret", local_peer_id=PEER,
-        ) is False
+            path=f"/{PEER}/secret", local_peer_id=PEER, handler_pattern="system/tree",) is False
 
     def test_teeth_the_handler_level_check_still_grants(self):
         assert check_path_permission(
             _cap(["*"], exclude=[f"/{PEER}/secret"]), operation="get",
-            path=f"/{PEER}/public", local_peer_id=PEER,
-        ) is True
+            path=f"/{PEER}/public", local_peer_id=PEER, handler_pattern="system/tree",) is True
 
 
 class TestThePredicate:
@@ -507,6 +505,10 @@ def _ctx(peer) -> HandlerContext:
         remote_peer_id="test-remote",
         handler_grant=OPEN,
         caller_capability=OPEN,
+        # §6.3 (0.8.2.23): REQUIRED and fail-closed. These rows drive
+        # `system/tree`'s `extract` and `merge`, so that is the frame the
+        # dispatcher would supply.
+        handler_pattern="system/tree",
         emit_pathway=peer.emit_pathway,
     )
 

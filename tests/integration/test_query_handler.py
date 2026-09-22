@@ -39,6 +39,13 @@ def _make_ctx(peer) -> HandlerContext:
         remote_peer_id="test-remote",
         handler_grant={"grants": [{"handlers": {"include": ["*"]}, "resources": {"include": ["*"]}, "operations": {"include": ["*"]}}]},
         caller_capability={"grants": [{"handlers": {"include": ["*"]}, "resources": {"include": ["*"]}, "operations": {"include": ["*"]}}]},
+        # §6.3 (0.8.2.23) makes the frame REQUIRED and fail-closed, so a
+        # context without one now refuses rather than matching every handler.
+        # The dispatcher populates this on every context it builds; a fixture
+        # that omits it is claiming production omits it, which it does not.
+        # `system/query` is the frame `EXTENSION-QUERY` §5.2 step 6b writes —
+        # the corpus's one own-handler spelling of a per-entry filter.
+        handler_pattern="system/query",
         emit_pathway=peer.emit_pathway,
     )
 

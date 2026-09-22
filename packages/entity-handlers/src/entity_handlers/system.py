@@ -14,6 +14,7 @@ from entity_core.handlers.connect import ADVERTISED_PROTOCOLS
 from entity_core.handlers.context import HandlerContext
 from entity_core.types.registry import list_handler_names, get_handler_manifest
 from entity_handlers._common import error_response
+from entity_handlers.tree import caller_can_read
 
 
 async def system_handler(
@@ -105,6 +106,23 @@ async def system_handler(
             if child_name in seen:
                 continue
             seen.add(child_name)
+            # §6.3's listing filter, widened by 0.8.2.22 (J5) from *"when the
+            # tree handler returns a listing"* to **any handler returning a
+            # multi-entry result whose entries are tree paths**. This branch is
+            # a domain listing over the same `EntityTree` the tree handler
+            # serves, so an unfiltered entry here is the H1 bulk-read
+            # disclosure reached through a second handler pattern: the caller
+            # asks `system/*` for `data/` instead of `system/tree`, and the
+            # exclude that `caller_can_read` enforces there carves out nothing
+            # here. The entry also carries the child's content hash, so it is
+            # the entity's address and not merely its name.
+            #
+            # ONE derivation, not two agreeing ones (F68) — this is the same
+            # `caller_can_read` the tree handler's three bulk reads call, and
+            # it frames on `system/tree` because the access being authorized is
+            # a tree read whichever handler enumerates it (§6.3, 0.8.2.23).
+            if not caller_can_read(ctx, path, child_name):
+                continue
             child_uri = prefix + child_name
             content_hash = entity_tree.get(child_uri)
             has_children = len(parts) > 1 or any(u.startswith(child_uri + "/") for u in uris)

@@ -18,7 +18,7 @@ concrete, so the arm looks inapplicable by construction.
     *"when ``include_payload`` is set, the subscribe handler MUST additionally
     verify the caller's capability covers the tree read —
     ``check_path_permission("get", resource_path, caller_capability,
-    "system/tree", local_peer_id)`` — and MUST reject the subscribe with 403
+    "system/tree", local_peer_id, handler_pattern="system/tree",)`` — and MUST reject the subscribe with 403
     ``payload_unauthorized`` if it does not."*
 
 The subscribe resource **is a pattern** (§3.1: a subscription is taken out on
@@ -101,8 +101,7 @@ class TestThePatternArmAtTheHandlerLevelCheck:
         """⭐ The headline. ``data/*`` spans ``data/secret``; the grant
         excludes it; the pattern must not be authorized as a whole."""
         assert check_path_permission(
-            _cap(["data/*"], ["data/secret"]), "get", "data/*", PEER,
-        ) is False, (
+            _cap(["data/*"], ["data/secret"]), "get", "data/*", PEER, handler_pattern="system/tree",) is False, (
             "a subject pattern spanning a grant exclusion was ALLOWED. The "
             "exclude loop compared a concrete exclude against the pattern "
             "STRING, which no concrete path can equal, so the exclusion "
@@ -114,8 +113,7 @@ class TestThePatternArmAtTheHandlerLevelCheck:
         """Without this the row above passes on a peer that denies every
         pattern subject outright."""
         assert check_path_permission(
-            _cap(["data/*"]), "get", "data/*", PEER,
-        ) is True
+            _cap(["data/*"]), "get", "data/*", PEER, handler_pattern="system/tree",) is True
 
     def test_a_NON_overlapping_exclude_does_not_deny(self):
         """The arm is ``patterns_overlap``, not *"any exclude denies"*. A
@@ -123,15 +121,14 @@ class TestThePatternArmAtTheHandlerLevelCheck:
         subject authorized, or the fix is a denial-of-service wearing a
         security fix's clothes."""
         assert check_path_permission(
-            _cap(["data/*", "other/*"], ["other/secret"]), "get", "data/*", PEER,
-        ) is True
+            _cap(["data/*", "other/*"], ["other/secret"]), "get", "data/*", PEER, handler_pattern="system/tree",) is True
 
     def test_the_concrete_arm_is_unchanged_in_both_directions(self):
         """The existing behaviour this must not disturb — the concrete subject
         is still decided by ``matches_pattern``, both ways."""
         cap = _cap(["data/*"], ["data/secret"])
-        assert check_path_permission(cap, "get", "data/secret", PEER) is False
-        assert check_path_permission(cap, "get", "data/public", PEER) is True
+        assert check_path_permission(cap, "get", "data/secret", PEER, handler_pattern="system/tree",) is False
+        assert check_path_permission(cap, "get", "data/public", PEER, handler_pattern="system/tree",) is True
 
     def test_an_exact_grant_exclude_of_the_pattern_ITSELF_still_denies(self):
         """A granter who writes the exclusion in the caller's own spelling is
@@ -146,8 +143,7 @@ class TestThePatternArmAtTheHandlerLevelCheck:
         why it is kept.
         """
         assert check_path_permission(
-            _cap(["data/*"], ["data/*"]), "get", "data/*", PEER,
-        ) is False
+            _cap(["data/*"], ["data/*"]), "get", "data/*", PEER, handler_pattern="system/tree",) is False
 
 
 # ---------------------------------------------------------------------------

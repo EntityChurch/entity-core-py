@@ -160,22 +160,19 @@ class TestPathPermissionGranterFrame:
         cap = _bare_wildcard_cap(A_HASH)
         path = f"/{B_PEER}/foo"
         assert not check_path_permission(
-            cap, "get", path, B_PEER, granter_peer_id=A_PEER,
-        )
+            cap, "get", path, B_PEER, granter_peer_id=A_PEER, handler_pattern="system/tree",)
 
     def test_self_issued_cap_admitted(self):
         cap = _bare_wildcard_cap(A_HASH)
         path = f"/{B_PEER}/foo"
         assert check_path_permission(
-            cap, "get", path, B_PEER, granter_peer_id=B_PEER,
-        )
+            cap, "get", path, B_PEER, granter_peer_id=B_PEER, handler_pattern="system/tree",)
 
     def test_granter_namespace_path_admitted(self):
         cap = _bare_wildcard_cap(A_HASH)
         path = f"/{A_PEER}/foo"
         assert check_path_permission(
-            cap, "get", path, B_PEER, granter_peer_id=A_PEER,
-        )
+            cap, "get", path, B_PEER, granter_peer_id=A_PEER, handler_pattern="system/tree",)
 
 
 class TestCanonicalizeFrameInvariant:

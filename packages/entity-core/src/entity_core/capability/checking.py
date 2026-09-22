@@ -91,6 +91,53 @@ def scope_type_for_dimension(dimension: str) -> str:
         ) from None
 
 
+def grant_declares_a_contradicting_scope_type(grant: dict[str, Any]) -> bool:
+    """§5.2 (0.8.2.22) — does this grant carry a ``scope.type`` that
+    contradicts the dimension it sits on?
+
+        *"The scope type is a property of the DIMENSION and is supplied by the
+        call site ``[MUST]``. … An implementation MUST NOT take the dispatch
+        type from a received entity's ``scope.type`` field. **A received
+        ``scope`` whose declared ``type`` contradicts its dimension is a
+        malformed token and MUST be refused ``403 capability_denied``
+        ``[MUST]``**."*
+
+    .. rubric:: The ruling has TWO clauses, and dropping the field satisfies
+       only the first
+
+    This peer never read ``scope.type`` — the type comes from
+    :py:func:`scope_type_for_dimension`, keyed on the dimension name — so the
+    *"MUST NOT take the dispatch type from a received entity"* half was already
+    satisfied, and satisfied structurally. That is also `entity-core-go`'s
+    position, reached the same way (their ``types.CapabilityScope`` has no
+    ``Type`` field at all, so a wire ``scope.type`` is dropped at decode), and
+    they filed J4 as **CONFORMS, no code change**.
+
+    **Dropping is not refusing.** The second clause is a separate ``[MUST]``
+    with its own status and code, and a peer that silently ignores a
+    contradicting type *accepts* a token the spec calls malformed. Two
+    ground-up seats converging on the first clause is the standing law that
+    cohort agreement is evidence about the reading implementers reach, not
+    about the text — the more so here, because the clause they both satisfied
+    is the one that comes with a mechanism and the one they missed is the one
+    that comes with a bare obligation. Routed as **SA-PY-60**.
+
+    Failing the grant closed here makes the surrounding check find no matching
+    grant, so the caller is answered ``403 capability_denied`` — the pair the
+    ruling names, produced without a second error path.
+    """
+    for dimension, expected in _SCOPE_TYPE_BY_DIMENSION.items():
+        value = grant.get(dimension)
+        if not isinstance(value, dict):
+            continue
+        declared = value.get("type")
+        # An ABSENT type is the ordinary shape of every capability this cohort
+        # mints; only a DECLARED one that disagrees is the malformed token.
+        if declared is not None and declared != expected:
+            return True
+    return False
+
+
 def granter_frame_peer_id(
     capability_data: dict[str, Any],
     local_peer_id: str,
@@ -598,6 +645,12 @@ def check_handler_scope(
     peer = target_peer if target_peer is not None else local_peer_id
 
     for grant in capability_data.get("grants", []):
+        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
+        # dimension is a malformed token. Fail the grant closed so the
+        # check answers 403 capability_denied — dropping the field, as
+        # both ground-up seats do, satisfies only the ruling's first half.
+        if grant_declares_a_contradicting_scope_type(grant):
+            continue
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
@@ -774,6 +827,12 @@ def check_resource_scope(
                 return False
 
         for grant in capability_data.get("grants", []):
+            # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
+            # dimension is a malformed token. Fail the grant closed so the
+            # check answers 403 capability_denied — dropping the field, as
+            # both ground-up seats do, satisfies only the ruling's first half.
+            if grant_declares_a_contradicting_scope_type(grant):
+                continue
             # Check handler scope
             handlers_scope = get_scope(grant, "handlers")
             if not matches_scope(handlers_scope, handler_pattern):
@@ -874,7 +933,7 @@ def check_path_permission(
     operation: str,
     path: str,
     local_peer_id: str,
-    handler_pattern: str | None = None,
+    handler_pattern: str,
     now: int | None = None,
     granter_peer_id: str | None = None,
 ) -> bool:
@@ -883,8 +942,42 @@ def check_path_permission(
     Per spec §6.3 check_path_permission. Called by handlers to verify
     path-level access (the second level of the two-level model).
 
-    If handler_pattern is provided, filters grants by those that match
-    the handler first (ensuring consistent two-level checks).
+    .. rubric:: ``handler_pattern`` is REQUIRED and FAIL-CLOSED (§6.3, 0.8.2.23)
+
+        *"An implementation MUST NOT treat an absent, null or empty
+        ``handler_pattern`` as "match all handlers". The parameter has no
+        permissive default, and a call site that cannot name its frame is a
+        defect at that call site. Where an authority genuinely grants handler
+        access with no path component, §5.2's ``{include: []}`` construction
+        states that **at the grant**, where it is auditable — not at the call,
+        where it is invisible."*
+
+    This parameter defaulted to ``None`` here, and ``None`` **skipped the
+    handlers filter entirely** — so a grant scoped to any handler at all
+    authorized the path. The spec measured that direction: *"Supplying nothing
+    widens: a grant scoped to any handler at all authorized a tree read through
+    a compute lookup."*
+
+    Two changes implement the MUST, and both are needed. The parameter has **no
+    default**, so a site that does not name its frame fails to call rather than
+    silently widening — which is what turns *"nobody wrote it"* from an
+    invisible policy into a `TypeError` at the defect's own line. And an
+    explicitly-passed ``None``/``""`` returns **False** rather than matching
+    everything, because the argument can also arrive from a context field
+    (:py:attr:`HandlerContext.handler_pattern`) that a caller never typed.
+
+    *SA-PY-58 landed the owning-handler frame as an argument and swept the
+    call sites it found; this pass swept the rest and found **five** still
+    omitting it — including* ``compute``'s ``check_write_permission``, *whose
+    sibling read arm had been fixed in that very commit. A row with two inputs
+    censused on one of them, again.*
+
+    Args:
+        handler_pattern: The handler that **owns the operation being
+            authorized** — never the handler running the check. A tree read
+            reached through subscription, history, compute or query frames on
+            ``system/tree``; a handler authorizing its own operation frames on
+            its own pattern.
 
     V6.0: handlers, resources, operations are now CapabilityScope objects.
 
@@ -916,19 +1009,35 @@ def check_path_permission(
     if not temporal_validity(capability_data, now)[0]:
         return False
 
+    # §6.3 (0.8.2.23) — the frame is REQUIRED and fail-closed. An absent, null
+    # or empty frame is NOT "match all handlers": it is a call site that could
+    # not name whose authority is being spent, and the spec assigns that a
+    # defect rather than a permission. Guarded here as well as in the signature
+    # because the value also arrives from `HandlerContext.handler_pattern`,
+    # which is `str | None` and which no call site types.
+    if not handler_pattern:
+        return False
+
     canonical_path = canonicalize(path, local_peer_id)
 
     for grant in capability_data.get("grants", []):
+        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
+        # dimension is a malformed token. Fail the grant closed so the
+        # check answers 403 capability_denied — dropping the field, as
+        # both ground-up seats do, satisfies only the ruling's first half.
+        if grant_declares_a_contradicting_scope_type(grant):
+            continue
         # V6.0: operations is now a CapabilityScope
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
             continue
 
-        # If handler_pattern provided, filter by handlers scope first
-        if handler_pattern is not None:
-            handlers_scope = get_scope(grant, "handlers")
-            if not matches_scope(handlers_scope, handler_pattern):
-                continue
+        # The handlers filter always runs (§6.3, 0.8.2.23): it ran only "if
+        # provided" until the frame became mandatory, and "not provided" was
+        # the widest possible reading of a dimension the caller never wrote.
+        handlers_scope = get_scope(grant, "handlers")
+        if not matches_scope(handlers_scope, handler_pattern):
+            continue
 
         # V6.0: resources is now a CapabilityScope with include/exclude
         resources_scope = get_scope(grant, "resources")
@@ -1035,6 +1144,12 @@ def find_matching_grant(
         return None
 
     for grant in capability_data.get("grants", []):
+        # §5.2 (0.8.2.22): a DECLARED scope.type contradicting its
+        # dimension is a malformed token. Fail the grant closed so the
+        # check answers 403 capability_denied — dropping the field, as
+        # both ground-up seats do, satisfies only the ruling's first half.
+        if grant_declares_a_contradicting_scope_type(grant):
+            continue
         operations_scope = get_scope(grant, "operations")
         if not matches_id_scope(operations_scope, operation):
             continue

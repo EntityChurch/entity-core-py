@@ -656,15 +656,57 @@ class TestHandlerScopeChecking:
 class TestPathPermissionWithHandlerFilter:
     """Tests for check_path_permission with handler filtering."""
 
-    def test_path_permission_without_handler_filter(self):
-        """Path permission works without handler filter."""
+    def test_an_absent_frame_is_REFUSED_not_match_all(self):
+        """§6.3 (0.8.2.23) — the frame is REQUIRED and FAIL-CLOSED.
+
+        **This row asserted the opposite until 0.8.2.23**, under the docstring
+        *"Path permission works without handler filter"* and the comment
+        *"Without handler filter, just checks path"* — an accurate description
+        of behaviour that the spec now names as a defect:
+
+            *"An implementation MUST NOT treat an absent, null or empty
+            ``handler_pattern`` as "match all handlers". The parameter has no
+            permissive default, and a call site that cannot name its frame is
+            a defect at that call site."*
+
+        It is **inverted and relabelled rather than deleted**: a reader who
+        finds the row gone has no way to learn that the arm moved, and this is
+        the one place in the suite that named the old behaviour out loud.
+
+        The signature now has no default either, so the ordinary spelling of
+        this mistake is a ``TypeError`` at the offending line; the explicit
+        ``None`` below is the arm that survives the signature — it is how the
+        value arrives from :py:attr:`HandlerContext.handler_pattern`, which no
+        call site types.
+        """
         cap_data = {
             "grants": [
                 {"handlers": {"include": ["system/tree"]}, "resources": {"include": ["system/types/*"]}, "operations": {"include": ["get"]}}
             ]
         }
-        # Without handler filter, just checks path
-        assert check_path_permission(cap_data, "get", "system/types/foo", "peer123")
+        for absent in (None, ""):
+            assert not check_path_permission(
+                cap_data, "get", "system/types/foo", "peer123",
+                handler_pattern=absent,
+            ), (
+                f"an absent frame ({absent!r}) authorized a path. That is the "
+                f"widening direction the spec measured: 'a grant scoped to any "
+                f"handler at all authorized a tree read through a compute lookup'"
+            )
+
+    def test_teeth_the_same_call_with_its_real_frame_is_granted(self):
+        """Without this the row above passes on a peer that refuses every
+        path — which would make the fail-closed guard indistinguishable from a
+        broken check."""
+        cap_data = {
+            "grants": [
+                {"handlers": {"include": ["system/tree"]}, "resources": {"include": ["system/types/*"]}, "operations": {"include": ["get"]}}
+            ]
+        }
+        assert check_path_permission(
+            cap_data, "get", "system/types/foo", "peer123",
+            handler_pattern="system/tree",
+        )
 
     def test_path_permission_with_handler_filter(self):
         """Path permission with handler filter only uses matching grants."""

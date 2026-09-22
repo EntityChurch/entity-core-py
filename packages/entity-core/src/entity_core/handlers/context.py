@@ -27,6 +27,19 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+#: Sentinel for :py:meth:`HandlerContext.check_caller_permission`'s
+#: ``handler_pattern`` — *"the handler currently dispatching"*, which is the
+#: right frame only when the check is about this handler's own operation.
+#:
+#: It cannot be spelled ``None``: ``None`` is a **meaningful** value at
+#: :py:func:`check_path_permission` — it disables grant filtering by handler
+#: entirely — so a default of ``None`` would make *"I did not think about the
+#: frame"* and *"I want no frame"* the same call, which is the shape that hid
+#: the defect this sentinel exists to stop (see
+#: ``tests/integration/test_handler_frame_of_the_6_3_check.py``).
+_DISPATCHING_HANDLER = "\0dispatching-handler"
+
+
 @dataclass
 class ExecuteResult:
     """Result from ctx.execute() call.
@@ -418,6 +431,7 @@ class HandlerContext:
         self,
         operation: str,
         path: str,
+        handler_pattern: str | None = _DISPATCHING_HANDLER,
     ) -> bool:
         """Check if caller's capability grants permission for operation on path.
 
@@ -451,20 +465,70 @@ class HandlerContext:
         **Neither is made redundant by the other**, and "optional" was never
         the word for either of them.
 
+        .. rubric:: The handler frame is an ARGUMENT, and it is not always ours
+
+        §6.3's signature filters the caller's grants by ``handler_pattern``
+        *before* their ``resources`` scope is read, so a grant scoped to a
+        different handler is discarded without ever being consulted. This
+        method defaulted that argument to ``self.handler_pattern`` — **the
+        handler currently dispatching** — with no way to say otherwise, and
+        four extensions write the argument as a literal at the call site:
+
+        ===================  ==================  =============================
+        site                 corpus writes       because
+        ===================  ==================  =============================
+        SUBSCRIPTION §2.3    ``"system/tree"``   the *read* being authorized is
+                                                 a tree read; the ``subscribe``
+                                                 grant does not carry it
+        HISTORY §4.2         ``"system/tree"``   same — the target path
+        COMPUTE §7.2         ``"system/tree"``   same — the impure read
+        QUERY §5.2 step 6b   ``"system/query"``  the corpus's one *own-handler*
+                                                 spelling of a per-entry filter
+        ===================  ==================  =============================
+
+        Supplying the dispatching handler at the first three refuses a caller
+        holding exactly the capability the corpus describes — §2.3's own prose
+        is *"a caller may legitimately hold `subscribe` without `get`"*, which
+        only has content if the two live in separately scoped grants. Measured
+        on the wire by ``entity-core-go``'s
+        ``include_payload_overlapping_exclude`` arm (py 403/403 where go and
+        rust answer 403/200).
+
         Args:
             operation: The operation to check (get, put, etc.).
             path: The data path being accessed.
+            handler_pattern: The handler scope to filter grants by. Defaults to
+                the dispatching handler, which is correct **only** when the
+                check is about this handler's own operation; pass the literal
+                the extension names when it is not.
 
         Returns:
             True if the caller's capability grants access.
         """
         from entity_core.capability.checking import check_path_permission
 
+        frame = (
+            self.handler_pattern
+            if handler_pattern == _DISPATCHING_HANDLER
+            else handler_pattern
+        )
+        # §6.3 (0.8.2.23) — REQUIRED and fail-closed. The dispatcher populates
+        # `handler_pattern` on every context it builds, so in production this
+        # resolves; it is `str | None` on the dataclass, and a context built
+        # without it (a fixture, a hand-rolled sub-dispatch) previously reached
+        # `check_path_permission(None)` and disabled the handlers filter
+        # entirely — the widening direction, at the one check §6.3 promoted to
+        # *the* enforcement for any subject derived after dispatch.
+        #
+        # Refusing here rather than defaulting is the point: "I did not think
+        # about the frame" MUST NOT be spelled the same as "any handler".
+        if not frame:
+            return False
         return check_path_permission(
             self.caller_capability,
             operation,
             path,
             self.local_peer_id,
-            handler_pattern=self.handler_pattern,
+            handler_pattern=frame,
             granter_peer_id=self.caller_capability_granter_peer_id,
         )

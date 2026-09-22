@@ -133,6 +133,15 @@ def _ctx(peer, caller: dict) -> HandlerContext:
         remote_peer_id="test-remote",
         handler_grant=OPEN,
         caller_capability=caller,
+        # §6.3 (0.8.2.23) — the frame is REQUIRED and fail-closed, so a context
+        # without one now refuses rather than matching every handler. These
+        # rows drive `system/tree`'s three bulk reads, and the dispatcher
+        # supplies that pattern on every context it builds (`peer.py`).
+        #
+        # This file's own docstring named the omission as the second reason
+        # SA-PY-58 was invisible; leaving it here would have kept these rows on
+        # the arm where a wrong frame and a right frame agree.
+        handler_pattern="system/tree",
         emit_pathway=peer.emit_pathway,
     )
 

@@ -81,6 +81,31 @@ def caller_can_read(ctx: HandlerContext, request_prefix: str, relative: str) -> 
     grant covering what it serves. Routed rather than settled; the reading is
     pinned by a test so it is a decision and not an accident.
 
+    .. rubric:: The rule binds ANY bulk enumerator, not only this handler
+       (0.8.2.22, J5)
+
+    §6.3's sentence read *"When the **tree handler** returns a listing"* while
+    §6.8's discriminator is general over handlers. 0.8.2.22 widened it to
+    *"when **any handler returns a multi-entry result whose entries are tree
+    paths** — a tree listing, a domain listing, or any bulk enumerator"*. The
+    second in-tree caller is ``entity_handlers/system.py``'s ``system/*``
+    catch-all listing, which reaches the **same** ``EntityTree`` and was
+    unfiltered: a caller refused ``data/alpha`` here could enumerate it, and
+    read its content hash, by asking ``system/*`` for ``data/`` instead.
+
+    .. rubric:: The frame is ``system/tree`` at every caller, and it is an
+       ARGUMENT the wrapper must not fix (SA-PY-58)
+
+    §6.3 (0.8.2.23): *"``handler_pattern`` is the handler that OWNS the
+    operation being authorized, never the handler performing the check."* The
+    access is a **tree read** wherever it is enumerated from, so the frame is
+    ``system/tree`` — the literal `EXTENSION-SUBSCRIPTION` §2.3, `HISTORY`
+    §4.2 and `COMPUTE` §7.2 all write. Left to
+    :py:meth:`HandlerContext.check_caller_permission`'s default it would be
+    *the dispatching handler*, which is right here by coincidence and wrong at
+    the domain listing: a caller holding ``{system/tree: get}`` would have that
+    grant discarded unread because the running handler is ``system/*``.
+
     Args:
         ctx: The handler context (its ``caller_capability`` is the authority).
         request_prefix: The prefix **as the caller spelled it**, so the entry
@@ -92,7 +117,9 @@ def caller_can_read(ctx: HandlerContext, request_prefix: str, relative: str) -> 
     Returns:
         True if the caller's capability grants ``get`` on the entry.
     """
-    return ctx.check_caller_permission("get", request_prefix + relative)
+    return ctx.check_caller_permission(
+        "get", request_prefix + relative, handler_pattern=TREE_HANDLER_PATTERN,
+    )
 
 
 async def tree_handler(

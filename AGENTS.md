@@ -268,6 +268,190 @@ fails the gates rather than slipping past them.
 
 ## Protocol / interop invariants agents get wrong
 
+- **A SWEEP is scoped by the input you censused, and a rule whose sentence names two inputs
+  will be swept on one of them — by the same author, in the same commit.** ***RATIFIED
+  2026-09-13*** *— second instance of the "a ROW can have more than one INPUT" law, and the
+  first where the incomplete sweep was **ours**, three commits old, and the missed site sat
+  **one method away** from the fixed one.* `SA-PY-58` landed §6.3's handler frame as an
+  argument and swept the call sites. **It found two of seven.** The five that kept the widening
+  default include `compute`'s `check_write_permission` — whose **sibling read arm was fixed in
+  that very commit**, directly above it, under a docstring that *explains the hazard in prose*.
+  §6.3's own sentence is *"a tree read, **a tree write**"*; the sweep was censused on the read.
+  **Why the adjacency is the tell and not the excuse.** A sweeper greps for the shape they just
+  fixed. `check_read_permission` had been *made* correct, so it no longer matched the grep for
+  *"omits the frame"* — and its neighbour, which still did, was invisible for the ordinary
+  reason that nobody re-reads the function they just edited. The other three sites (§7.2 Phase
+  2's `read_paths` loop and both write loops) were missed because **Phase 2b already carried
+  the literal**, which is exactly what made Phase 2 read as done.
+  **The check, and it is a rewrite of the sweep's own grep:** after fixing a call site, grep for
+  the **concept** (*"which call sites of this function authorize an access they do not own?"*)
+  rather than for the defect's *syntax*, and enumerate from the **callee's** call graph, not
+  from the sites your first grep returned. A census keyed on *"omits the argument"* shrinks as
+  you fix things; a census keyed on *"calls this function"* does not.
+  **And the structural half is what made the residue findable:** the parameter now has **no
+  default**, so a site that cannot name its frame `TypeError`s at its own line instead of
+  widening silently — the ordinary spelling of the mistake became a hard failure rather than a
+  policy. Enforcement point: `check_path_permission`'s required `handler_pattern` plus
+  `tests/unit/test_capability.py::test_an_absent_frame_is_REFUSED_not_match_all`, whose
+  predecessor **asserted the opposite** and was inverted rather than deleted.
+
+- **Your own SERIALIZER cannot express the attack, because it is conformant — so a probe built
+  through it tests a degraded shape and passes.** *Candidate, 2026-09-13, building the K1
+  author-forgery probe.* `Envelope.to_dict` keys each `included` entry by the entity's own
+  `content_hash`. That is correct of a sender and fatal to a probe: *"file the attacker's
+  identity under the victim's hash"* silently became *"the victim's identity is absent"*.
+  **Both produce 401 on this peer and completely different answers on a key-trusting one**, so
+  the degraded arm would have scored a non-conformant peer **green** while reading as coverage.
+  **Found by the mutation, not by re-reading the arm.** Restoring the defect (*trust the wire
+  key*) should have made the forgery succeed; it did not, and the un-predicted red row was the
+  finding. Second cause in the same probe: the arm swapped the identity but kept the **victim's
+  signature**, so it refused on the signature — a second, independent refusal, which is the
+  standing *"your fixture is not the discriminating configuration"* shape. Re-signing with the
+  **attacker's** key while still declaring `signer = victim` is what isolates the binding.
+  **The check:** when a probe forges a wire-level value, ask *which of my own constructors
+  normalizes it* — a conformant encoder is a filter between your test and the attack. Build the
+  wire form by hand (here a `rekey` map applied after `to_dict`), and **verify by mutation that
+  the attack SUCCEEDS when the guard is removed**; a probe that never accepts is not a control.
+  Enforcement point: `tests/integration/test_resolution_integrity_k1.py::TestTheAuthorForgery`
+  — four mutations, and the one that corrected the probe is documented at `_through_the_wire`.
+
+- **When a ruling has two clauses and only one carries a MECHANISM, the cohort implements that
+  one — "we never built the defect" answers the first clause and says nothing about the
+  second.** *Candidate, 2026-09-13 — `SA-PY-60`, J4.* §5.2 (0.8.2.22) says (1) *MUST NOT take
+  the dispatch type from a received entity's `scope.type`*, and (2) *a received `scope` whose
+  declared `type` contradicts its dimension is a **malformed token** and MUST be refused `403
+  capability_denied`*. **Both ground-up seats satisfied (1) structurally and neither satisfied
+  (2)** — go because their struct has no `Type` field, we because the type is derived from the
+  dimension name. go filed **CONFORMS, no code change**, with a regression guard that pins (1)
+  and is silent on (2).
+  **Dropping is not refusing.** Clause 1 forbids *reading*; clause 2 requires *answering*. A
+  peer that silently ignores a contradicting type accepts a token the spec calls malformed, and
+  nothing about clause 1's mechanism produces clause 2's pair.
+  **Why this direction is systematic rather than sloppy:** a clause you satisfy by construction
+  produces **no diff and no test**, so the disposition writes itself and the *other* clause has
+  nothing to attach to. It is *"a ruling you already satisfy produces no diff"* with only
+  **half** the ruling already satisfied — and the satisfied half supplies the confidence.
+  **The check:** when a ruling is a paragraph, **count its `[MUST]`s and answer them
+  separately**, and be suspicious of any clause you discharge with *"we don't do that"* — that
+  sentence answers a prohibition and never an obligation. Then ask whether the field is one
+  **anyone in the cohort populates**: `scope.type` has no producer in any of the three trees, so
+  nothing sends one by accident and no suite can see the divergence — the standing *"a field
+  with no producer is not converged, it is unmeasured"* law, with the first seat to implement
+  creating the divergence. Enforcement point:
+  `tests/integration/test_scope_type_is_a_dimension_property_j4.py`, whose absent-type class
+  pins the boundary a "be stricter" fix gets wrong (silence is not contradiction) and whose two
+  unit rows pin that the malformed unit is the **token**, not the axis and not the capability.
+
+- **THIRD instance of the mutation-restore trap, with the entry on screen and the rule already
+  ratified — and the reason it recurred is that the restore is written as CLEANUP.** *2026-09-13.*
+  A `git checkout --` was placed in the same shell invocation as a mutation, on an **uncommitted**
+  fix, and took the fix out with the mutation. The file's tests then passed (the tests were
+  committed, the source was not), and the loss surfaced only on the next full run, as an
+  `ImportError` for a function that had existed twenty minutes earlier.
+  **What the existing entry does not say, and this is the increment:** the rule is stated as
+  *"mutate a committed file"*, which reads as a precondition to check **once**. It is not — it
+  is a precondition on **every** mutation in a session, and a session lands fixes continuously,
+  so the same script that was safe at 14:00 is destructive at 14:40 with no edit to it. I had
+  committed twice already and treated the rule as discharged.
+  **The mechanical form that actually holds:** `git status --short <file>` immediately before
+  the mutation, or simply `git commit` first — and **never** put the mutation and its restore in
+  one invocation, so there is a moment at which the dirty tree is observable. Cost here: one
+  re-apply, no shipped defect, because the full-suite run caught it — which is the argument for
+  running the full suite after a mutation pass rather than only the mutated file's tests.
+
+- **A convenience WRAPPER that fixes a spec argument is a policy decision with no call site to
+  review it — and the corpus writing that argument as a LITERAL is the tell you are about to
+  lose it.** ***RATIFIED 2026-09-13*** *— third construct of the "a default argument is a wire
+  decision with no call site" law (after the `=` default and the status-named constructor), with
+  an **authorization frame** as the constant and a method as the hiding place. `SA-PY-58`.*
+  §6.3's `check_path_permission` filters the caller's grants by `handler_pattern` **before** their
+  `resources` scope is read, so a grant scoped to another handler is discarded unread. **Four
+  extensions write that argument as a literal at the call site and they do not write the same
+  one** — `"system/tree"` at SUBSCRIPTION §2.3, HISTORY §4.2 and COMPUTE §7.2; `"system/query"` at
+  QUERY §5.2 step 6b. `HandlerContext.check_caller_permission` supplied `self.handler_pattern` —
+  *the handler currently dispatching* — and offered no override, so the argument was right only
+  where the dispatching handler happened to be the one the corpus names.
+  **The wrapper IS the mechanism, and that is the reusable half.** §7.2's Phase 2b, written as a
+  direct `check_path_permission(...)` call, **kept its literal**. Every site that went through the
+  wrapper lost one. So the discriminator is not care and not review — it is whether the call site
+  had a slot to write the value into. **Grep for a wrapper that drops a parameter the spec varies;
+  it converts a per-site decision into a global one silently, and a global one is what nobody
+  re-reads.** Measured: a caller holding §2.3's own described shape (`{system/subscription:
+  subscribe}` + `{system/tree: get}` — separately scoped, which is the only reading under which
+  §2.3's argument *"a caller may legitimately hold `subscribe` without `get`"* has content) was
+  refused; history refused the same; and compute, which omitted the argument rather than defaulting
+  it, was **wider** than the corpus, because `None` disables filtering entirely.
+  **Two things no local method could see.** `HandlerContext.handler_pattern` defaults to `None`,
+  and every in-process fixture in this tree leaves it there — so **every existing row ran with the
+  filter disabled**, the one configuration in which the wrong frame and the right frame agree. And
+  the class written for this very rule three commits earlier (`SA-PY-56`) mints
+  `handlers: {"include": ["*"]}` in every row, blind for a second, independent reason. *A fixture
+  is a claim about what production supplies, and these two claimed nothing.*
+  **And the frame runs UPSTREAM of every dimension, which is why it was mis-diagnosed rather than
+  missed.** A peer with a perfect matcher and the wrong frame answers DENY with **no dimension to
+  attribute it to** — so `entity-core-go`, reading py's 403/403 from outside, offered two candidate
+  causes and both were dimension-level, because a 403 is all the wire shows. They routed it to arch
+  as a §2.3 *pattern-subject* question. **It was this argument, and §2.3 already names it.**
+  Enforcement point: `tests/integration/test_handler_frame_of_the_6_3_check.py` — the argument in
+  isolation, all three behavioural sites at the spec-shaped cap with teeth, the compute widening,
+  and **both non-discriminators kept and labelled** (the wildcard cap, the absent frame). Three
+  mutations, three correct predictions, one row each.
+
+- **A cell table measures a MATCHER; it does not measure whether the matcher is REACHED — and the
+  handler that takes its path from `params` is reached by nothing.** *Candidate, 2026-09-13 —
+  `SA-PY-59`, found auditing the cohort's nine narrow-cap arms against this tree.*
+  `system/revision` has nineteen handler operations. This peer authorized **eight**;
+  `entity-core-go` authorizes sixteen. The module reads `ctx.resource_targets` **zero times** —
+  every prefix comes from `params.prefix` — and §5.2's resource arm is conditioned on
+  `resource_target is not null`, so **a caller that simply omits the `resource` field reaches the
+  handler with nothing having looked at a path.** `check_path_permission` on the params prefix is
+  then the only authorization there is, and eleven operations did not call it. `diff` returns every
+  changed **path and content hash** between two versions of any prefix: the same disclosure as the
+  `snapshot` + `diff`-against-empty composition the whole `H1` sweep exists for, through a handler
+  that sweep does not touch, and **without needing an exclude at all**.
+  **Why every instrument in the cohort is blind to it.** keystone's scope-cell table enumerates
+  `(layer, dimension, polarity, operand)` — the cells of a matcher. A peer can be **146/146 green**
+  and never call the matcher. The nine narrow-cap arms all drive `system/tree`, `system/query` and
+  `system/subscription`; **no check anywhere drives a revision operation under a cap that does not
+  already cover the prefix**, which is go's own *"every category drives the broad connection cap"*
+  headline, unextended to the handler where it bites hardest. And locally: ~90 revision tests, every
+  one minting a permissive capability, so landing eight gates reddened **nothing among 4638**.
+  **The check, and it is a grep not a doctrine:** for every handler, ask *where does the path come
+  from* — `resource.targets[0]` or `params`. V7 already answers it for the tree handler and this
+  repo already carries the invariant; what it does not say is that the answer must be **re-derived
+  per handler**, and the ones that take it from params are exactly the ones §5.2 cannot cover. Then
+  count the operations that authorize against the operations that exist: *eight of nineteen* is a
+  number no one had because no one had asked for the ratio.
+  **And the residual is a cohort finding, not a py one.** At 16/19 we match go exactly, and the
+  three neither seat checks are **the same three** — `find-ancestor`, `config`, `merge-config`, two
+  of them **writes** to a prefix's revision configuration, and `merge-config` decides which side
+  wins a merge, hence the merged bytes, hence the version root. Neither seat has a sentence to point
+  at: `EXTENSION-REVISION` never enumerates which operations are path-authorized. **Two ground-up
+  seats converging is evidence about implementers**, so it is routed rather than closed — refusing
+  where go accepts manufactures the divergence out of a gap. Enforcement point:
+  `tests/integration/test_revision_unchecked_operations.py`, including a **structural** row pinning
+  that the module still reads no resource field, and a class asserting the three residual ops at
+  **today's** answer with the retirement condition in the message.
+
+- **A routed item's STATUS is a claim about a question; the behaviour under it is a separate
+  claim — and "already routed" is the disposition that terminates in no work.** *Candidate,
+  2026-09-13 — auditing `entity-core-go`'s three-way survey, where the one real bug on the whole
+  board was the row filed as not-a-defect.* The survey classified 32 non-PASSes across three peers
+  and got 31 right. The one it got wrong was `include_payload_overlapping_exclude`, filed as *"the
+  already-routed Q2 divergence… WARN, not FAIL, because py's control is inconclusive."* Every
+  clause true; the conclusion — *"no new defect"* — wrong, because a question can be open upstream
+  while the behaviour underneath it is an ordinary bug at one seat.
+  **Why this classification is the attractive one:** it is *verifiable* (the item really was
+  routed), it costs nothing to apply, and it reads as diligence rather than as a shortcut. It is
+  the *"a premise saying you already comply"* shape with **our own ledger** as the premise.
+  **The check, and the survey was one step away from it:** *an inconclusive control is a reason to
+  investigate, not a reason to classify.* When an arm's own message says it cannot attribute its
+  refusal, the board cannot disposition that row at all — it needs a source read at the failing
+  seat or an ask routed to it. Corollary for the seat being surveyed: **when a sibling reports your
+  column as conformant-but-divergent, that is a claim about your code** (the standing hearsay law),
+  and the cheap move is to drive their exact capability shape in your own tree before agreeing with
+  the disposition. Here it was one test file and the "spec question" evaporated.
+
 - **A sibling's CITATION is scoped by a surface THEY have — and the seat the citation does not
   reach is the seat with the defect.** ***RATIFIED 2026-09-12*** *— tenth axis of the "a routed
   report's claims about our repo are hearsay" law (after our architecture, coverage, version,

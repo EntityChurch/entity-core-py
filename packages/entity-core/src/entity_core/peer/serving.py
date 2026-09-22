@@ -196,6 +196,13 @@ class CapTokenScope:
         """
         return check_path_permission(
             self.cap_data, "get", path, self.local_peer_id,
+            # §6.3 (0.8.2.23): the frame is the handler that OWNS the access.
+            # The serving face renders tree reads, so it is `system/tree`. The
+            # published-set grants this evaluator builds declare
+            # `handlers: {include: ["*"]}` — which is where a no-path-component
+            # authority is stated per §5.2, at the grant and auditable, rather
+            # than by omitting the argument here where it would be invisible.
+            handler_pattern="system/tree",
         )
 
     def prefix_in_scope(self, prefix: str) -> bool:

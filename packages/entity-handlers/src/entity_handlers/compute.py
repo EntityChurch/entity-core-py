@@ -912,16 +912,36 @@ class EvalContext:
         )
 
     def check_read_permission(self, path: str) -> bool:
-        """Check if capability covers read at path."""
+        """Check if capability covers read at path.
+
+        The handler frame is `"system/tree"` — written as a literal in §7.2's
+        `compute/lookup/tree` block (the line directly above
+        `ctx.entity_tree.get(path)`), because the thing being authorized is a
+        tree read and not a compute operation. Omitting it passes `None`,
+        which disables grant filtering by handler entirely and lets a grant
+        scoped to *any* handler authorize the read — the widening direction.
+        §7.2's Phase 2b already carried the literal here; this site lost it to
+        the wrapper.
+        """
         return check_path_permission(
             self.capability, "get", path, self.local_peer_id,
+            handler_pattern="system/tree",
             granter_peer_id=self._granter_frame(),
         )
 
     def check_write_permission(self, path: str) -> bool:
-        """Check if capability covers write at path."""
+        """Check if capability covers write at path.
+
+        Frames on ``system/tree`` for the same reason
+        :py:meth:`check_read_permission` does — the thing being authorized is a
+        tree **write**, not a compute operation. This arm kept the omitted
+        (widening) default through the SA-PY-58 sweep that fixed its sibling
+        one method up: the sweep was censused on the *read* input of a rule
+        whose sentence covers *"a tree read, a tree write"* (§6.3, 0.8.2.23).
+        """
         return check_path_permission(
             self.capability, "put", path, self.local_peer_id,
+            handler_pattern="system/tree",
             granter_peer_id=self._granter_frame(),
         )
 
@@ -3585,8 +3605,12 @@ async def _handle_install(
     # Phase 2: Verify capability
     _caller_frame = handler_ctx.caller_capability_granter_peer_id  # V7 §PR-8
     for read_path in impure_ops.read_paths:
+        # §7.2 Phase 2 — a tree read, so the frame is `system/tree` (§6.3,
+        # 0.8.2.23). Phase 2b below already carried the literal; Phase 2's own
+        # two loops did not.
         if not check_path_permission(
             capability, "get", read_path, handler_ctx.local_peer_id,
+            handler_pattern="system/tree",
             granter_peer_id=_caller_frame,
         ):
             return {
@@ -3645,6 +3669,7 @@ async def _handle_install(
     result_path = params_data.get("result_path") or f"{root_path}/result"
     if not check_path_permission(
         capability, "put", result_path, handler_ctx.local_peer_id,
+        handler_pattern="system/tree",
         granter_peer_id=_caller_frame,
     ):
         return {
@@ -3658,6 +3683,7 @@ async def _handle_install(
     for wp in impure_ops.write_paths:
         if not check_path_permission(
             capability, "put", wp, handler_ctx.local_peer_id,
+            handler_pattern="system/tree",
             granter_peer_id=_caller_frame,
         ):
             return {

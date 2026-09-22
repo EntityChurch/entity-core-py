@@ -514,7 +514,19 @@ async def _handle_subscribe(
     # (include_payload), the caller MUST also be authorized to read it —
     # otherwise the option is a capability bypass. Enforce here, before the
     # content is ever attached at delivery (§4.2).
-    if request.include_payload and not ctx.check_caller_permission("get", pattern):
+    #
+    # The handler frame is `"system/tree"`, written as a literal in §2.3's own
+    # signature — NOT the dispatching handler. §2.3's argument for the check is
+    # that *"a caller may legitimately hold `subscribe` without `get`"*, which
+    # only has content if the two are separately scoped grants; filtering by
+    # `system/subscription` discards the `system/tree` grant before its
+    # resources are read and refuses every conformant caller. Measured by
+    # `entity-core-go`'s `include_payload_overlapping_exclude` (py 403/403 vs
+    # go/rust 403/200) and routed there as a pattern-subject question — it was
+    # this argument. See tests/integration/test_handler_frame_of_the_6_3_check.py.
+    if request.include_payload and not ctx.check_caller_permission(
+        "get", pattern, handler_pattern="system/tree",
+    ):
         return _error_response(
             403,
             "payload_unauthorized",
